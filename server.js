@@ -150,19 +150,14 @@ const signToken = (id) =>
   jwt.sign({ id }, process.env.JWT_SECRET, { expiresIn: "30d" });
 
 
-// Root route to check if backend is running
+// ─── Health check / root route ─────────────────────────────────────────
 app.get("/", (req, res) => {
-  res.json({ message: "Backend is live and running!" });
-});
-
-// Optional: test MongoDB connection
-app.get("/test-db", async (req, res) => {
-  try {
-    const collections = await mongoose.connection.db.listCollections().toArray();
-    res.json({ success: true, collections });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
+  res.json({
+    status: "ok",
+    message: "Learnify API is running 🚀",
+    version: "1.0.0",
+    timestamp: new Date().toISOString(),
+  });
 });
 // ─── SANITIZE SECTIONS ────────────────────────────────────────────────────────
 // Frontend sends temp IDs like "n8hbwfu". Since schema uses Mixed type,
