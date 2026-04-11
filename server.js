@@ -6,13 +6,29 @@ const multer   = require("multer");
 const path     = require("path");
 const fs       = require("fs");
 require("dotenv").config();
+const { cloudinary } = require("./config/cloudinary");
 
 const app = express();
 
+// ─── CORS ─────────────────────────────────────────────────────────────────────
+// Allows localhost in dev AND your Vercel frontend in production.
+// After you deploy to Vercel, replace "https://your-app.vercel.app"
+// with your real Vercel URL (e.g. https://learnify-ui.vercel.app)
+const allowedOrigins = [
+  "http://localhost:3000",
+  process.env.CLIENT_URL,          // set this in Render env vars
+].filter(Boolean);                 // removes undefined if CLIENT_URL not set yet
+
 app.use(cors({
-  origin: process.env.CLIENT_URL || "http://localhost:3000",
+  origin: (origin, callback) => {
+    // Allow requests with no origin (mobile apps, curl, Postman)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    callback(new Error(`CORS blocked: ${origin}`));
+  },
   credentials: true,
 }));
+
 app.use(express.json());
 app.use("/uploads", express.static("uploads"));
 
@@ -149,19 +165,17 @@ const instructorOnly = (req, res, next) => {
 const signToken = (id) =>
   jwt.sign({ id }, process.env.JWT_SECRET, { expiresIn: "30d" });
 
-
-// ─── Health check / root route ─────────────────────────────────────────
+// ─── Health check / root route ────────────────────────────────────────────────
 app.get("/", (req, res) => {
   res.json({
-    status: "ok",
-    message: "Learnify API is running 🚀",
-    version: "1.0.0",
+    status:    "ok",
+    message:   "Learnify API is running 🚀",
+    version:   "1.0.0",
     timestamp: new Date().toISOString(),
   });
 });
+
 // ─── SANITIZE SECTIONS ────────────────────────────────────────────────────────
-// Frontend sends temp IDs like "n8hbwfu". Since schema uses Mixed type,
-// we just make sure _id exists on every section and lecture.
 function sanitizeSections(body) {
   const data = { ...body };
   if (!Array.isArray(data.sections)) return data;
@@ -201,15 +215,15 @@ app.post("/api/auth/register", async (req, res) => {
     if (exists) return res.status(400).json({ message: "Email is already registered" });
 
     const user = await User.create({
-      name: name.trim(),
-      email: email.toLowerCase().trim(),
+      name:     name.trim(),
+      email:    email.toLowerCase().trim(),
       password,
-      role: role === "instructor" ? "instructor" : "student",
+      role:     role === "instructor" ? "instructor" : "student",
     });
 
     res.status(201).json({
       token: signToken(user._id),
-      user: { _id: user._id, name: user.name, email: user.email, role: user.role, avatar: user.avatar },
+      user:  { _id: user._id, name: user.name, email: user.email, role: user.role, avatar: user.avatar },
     });
   } catch (err) {
     console.error("Register error:", err.message);
@@ -231,9 +245,14 @@ app.post("/api/auth/login", async (req, res) => {
     res.json({
       token: signToken(user._id),
       user: {
-        _id: user._id, name: user.name, email: user.email,
-        role: user.role, avatar: user.avatar, bio: user.bio,
-        title: user.title, createdAt: user.createdAt,
+        _id:       user._id,
+        name:      user.name,
+        email:     user.email,
+        role:      user.role,
+        avatar:    user.avatar,
+        bio:       user.bio,
+        title:     user.title,
+        createdAt: user.createdAt,
       },
     });
   } catch (err) {
@@ -246,9 +265,15 @@ app.post("/api/auth/login", async (req, res) => {
 app.get("/api/auth/me", protect, (req, res) => {
   const u = req.user;
   res.json({
-    _id: u._id, name: u.name, email: u.email,
-    role: u.role, avatar: u.avatar, bio: u.bio,
-    title: u.title, location: u.location, website: u.website,
+    _id:       u._id,
+    name:      u.name,
+    email:     u.email,
+    role:      u.role,
+    avatar:    u.avatar,
+    bio:       u.bio,
+    title:     u.title,
+    location:  u.location,
+    website:   u.website,
     createdAt: u.createdAt,
   });
 });
@@ -269,7 +294,7 @@ app.patch("/api/auth/profile", protect, async (req, res) => {
 });
 
 // ─── COURSE ROUTES ────────────────────────────────────────────────────────────
-// ⚠️ IMPORTANT: Specific named routes MUST come before /:id wildcard routes
+// ⚠️ Specific named routes MUST come before /:id wildcard routes
 
 // Instructor: get my courses
 app.get("/api/courses/instructor/my-courses", protect, instructorOnly, async (req, res) => {
@@ -397,7 +422,7 @@ app.get("/api/enrollments/my", protect, async (req, res) => {
   try {
     const enrollments = await Enrollment.find({ student: req.user._id })
       .populate({
-        path: "course",
+        path:     "course",
         populate: { path: "instructor", select: "name avatar title" },
       })
       .sort("-createdAt");
@@ -502,13 +527,12 @@ app.get("/api/reviews/:courseId", async (req, res) => {
       .sort("-createdAt")
       .limit(100);
 
-    // Map student → user so the frontend ReviewCard works with both field names
     const mapped = reviews.map(r => ({
       _id:       r._id,
       rating:    r.rating,
       comment:   r.comment,
       createdAt: r.createdAt,
-      user:      r.student,   // ← expose as "user" for the frontend component
+      user:      r.student,
     }));
     res.json(mapped);
   } catch (err) {
@@ -522,11 +546,9 @@ app.post("/api/reviews/:courseId", protect, async (req, res) => {
     const { rating, comment } = req.body;
     if (!rating) return res.status(400).json({ message: "Rating is required" });
 
-    // Must be enrolled
     const enrolled = await Enrollment.findOne({ student: req.user._id, course: req.params.courseId });
     if (!enrolled) return res.status(403).json({ message: "You must be enrolled to leave a review" });
 
-    // One review per student
     const existing = await Review.findOne({ course: req.params.courseId, student: req.user._id });
     if (existing) return res.status(400).json({ message: "You have already reviewed this course" });
 
@@ -537,7 +559,6 @@ app.post("/api/reviews/:courseId", protect, async (req, res) => {
       comment: comment || "",
     });
 
-    // Recalculate and update course average
     const allReviews = await Review.find({ course: req.params.courseId });
     const avg = allReviews.reduce((a, r) => a + r.rating, 0) / allReviews.length;
     await Course.findByIdAndUpdate(req.params.courseId, {
@@ -559,32 +580,166 @@ app.post("/api/reviews/:courseId", protect, async (req, res) => {
   }
 });
 
-// ─── IMAGE UPLOAD ─────────────────────────────────────────────────────────────
-if (!fs.existsSync("uploads")) fs.mkdirSync("uploads");
+// ─── IMAGE UPLOAD: temp disk → Cloudinary uploader.upload() → unlink temp ─────
+const UPLOAD_TMP = path.join(__dirname, "uploads", "tmp");
+if (!fs.existsSync(UPLOAD_TMP)) fs.mkdirSync(UPLOAD_TMP, { recursive: true });
 
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, "uploads/"),
-  filename:    (req, file, cb) => {
-    const ext  = path.extname(file.originalname);
-    const name = path.basename(file.originalname, ext).replace(/\s+/g, "-");
-    cb(null, `${Date.now()}-${name}${ext}`);
+const tempImageStorage = multer.diskStorage({
+  destination: (_, __, cb) => cb(null, UPLOAD_TMP),
+  filename: (_, file, cb) => {
+    const ext = path.extname(file.originalname || "") || ".jpg";
+    cb(null, `img-${Date.now()}-${Math.random().toString(36).slice(2, 9)}${ext}`);
   },
 });
-const upload = multer({
-  storage,
+const tempImageUpload = multer({
+  storage: tempImageStorage,
   limits: { fileSize: 5 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
-    const allowed = ["image/jpeg","image/jpg","image/png","image/webp","image/gif"];
+    const allowed = ["image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif"];
     if (allowed.includes(file.mimetype)) cb(null, true);
     else cb(new Error("Only image files are allowed (JPG, PNG, WebP, GIF)"), false);
   },
 });
 
-app.post("/api/upload/image", protect, instructorOnly, upload.single("image"), (req, res) => {
-  if (!req.file) return res.status(400).json({ message: "No file uploaded" });
-  const url = `${req.protocol}://${req.get("host")}/uploads/${req.file.filename}`;
-  res.json({ url, filename: req.file.filename });
+app.post("/api/upload/image", protect, instructorOnly, tempImageUpload.single("image"), async (req, res) => {
+  console.log('🚀 [POST] /api/upload/image - Request received');
+  
+  if (!req.file) {
+    console.log('⚠️  Upload failed: No file found in request');
+    return res.status(400).json({ message: "No file uploaded" });
+  }
+
+  const localPath = req.file.path;
+  const courseId = req.body.courseId;
+  
+  console.log(`📂 File detected: ${req.file.originalname} (${req.file.size} bytes)`);
+  console.log(`📍 Local temporary path: ${localPath}`);
+  console.log(`🆔 Course ID provided: ${courseId || 'None (General Upload)'}`);
+
+  const cleanupLocal = async () => {
+    try {
+      await fs.promises.unlink(localPath);
+      console.log('🧹 Cleanup: Local temporary file deleted');
+    } catch (err) {
+      console.error('❌ Cleanup Error: Failed to delete local file', err.message);
+    }
+  };
+
+  try {
+    // --- Validation Logic ---
+    if (courseId) {
+      if (!mongoose.Types.ObjectId.isValid(courseId)) {
+        console.log('🚫 Validation Error: Invalid Course ID format');
+        await cleanupLocal();
+        return res.status(400).json({ message: "Invalid course id" });
+      }
+
+      const allowed = await Course.findOne({ _id: courseId, instructor: req.user._id }).select("_id");
+      if (!allowed) {
+        console.log(`🚫 Auth Error: User ${req.user._id} not authorized for Course ${courseId}`);
+        await cleanupLocal();
+        return res.status(404).json({ message: "Course not found or unauthorized" });
+      }
+      console.log('✅ Authorization: Course ownership verified');
+    }
+
+    // --- Cloudinary Upload ---
+    console.log('☁️  Starting Cloudinary upload...');
+    const result = await cloudinary.uploader.upload(localPath, {
+      folder: "udemy-clone",
+      resource_type: "image",
+    });
+    console.log('✨ Cloudinary upload successful!');
+    console.log(`🔗 URL: ${result.secure_url}`);
+
+    await cleanupLocal();
+
+    // --- Database Update ---
+    if (courseId) {
+      console.log('💾 Updating database with new thumbnail URL...');
+      const updated = await Course.findOneAndUpdate(
+        { _id: courseId, instructor: req.user._id },
+        { $set: { thumbnail: result.secure_url } },
+        { new: true }
+      ).select("thumbnail");
+
+      console.log('🏁 Success: Database updated and response sent');
+      return res.json({
+        url: result.secure_url,
+        secure_url: result.secure_url,
+        public_id: result.public_id,
+        thumbnail: updated.thumbnail,
+      });
+    }
+
+    console.log('🏁 Success: General upload completed (No DB update required)');
+    res.json({
+      url: result.secure_url,
+      secure_url: result.secure_url,
+      public_id: result.public_id,
+    });
+
+  } catch (err) {
+    console.error('💥 CRITICAL ERROR during upload process:');
+    console.error(err);
+    await cleanupLocal();
+    res.status(500).json({ message: err.message || "Upload failed" });
+  }
 });
+
+// app.post("/api/upload/image", protect, instructorOnly, tempImageUpload.single("image"), async (req, res) => {
+//   console.log('called image upload');
+//   if (!req.file) return res.status(400).json({ message: "No file uploaded" });
+
+//   const localPath = req.file.path;
+//   const courseId = req.body.courseId;
+
+//   const cleanupLocal = () => fs.promises.unlink(localPath).catch(() => {});
+
+//   try {
+//     if (courseId) {
+//       if (!mongoose.Types.ObjectId.isValid(courseId)) {
+//         await cleanupLocal();
+//         return res.status(400).json({ message: "Invalid course id" });
+//       }
+//       const allowed = await Course.findOne({ _id: courseId, instructor: req.user._id }).select("_id");
+//       if (!allowed) {
+//         await cleanupLocal();
+//         return res.status(404).json({ message: "Course not found or unauthorized" });
+//       }
+//     }
+
+//     const result = await cloudinary.uploader.upload(localPath, {
+//       folder: "udemy-clone",
+//       resource_type: "image",
+//     });
+//     await cleanupLocal();
+
+//     if (courseId) {
+//       const updated = await Course.findOneAndUpdate(
+//         { _id: courseId, instructor: req.user._id },
+//         { $set: { thumbnail: result.secure_url } },
+//         { new: true }
+//       ).select("thumbnail");
+//       return res.json({
+//         url: result.secure_url,
+//         secure_url: result.secure_url,
+//         public_id: result.public_id,
+//         thumbnail: updated.thumbnail,
+//       });
+//     }
+
+//     res.json({
+//       url: result.secure_url,
+//       secure_url: result.secure_url,
+//       public_id: result.public_id,
+//     });
+//   } catch (err) {
+//     await cleanupLocal();
+//     console.error("Image upload error:", err);
+//     res.status(500).json({ message: err.message || "Upload failed" });
+//   }
+// });
 
 // ─── HEALTH CHECK ─────────────────────────────────────────────────────────────
 app.get("/api/health", (req, res) => {
@@ -611,5 +766,5 @@ const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on http://localhost:${PORT}`);
   console.log(`📦 Database: learnify @ cluster0.27tk541.mongodb.net`);
-  console.log(`🌍 CORS allowed for: ${process.env.CLIENT_URL}`);
+  console.log(`🌍 CORS allowed origins: ${allowedOrigins.join(", ")}`);
 });
