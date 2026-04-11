@@ -111,6 +111,26 @@ const CourseSchema = new mongoose.Schema({
   studentsEnrolled: { type: Number, default: 0 },
   revenue:          { type: Number, default: 0 },
   badge:            String,
+  imageTestimonials: {
+    type: [
+      {
+        author:   { type: String, default: "" },
+        text:     { type: String, default: "" },
+        imageUrl: { type: String, default: "" },
+      },
+    ],
+    default: [],
+  },
+  videoTestimonials: {
+    type: [
+      {
+        author:   { type: String, default: "" },
+        text:     { type: String, default: "" },
+        videoUrl: { type: String, default: "" },
+      },
+    ],
+    default: [],
+  },
 }, { timestamps: true });
 const Course = mongoose.model("Course", CourseSchema);
 

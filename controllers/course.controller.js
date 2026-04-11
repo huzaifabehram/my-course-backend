@@ -54,8 +54,17 @@ const getInstructorCourses = async (req, res) => {
 // Instructor only: create a new course
 const createCourse = async (req, res) => {
   try {
-    const { title, description, category, price, status, sections, thumbnail } =
-      req.body;
+    const {
+      title,
+      description,
+      category,
+      price,
+      status,
+      sections,
+      thumbnail,
+      imageTestimonials,
+      videoTestimonials,
+    } = req.body;
 
     if (!title) {
       return res.status(400).json({ message: "Course title is required." });
@@ -70,6 +79,8 @@ const createCourse = async (req, res) => {
       sections: sections || [],
       thumbnail: thumbnail || "",
       instructor: req.user._id,
+      imageTestimonials: Array.isArray(imageTestimonials) ? imageTestimonials : [],
+      videoTestimonials: Array.isArray(videoTestimonials) ? videoTestimonials : [],
     });
 
     res.status(201).json({ message: "Course created successfully!", course });
@@ -94,8 +105,17 @@ const updateCourse = async (req, res) => {
       return res.status(403).json({ message: "You can only edit your own courses." });
     }
 
-    const { title, description, category, price, status, sections, thumbnail } =
-      req.body;
+    const {
+      title,
+      description,
+      category,
+      price,
+      status,
+      sections,
+      thumbnail,
+      imageTestimonials,
+      videoTestimonials,
+    } = req.body;
 
     course.title = title ?? course.title;
     course.description = description ?? course.description;
@@ -104,6 +124,8 @@ const updateCourse = async (req, res) => {
     course.status = status ?? course.status;
     course.sections = sections ?? course.sections;
     course.thumbnail = thumbnail ?? course.thumbnail;
+    if (Array.isArray(imageTestimonials)) course.imageTestimonials = imageTestimonials;
+    if (Array.isArray(videoTestimonials)) course.videoTestimonials = videoTestimonials;
 
     const updated = await course.save();
 
