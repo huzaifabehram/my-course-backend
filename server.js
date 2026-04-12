@@ -131,6 +131,19 @@ const CourseSchema = new mongoose.Schema({
     ],
     default: [],
   },
+  projectGallery: {
+    type: [
+      {
+        caption:  { type: String, default: "" },
+        imageUrl: { type: String, default: "" },
+      },
+    ],
+    default: [],
+  },
+  alsoBoughtCourseIds: {
+    type: [{ type: mongoose.Schema.Types.ObjectId, ref: "Course" }],
+    default: [],
+  },
 }, { timestamps: true });
 const Course = mongoose.model("Course", CourseSchema);
 
