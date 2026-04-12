@@ -7,7 +7,7 @@ const path     = require("path");
 const fs       = require("fs");
 require("dotenv").config();
 const { cloudinary } = require("./config/cloudinary");
-
+const Review = require("./models/Review.model");
 const app = express();
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────

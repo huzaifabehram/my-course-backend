@@ -1,6 +1,4 @@
 // server/models/Course.model.js
-// ─── Course schema with sections and lectures ─────────────────────────────────
-
 const mongoose = require("mongoose");
 
 const LectureSchema = new mongoose.Schema({
@@ -23,6 +21,10 @@ const CourseSchema = new mongoose.Schema(
       required: [true, "Course title is required"],
       trim: true,
     },
+    subtitle: {
+      type: String,
+      default: "",
+    },
     description: {
       type: String,
       default: "",
@@ -36,7 +38,15 @@ const CourseSchema = new mongoose.Schema(
       required: true,
       default: 0,
     },
+    discountPrice: {
+      type: Number,
+      default: 0,
+    },
     thumbnail: {
+      type: String,
+      default: "",
+    },
+    previewVideoUrl: {
       type: String,
       default: "",
     },
@@ -45,7 +55,6 @@ const CourseSchema = new mongoose.Schema(
       enum: ["draft", "published", "review"],
       default: "draft",
     },
-    // Reference to the instructor who created this course
     instructor: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",
@@ -53,10 +62,80 @@ const CourseSchema = new mongoose.Schema(
     },
     sections: [SectionSchema],
 
+    // Course content
+    whatYouLearn: {
+      type: [String],
+      default: [],
+    },
+    requirements: {
+      type: [String],
+      default: [],
+    },
+    tags: {
+      type: [String],
+      default: [],
+    },
+
     // Stats
     studentsEnrolled: { type: Number, default: 0 },
     rating: { type: Number, default: 0 },
+    totalRatings: { type: Number, default: 0 },
     revenue: { type: Number, default: 0 },
+    level: {
+      type: String,
+      enum: ["Beginner", "Intermediate", "Advanced"],
+      default: "Beginner",
+    },
+    language: {
+      type: String,
+      default: "English",
+    },
+    duration: {
+      type: String,
+      default: "",
+    },
+
+    // NEW: Image Testimonials
+    imageTestimonials: {
+      type: [
+        {
+          author: { type: String, default: "" },
+          text: { type: String, default: "" },
+          imageUrl: { type: String, default: "" },
+        },
+      ],
+      default: [],
+    },
+
+    // NEW: Video Testimonials
+    videoTestimonials: {
+      type: [
+        {
+          author: { type: String, default: "" },
+          text: { type: String, default: "" },
+          videoUrl: { type: String, default: "" },
+        },
+      ],
+      default: [],
+    },
+
+    // NEW: Project Gallery
+    projectGallery: {
+      type: [
+        {
+          imageUrl: { type: String, required: true },
+          caption: { type: String, default: "" },
+        },
+      ],
+      default: [],
+    },
+
+    // NEW: Students Also Bought (references to other courses)
+    alsoBoughtCourseIds: {
+      type: [mongoose.Schema.Types.ObjectId],
+      ref: "Course",
+      default: [],
+    },
   },
   { timestamps: true }
 );
