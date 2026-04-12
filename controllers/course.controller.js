@@ -1,6 +1,19 @@
 // server/controllers/course.controller.js
 const Course = require("../models/Course.model");
-const Review = require("../models/Review.model"); // Make sure you have this model
+const Review = require("../models/Review.model");
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HELPER: Clean testimonials/gallery data (remove frontend-generated `id` field)
+// ═══════════════════════════════════════════════════════════════════════════
+function sanitizeTestimonials(items) {
+  if (!Array.isArray(items)) return [];
+  return items.map(({ id, _id, ...rest }) => rest); // Remove `id` and `_id`, keep rest
+}
+
+function sanitizeGallery(items) {
+  if (!Array.isArray(items)) return [];
+  return items.map(({ id, _id, ...rest }) => rest);
+}
 
 // ── GET /api/courses ──────────────────────────────────────────────────────────
 // Public: get all published courses
@@ -108,6 +121,13 @@ const createCourse = async (req, res) => {
       return res.status(400).json({ message: "Course title is required." });
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // FIX: Sanitize testimonials and gallery to remove frontend `id` field
+    // ═══════════════════════════════════════════════════════════════════════
+    const cleanImageTestimonials = sanitizeTestimonials(imageTestimonials);
+    const cleanVideoTestimonials = sanitizeTestimonials(videoTestimonials);
+    const cleanProjectGallery = sanitizeGallery(projectGallery);
+
     const course = await Course.create({
       title,
       subtitle: subtitle || "",
@@ -123,9 +143,9 @@ const createCourse = async (req, res) => {
       requirements: Array.isArray(requirements) ? requirements : [],
       tags: Array.isArray(tags) ? tags : [],
       instructor: req.user._id,
-      imageTestimonials: Array.isArray(imageTestimonials) ? imageTestimonials : [],
-      videoTestimonials: Array.isArray(videoTestimonials) ? videoTestimonials : [],
-      projectGallery: Array.isArray(projectGallery) ? projectGallery : [],
+      imageTestimonials: cleanImageTestimonials,
+      videoTestimonials: cleanVideoTestimonials,
+      projectGallery: cleanProjectGallery,
       alsoBoughtCourseIds: Array.isArray(alsoBoughtCourseIds) ? alsoBoughtCourseIds : [],
       level: level || "Beginner",
       language: language || "English",
@@ -135,7 +155,7 @@ const createCourse = async (req, res) => {
     res.status(201).json({ message: "Course created successfully!", course });
   } catch (error) {
     console.error("Create course error:", error.message);
-    res.status(500).json({ message: "Could not create course." });
+    res.status(500).json({ message: "Could not create course.", error: error.message });
   }
 };
 
@@ -195,17 +215,29 @@ const updateCourse = async (req, res) => {
     if (Array.isArray(whatYouLearn)) course.whatYouLearn = whatYouLearn;
     if (Array.isArray(requirements)) course.requirements = requirements;
     if (Array.isArray(tags)) course.tags = tags;
-    if (Array.isArray(imageTestimonials)) course.imageTestimonials = imageTestimonials;
-    if (Array.isArray(videoTestimonials)) course.videoTestimonials = videoTestimonials;
-    if (Array.isArray(projectGallery)) course.projectGallery = projectGallery;
-    if (Array.isArray(alsoBoughtCourseIds)) course.alsoBoughtCourseIds = alsoBoughtCourseIds;
+    
+    // ═══════════════════════════════════════════════════════════════════════
+    // FIX: Sanitize testimonials and gallery before saving
+    // ═══════════════════════════════════════════════════════════════════════
+    if (Array.isArray(imageTestimonials)) {
+      course.imageTestimonials = sanitizeTestimonials(imageTestimonials);
+    }
+    if (Array.isArray(videoTestimonials)) {
+      course.videoTestimonials = sanitizeTestimonials(videoTestimonials);
+    }
+    if (Array.isArray(projectGallery)) {
+      course.projectGallery = sanitizeGallery(projectGallery);
+    }
+    if (Array.isArray(alsoBoughtCourseIds)) {
+      course.alsoBoughtCourseIds = alsoBoughtCourseIds;
+    }
 
     const updated = await course.save();
 
     res.status(200).json({ message: "Course updated successfully!", course: updated });
   } catch (error) {
     console.error("Update course error:", error);
-    res.status(500).json({ message: "Could not update course." });
+    res.status(500).json({ message: "Could not update course.", error: error.message });
   }
 };
 

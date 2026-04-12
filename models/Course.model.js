@@ -14,6 +14,28 @@ const SectionSchema = new mongoose.Schema({
   lectures: [LectureSchema],
 });
 
+// ═══════════════════════════════════════════════════════════════════════════
+// FIX: Add `_id: false` to prevent automatic _id generation
+// OR explicitly allow `id` field in schema
+// ═══════════════════════════════════════════════════════════════════════════
+
+const ImageTestimonialSchema = new mongoose.Schema({
+  author: { type: String, default: "" },
+  text: { type: String, default: "" },
+  imageUrl: { type: String, default: "" },
+}, { _id: true }); // Allow MongoDB to generate _id automatically
+
+const VideoTestimonialSchema = new mongoose.Schema({
+  author: { type: String, default: "" },
+  text: { type: String, default: "" },
+  videoUrl: { type: String, default: "" },
+}, { _id: true }); // Allow MongoDB to generate _id automatically
+
+const ProjectGallerySchema = new mongoose.Schema({
+  imageUrl: { type: String, required: true },
+  caption: { type: String, default: "" },
+}, { _id: true }); // Allow MongoDB to generate _id automatically
+
 const CourseSchema = new mongoose.Schema(
   {
     title: {
@@ -95,42 +117,26 @@ const CourseSchema = new mongoose.Schema(
       default: "",
     },
 
-    // NEW: Image Testimonials
+    // ═══════════════════════════════════════════════════════════════════════
+    // FIXED: Use proper subdocument schemas
+    // ═══════════════════════════════════════════════════════════════════════
+    
     imageTestimonials: {
-      type: [
-        {
-          author: { type: String, default: "" },
-          text: { type: String, default: "" },
-          imageUrl: { type: String, default: "" },
-        },
-      ],
+      type: [ImageTestimonialSchema],
       default: [],
     },
 
-    // NEW: Video Testimonials
     videoTestimonials: {
-      type: [
-        {
-          author: { type: String, default: "" },
-          text: { type: String, default: "" },
-          videoUrl: { type: String, default: "" },
-        },
-      ],
+      type: [VideoTestimonialSchema],
       default: [],
     },
 
-    // NEW: Project Gallery
     projectGallery: {
-      type: [
-        {
-          imageUrl: { type: String, required: true },
-          caption: { type: String, default: "" },
-        },
-      ],
+      type: [ProjectGallerySchema],
       default: [],
     },
 
-    // NEW: Students Also Bought (references to other courses)
+    // Students Also Bought (references to other courses)
     alsoBoughtCourseIds: {
       type: [mongoose.Schema.Types.ObjectId],
       ref: "Course",
