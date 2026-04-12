@@ -1,49 +1,57 @@
 // Server/server.js — Complete MERN Backend
+// ✅ Compatible with: imageTestimonials, videoTestimonials, projectGallery,
+//    alsoBoughtCourseIds from InstructorDashboard
+// ✅ Cloudinary image + video upload via streams (no disk storage needed)
+// ✅ Video testimonial upload via POST /api/upload/video
+// ✅ All new course fields saved & returned to Shopify.jsx landing page
+require("dotenv").config();
+
 const express  = require("express");
 const mongoose = require("mongoose");
 const cors     = require("cors");
 const multer   = require("multer");
-const path     = require("path");
-const fs       = require("fs");
-require("dotenv").config();
-const { cloudinary } = require("./config/cloudinary");
+const bcrypt   = require("bcryptjs");
+const jwt      = require("jsonwebtoken");
+const cloudinary = require("cloudinary").v2;
 
 const app = express();
+
+// ─── CLOUDINARY CONFIG ────────────────────────────────────────────────────────
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key:    process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
+console.log("☁️  Cloudinary:", process.env.CLOUDINARY_CLOUD_NAME ? "✓ configured" : "✗ NOT configured — set env vars");
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
 const allowedOrigins = [
   "http://localhost:3000",
+  "http://localhost:5173",
   process.env.CLIENT_URL,
+  process.env.PUBLIC_URL,
 ].filter(Boolean);
 
 app.use(cors({
-  origin: (origin, callback) => {
-    if (!origin) return callback(null, true);
-    if (allowedOrigins.includes(origin)) return callback(null, true);
-    callback(new Error(`CORS blocked: ${origin}`));
+  origin: (origin, cb) => {
+    if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
+    cb(new Error(`CORS blocked: ${origin}`));
   },
   credentials: true,
 }));
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
-app.use(express.json());
-app.use("/uploads", express.static("uploads"));
-
-// ─── DB CONNECTION ─────────────────────────────────────────────────────────────
-mongoose.connect(process.env.MONGO_URI, {
-  useNewUrlParser:    true,
-  useUnifiedTopology: true,
-})
-  .then(() => console.log("✅ MongoDB connected to learnify database"))
-  .catch(err => console.error("❌ MongoDB connection error:", err.message));
-
+// ─── MONGODB ──────────────────────────────────────────────────────────────────
+mongoose.connect(process.env.MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
+  .then(() => console.log("✅ MongoDB connected"))
+  .catch(err => console.error("❌ MongoDB error:", err.message));
 mongoose.connection.on("disconnected", () => console.log("⚠️  MongoDB disconnected"));
 mongoose.connection.on("reconnected",  () => console.log("✅ MongoDB reconnected"));
 
-// ─── DEPENDENCIES ─────────────────────────────────────────────────────────────
-const bcrypt = require("bcryptjs");
-const jwt    = require("jsonwebtoken");
-
-// ─── MODELS ───────────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+// SCHEMAS & MODELS
+// ══════════════════════════════════════════════════════════════════════════════
 
 // ── User ──────────────────────────────────────────────────────────────────────
 const UserSchema = new mongoose.Schema({
@@ -59,25 +67,23 @@ const UserSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 UserSchema.pre("save", async function(next) {
-  if (this.isModified("password")) {
-    this.password = await bcrypt.hash(this.password, 10);
-  }
+  if (this.isModified("password")) this.password = await bcrypt.hash(this.password, 10);
   next();
 });
-UserSchema.methods.matchPassword = function(plainPassword) {
-  return bcrypt.compare(plainPassword, this.password);
+UserSchema.methods.matchPassword = function(plain) {
+  return bcrypt.compare(plain, this.password);
 };
 const User = mongoose.model("User", UserSchema);
 
-// ── Lecture & Section (Mixed _id to accept frontend temp IDs) ─────────────────
+// ── Sub-document schemas ──────────────────────────────────────────────────────
 const LectureSchema = new mongoose.Schema({
   _id:       { type: mongoose.Schema.Types.Mixed },
   title:     { type: String, default: "Untitled Lecture" },
   type:      { type: String, default: "video" },
   duration:  { type: String, default: "" },
   free:      { type: Boolean, default: false },
-  videoUrl:  { type: String, default: "" },
   preview:   { type: Boolean, default: false },
+  videoUrl:  { type: String, default: "" },
   resources: [String],
 }, { _id: false });
 
@@ -87,7 +93,7 @@ const SectionSchema = new mongoose.Schema({
   lectures: { type: [LectureSchema], default: [] },
 }, { _id: false });
 
-// ── Testimonial Schemas ───────────────────────────────────────────────────────
+// ── NEW: testimonial + gallery sub-schemas ────────────────────────────────────
 const ImageTestimonialSchema = new mongoose.Schema({
   author:   { type: String, default: "" },
   text:     { type: String, default: "" },
@@ -134,11 +140,12 @@ const CourseSchema = new mongoose.Schema({
   language:         { type: String, default: "English" },
   duration:         String,
   lastUpdated:      String,
-  imageTestimonials: { type: [ImageTestimonialSchema], default: [] },
-  videoTestimonials: { type: [VideoTestimonialSchema], default: [] },
-  projectGallery:    { type: [ProjectGallerySchema], default: [] },
+  // ── NEW fields (saved from InstructorDashboard) ───────────────────────────
+  imageTestimonials:   { type: [ImageTestimonialSchema],   default: [] },
+  videoTestimonials:   { type: [VideoTestimonialSchema],   default: [] },
+  projectGallery:      { type: [ProjectGallerySchema],     default: [] },
   alsoBoughtCourseIds: {
-    type: [{ type: mongoose.Schema.Types.ObjectId, ref: "Course" }],
+    type:    [{ type: mongoose.Schema.Types.ObjectId, ref: "Course" }],
     default: [],
   },
 }, { timestamps: true });
@@ -172,7 +179,12 @@ const ReviewSchema = new mongoose.Schema({
 ReviewSchema.index({ course: 1, student: 1 }, { unique: true });
 const Review = mongoose.model("Review", ReviewSchema);
 
-// ─── MIDDLEWARE ───────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+// AUTH MIDDLEWARE
+// ══════════════════════════════════════════════════════════════════════════════
+
+const signToken = (id) => jwt.sign({ id }, process.env.JWT_SECRET, { expiresIn: "30d" });
+
 const protect = async (req, res, next) => {
   const token = req.headers.authorization?.split(" ")[1];
   if (!token) return res.status(401).json({ message: "Not authorized — no token provided" });
@@ -181,43 +193,55 @@ const protect = async (req, res, next) => {
     req.user = await User.findById(decoded.id).select("-password");
     if (!req.user) return res.status(401).json({ message: "User not found" });
     next();
-  } catch (err) {
+  } catch {
     res.status(401).json({ message: "Token is invalid or expired" });
   }
 };
 
 const instructorOnly = (req, res, next) => {
-  if (req.user?.role !== "instructor") {
+  if (req.user?.role !== "instructor")
     return res.status(403).json({ message: "Access denied — instructors only" });
-  }
   next();
 };
 
-const signToken = (id) =>
-  jwt.sign({ id }, process.env.JWT_SECRET, { expiresIn: "30d" });
+// ══════════════════════════════════════════════════════════════════════════════
+// HELPERS
+// ══════════════════════════════════════════════════════════════════════════════
 
-// ─── Health check / root route ────────────────────────────────────────────────
-app.get("/", (req, res) => {
-  res.json({
-    status:    "ok",
-    message:   "Learnify API is running 🚀",
-    version:   "1.0.0",
-    timestamp: new Date().toISOString(),
+/** Stream a Buffer directly to Cloudinary — no temp files needed */
+function streamToCloudinary(buffer, options) {
+  return new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(options, (err, result) => {
+      if (err) return reject(err);
+      resolve(result);
+    });
+    stream.end(buffer);
   });
-});
+}
 
-// ─── SANITIZE SECTIONS & TESTIMONIALS ────────────────────────────────────────
+/** Guard: reject upload if Cloudinary env vars are missing */
+function requireCloudinary(req, res, next) {
+  if (!process.env.CLOUDINARY_CLOUD_NAME || !process.env.CLOUDINARY_API_KEY || !process.env.CLOUDINARY_API_SECRET)
+    return res.status(500).json({ message: "Cloudinary is not configured. Add CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET to .env" });
+  next();
+}
+
+/** Strip transient `id` keys added by the frontend before saving to MongoDB */
+function stripFrontendIds(arr) {
+  if (!Array.isArray(arr)) return [];
+  return arr.map(({ id, ...rest }) => rest);   // remove `id`, keep `_id` if present
+}
+
+/** Fix sections + lectures coming from the frontend (may have `id` instead of `_id`) */
 function sanitizeSections(body) {
   const data = { ...body };
   if (!Array.isArray(data.sections)) return data;
-
-  data.sections = data.sections.map((section) => {
+  data.sections = data.sections.map(section => {
     const sec = { ...section };
     if (!sec._id) sec._id = sec.id || new mongoose.Types.ObjectId().toString();
     delete sec.id;
-
     if (Array.isArray(sec.lectures)) {
-      sec.lectures = sec.lectures.map((lec) => {
+      sec.lectures = sec.lectures.map(lec => {
         const l = { ...lec };
         if (!l._id) l._id = l.id || new mongoose.Types.ObjectId().toString();
         delete l.id;
@@ -226,225 +250,191 @@ function sanitizeSections(body) {
     }
     return sec;
   });
+  return data;
+}
+
+/** Sanitize the full course payload before create/update */
+function sanitizeCoursePayload(raw) {
+  const data = sanitizeSections(raw);
+
+  // Strip frontend-only `id` from testimonials & gallery arrays
+  if (data.imageTestimonials)   data.imageTestimonials   = stripFrontendIds(data.imageTestimonials);
+  if (data.videoTestimonials)   data.videoTestimonials   = stripFrontendIds(data.videoTestimonials);
+  if (data.projectGallery)      data.projectGallery      = stripFrontendIds(data.projectGallery);
+
+  // alsoBoughtCourseIds — keep as-is (array of ObjectId strings)
+  if (!Array.isArray(data.alsoBoughtCourseIds)) data.alsoBoughtCourseIds = [];
 
   return data;
 }
 
-function sanitizeTestimonials(items) {
-  if (!Array.isArray(items)) return [];
-  return items.map(({ id, ...rest }) => rest);
-}
+// ══════════════════════════════════════════════════════════════════════════════
+// ROOT / HEALTH
+// ══════════════════════════════════════════════════════════════════════════════
 
-// ─── AUTH ROUTES ──────────────────────────────────────────────────────────────
+app.get("/", (req, res) => res.json({ status: "ok", message: "Learnify API 🚀", version: "2.0.0", timestamp: new Date().toISOString() }));
 
-// Register
+app.get("/api/health", (req, res) => res.json({
+  status:     "ok",
+  database:   mongoose.connection.readyState === 1 ? "connected" : "disconnected",
+  cloudinary: process.env.CLOUDINARY_CLOUD_NAME ? "configured" : "not configured",
+  time:       new Date().toISOString(),
+}));
+
+// ══════════════════════════════════════════════════════════════════════════════
+// AUTH ROUTES
+// ══════════════════════════════════════════════════════════════════════════════
+
 app.post("/api/auth/register", async (req, res) => {
   try {
     const { name, email, password, role } = req.body;
-    if (!name?.trim() || !email?.trim() || !password) {
+    if (!name?.trim() || !email?.trim() || !password)
       return res.status(400).json({ message: "Name, email and password are required" });
-    }
-    if (password.length < 6) {
+    if (password.length < 6)
       return res.status(400).json({ message: "Password must be at least 6 characters" });
-    }
-    const exists = await User.findOne({ email: email.toLowerCase().trim() });
-    if (exists) return res.status(400).json({ message: "Email is already registered" });
+    if (await User.findOne({ email: email.toLowerCase().trim() }))
+      return res.status(400).json({ message: "Email is already registered" });
 
     const user = await User.create({
-      name:     name.trim(),
-      email:    email.toLowerCase().trim(),
+      name:  name.trim(),
+      email: email.toLowerCase().trim(),
       password,
-      role:     role === "instructor" ? "instructor" : "student",
+      role:  role === "instructor" ? "instructor" : "student",
     });
-
     res.status(201).json({
       token: signToken(user._id),
       user:  { _id: user._id, name: user.name, email: user.email, role: user.role, avatar: user.avatar },
     });
   } catch (err) {
     console.error("Register error:", err.message);
-    res.status(500).json({ message: "Registration failed. Please try again." });
+    res.status(500).json({ message: "Registration failed." });
   }
 });
 
-// Login
 app.post("/api/auth/login", async (req, res) => {
   try {
     const { email, password } = req.body;
-    if (!email || !password) {
-      return res.status(400).json({ message: "Email and password are required" });
-    }
+    if (!email || !password) return res.status(400).json({ message: "Email and password are required" });
     const user = await User.findOne({ email: email.toLowerCase().trim() });
-    if (!user || !(await user.matchPassword(password))) {
+    if (!user || !(await user.matchPassword(password)))
       return res.status(401).json({ message: "Invalid email or password" });
-    }
     res.json({
       token: signToken(user._id),
-      user: {
-        _id:       user._id,
-        name:      user.name,
-        email:     user.email,
-        role:      user.role,
-        avatar:    user.avatar,
-        bio:       user.bio,
-        title:     user.title,
-        createdAt: user.createdAt,
-      },
+      user:  { _id: user._id, name: user.name, email: user.email, role: user.role, avatar: user.avatar, bio: user.bio, title: user.title, createdAt: user.createdAt },
     });
   } catch (err) {
     console.error("Login error:", err.message);
-    res.status(500).json({ message: "Login failed. Please try again." });
+    res.status(500).json({ message: "Login failed." });
   }
 });
 
-// Get current user
 app.get("/api/auth/me", protect, (req, res) => {
   const u = req.user;
-  res.json({
-    _id:       u._id,
-    name:      u.name,
-    email:     u.email,
-    role:      u.role,
-    avatar:    u.avatar,
-    bio:       u.bio,
-    title:     u.title,
-    location:  u.location,
-    website:   u.website,
-    createdAt: u.createdAt,
-  });
+  res.json({ _id: u._id, name: u.name, email: u.email, role: u.role, avatar: u.avatar, bio: u.bio, title: u.title, location: u.location, website: u.website, createdAt: u.createdAt });
 });
 
-// Update profile
 app.patch("/api/auth/profile", protect, async (req, res) => {
   try {
     const { name, bio, title, location, website, avatar } = req.body;
-    const user = await User.findByIdAndUpdate(
-      req.user._id,
-      { name, bio, title, location, website, avatar },
-      { new: true, runValidators: true }
-    ).select("-password");
+    const user = await User.findByIdAndUpdate(req.user._id, { name, bio, title, location, website, avatar }, { new: true, runValidators: true }).select("-password");
     res.json(user);
-  } catch (err) {
-    res.status(500).json({ message: err.message });
-  }
+  } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// ─── USER ROUTES ──────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+// USER ROUTES
+// ══════════════════════════════════════════════════════════════════════════════
 
-// Get user by ID (for instructor info)
 app.get("/api/users/:id", async (req, res) => {
   try {
     const user = await User.findById(req.params.id).select("-password");
     if (!user) return res.status(404).json({ message: "User not found" });
     res.json(user);
-  } catch (err) {
-    res.status(500).json({ message: err.message });
-  }
+  } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// ─── COURSE ROUTES ────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+// COURSE ROUTES
+// ══════════════════════════════════════════════════════════════════════════════
 
-// Instructor: get my courses
+// Named sub-routes MUST come before /:id wildcard
+
 app.get("/api/courses/instructor/my-courses", protect, instructorOnly, async (req, res) => {
   try {
-    const courses = await Course.find({ instructor: req.user._id }).sort("-createdAt");
-    res.json(courses);
-  } catch (err) {
-    res.status(500).json({ message: err.message });
-  }
+    res.json(await Course.find({ instructor: req.user._id }).sort("-createdAt"));
+  } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// Alias for backward compatibility
 app.get("/api/courses/instructor/mine", protect, instructorOnly, async (req, res) => {
   try {
-    const courses = await Course.find({ instructor: req.user._id }).sort("-createdAt");
-    res.json(courses);
-  } catch (err) {
-    res.status(500).json({ message: err.message });
-  }
+    res.json(await Course.find({ instructor: req.user._id }).sort("-createdAt"));
+  } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// Public: list all published courses
 app.get("/api/courses", async (req, res) => {
   try {
     const { category, search } = req.query;
     const query = { status: "published" };
     if (category && category !== "All") query.category = category;
     if (search) query.title = { $regex: search, $options: "i" };
-
     const courses = await Course.find(query)
       .populate("instructor", "name avatar title")
       .select("-sections")
       .sort("-createdAt");
     res.json(courses);
-  } catch (err) {
-    res.status(500).json({ message: err.message });
-  }
+  } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// Public: single course detail (with full sections, testimonials, and reviews)
+// ── GET single course — returns ALL new fields to Shopify.jsx ─────────────────
 app.get("/api/courses/:id", async (req, res) => {
   try {
     const course = await Course.findById(req.params.id)
       .populate("instructor", "name avatar title bio location website");
-    
     if (!course) return res.status(404).json({ message: "Course not found" });
 
-    // Fetch reviews for this course
-    const reviews = await Review.find({ course: req.params.id })
+    // Fetch & format reviews
+    const dbReviews = await Review.find({ course: req.params.id })
       .populate("student", "name avatar")
-      .sort({ createdAt: -1 })
+      .sort("-createdAt")
       .limit(50);
 
-    // Map reviews to the format expected by frontend
-    const reviews_list = reviews.map((r) => ({
-      _id: r._id,
-      id: r._id,
-      author: r.student?.name || "Anonymous",
-      avatar: r.student?.avatar || "",
-      rating: r.rating,
-      text: r.comment || r.text || "",
-      date: r.createdAt ? new Date(r.createdAt).toLocaleDateString() : "Recently",
-      verified: true,
+    const reviews_list = dbReviews.map(r => ({
+      _id:     r._id,
+      author:  r.student?.name || "Anonymous",
+      avatar:  r.student?.avatar || "",
+      rating:  r.rating,
+      text:    r.comment || r.text || "",
+      date:    r.createdAt ? new Date(r.createdAt).toLocaleDateString() : "Recently",
     }));
 
-    // Transform sections to include lectures_list
-    const sectionsWithLectures = course.sections.map(section => ({
-      ...section.toObject(),
-      lectures_list: section.lectures || []
+    // Add lectures_list to each section (Shopify.jsx reads `section.lectures_list`)
+    const sectionsWithList = course.sections.map(sec => ({
+      ...sec.toObject(),
+      lectures_list: sec.lectures || [],
     }));
 
-    // Return course with all data
-    const courseObj = course.toObject();
+    const obj = course.toObject();
     res.json({
-      ...courseObj,
-      sections: sectionsWithLectures,
+      ...obj,
+      sections:            sectionsWithList,
       reviews_list,
-      students: courseObj.students || courseObj.studentsEnrolled || 0,
-      reviews: courseObj.reviews || courseObj.totalRatings || 0,
+      students:            obj.students || obj.studentsEnrolled || 0,
+      reviews:             obj.reviews  || obj.totalRatings     || 0,
+      // ── NEW fields passed through to landing page ──────────────────────
+      imageTestimonials:   obj.imageTestimonials   || [],
+      videoTestimonials:   obj.videoTestimonials   || [],
+      projectGallery:      obj.projectGallery      || [],
+      alsoBoughtCourseIds: obj.alsoBoughtCourseIds || [],
     });
   } catch (err) {
-    console.error("Get course by ID error:", err);
+    console.error("GET course error:", err);
     res.status(404).json({ message: "Course not found" });
   }
 });
 
-// Create course
 app.post("/api/courses", protect, instructorOnly, async (req, res) => {
   try {
-    const data = sanitizeSections(req.body);
-    
-    // Sanitize testimonials and gallery
-    if (data.imageTestimonials) {
-      data.imageTestimonials = sanitizeTestimonials(data.imageTestimonials);
-    }
-    if (data.videoTestimonials) {
-      data.videoTestimonials = sanitizeTestimonials(data.videoTestimonials);
-    }
-    if (data.projectGallery) {
-      data.projectGallery = sanitizeTestimonials(data.projectGallery);
-    }
-    
+    const data = sanitizeCoursePayload(req.body);
     const course = await Course.create({ ...data, instructor: req.user._id });
     res.status(201).json(course);
   } catch (err) {
@@ -453,22 +443,9 @@ app.post("/api/courses", protect, instructorOnly, async (req, res) => {
   }
 });
 
-// Update course
 app.put("/api/courses/:id", protect, instructorOnly, async (req, res) => {
   try {
-    const data = sanitizeSections(req.body);
-    
-    // Sanitize testimonials and gallery
-    if (data.imageTestimonials) {
-      data.imageTestimonials = sanitizeTestimonials(data.imageTestimonials);
-    }
-    if (data.videoTestimonials) {
-      data.videoTestimonials = sanitizeTestimonials(data.videoTestimonials);
-    }
-    if (data.projectGallery) {
-      data.projectGallery = sanitizeTestimonials(data.projectGallery);
-    }
-    
+    const data = sanitizeCoursePayload(req.body);
     const course = await Course.findOneAndUpdate(
       { _id: req.params.id, instructor: req.user._id },
       data,
@@ -482,18 +459,14 @@ app.put("/api/courses/:id", protect, instructorOnly, async (req, res) => {
   }
 });
 
-// Delete course
 app.delete("/api/courses/:id", protect, instructorOnly, async (req, res) => {
   try {
     const course = await Course.findOneAndDelete({ _id: req.params.id, instructor: req.user._id });
     if (!course) return res.status(404).json({ message: "Course not found or unauthorized" });
     res.json({ message: "Course deleted successfully" });
-  } catch (err) {
-    res.status(500).json({ message: err.message });
-  }
+  } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// Toggle publish/unpublish
 app.patch("/api/courses/:id/publish", protect, instructorOnly, async (req, res) => {
   try {
     const course = await Course.findOne({ _id: req.params.id, instructor: req.user._id });
@@ -501,12 +474,9 @@ app.patch("/api/courses/:id/publish", protect, instructorOnly, async (req, res) 
     course.status = course.status === "published" ? "draft" : "published";
     await course.save();
     res.json({ status: course.status, isPublished: course.status === "published" });
-  } catch (err) {
-    res.status(500).json({ message: err.message });
-  }
+  } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// Status update (kept for compatibility)
 app.patch("/api/courses/:id/status", protect, instructorOnly, async (req, res) => {
   try {
     const course = await Course.findOneAndUpdate(
@@ -516,124 +486,87 @@ app.patch("/api/courses/:id/status", protect, instructorOnly, async (req, res) =
     );
     if (!course) return res.status(404).json({ message: "Course not found" });
     res.json(course);
-  } catch (err) {
-    res.status(500).json({ message: err.message });
-  }
+  } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// ─── ENROLLMENT ROUTES ────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+// ENROLLMENT ROUTES
+// ══════════════════════════════════════════════════════════════════════════════
 
-// Get my enrolled courses
 app.get("/api/enrollments/my", protect, async (req, res) => {
   try {
     const enrollments = await Enrollment.find({ student: req.user._id })
-      .populate({
-        path:     "course",
-        populate: { path: "instructor", select: "name avatar title" },
-      })
+      .populate({ path: "course", populate: { path: "instructor", select: "name avatar title" } })
       .sort("-createdAt");
     res.json(enrollments);
-  } catch (err) {
-    res.status(500).json({ message: err.message });
-  }
+  } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// Check if enrolled in a specific course
 app.get("/api/enrollments/check/:courseId", protect, async (req, res) => {
   try {
-    const enrollment = await Enrollment.findOne({
-      student: req.user._id,
-      course:  req.params.courseId,
-    });
+    const enrollment = await Enrollment.findOne({ student: req.user._id, course: req.params.courseId });
     res.json({ enrolled: Boolean(enrollment), isEnrolled: Boolean(enrollment) });
-  } catch (err) {
-    res.status(500).json({ message: err.message });
-  }
+  } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// Enroll in a course
 app.post("/api/enrollments/:courseId", protect, async (req, res) => {
   try {
     const course = await Course.findById(req.params.courseId);
     if (!course) return res.status(404).json({ message: "Course not found" });
-    if (course.status !== "published" && course.price > 0) {
+    if (course.status !== "published" && course.price > 0)
       return res.status(403).json({ message: "This course is not available for enrollment" });
-    }
 
-    const existing = await Enrollment.findOne({
-      student: req.user._id,
-      course:  req.params.courseId,
-    });
-    if (existing) return res.status(400).json({ message: "You are already enrolled in this course" });
+    const existing = await Enrollment.findOne({ student: req.user._id, course: req.params.courseId });
+    if (existing) return res.status(400).json({ message: "Already enrolled" });
 
-    const enrollment = await Enrollment.create({
-      student: req.user._id,
-      course:  req.params.courseId,
-    });
+    const enrollment = await Enrollment.create({ student: req.user._id, course: req.params.courseId });
     await Course.findByIdAndUpdate(req.params.courseId, { $inc: { studentsEnrolled: 1, students: 1 } });
-
-    // Auto-create empty progress record
     await Progress.findOneAndUpdate(
       { student: req.user._id, courseId: req.params.courseId },
       { $setOnInsert: { student: req.user._id, courseId: req.params.courseId, completedLectures: [] } },
       { upsert: true, new: true }
     );
-
     res.status(201).json(enrollment);
-  } catch (err) {
-    res.status(500).json({ message: err.message });
-  }
+  } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// ─── PROGRESS ROUTES ──────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+// PROGRESS ROUTES
+// ══════════════════════════════════════════════════════════════════════════════
 
-// Mark a lecture as complete
 app.post("/api/progress/mark", protect, async (req, res) => {
   try {
     const { courseId, lectureId } = req.body;
-    if (!courseId || !lectureId) {
-      return res.status(400).json({ message: "courseId and lectureId are required" });
-    }
-
-    const enrolled = await Enrollment.findOne({ student: req.user._id, course: courseId });
-    if (!enrolled) return res.status(403).json({ message: "You are not enrolled in this course" });
+    if (!courseId || !lectureId) return res.status(400).json({ message: "courseId and lectureId are required" });
+    if (!(await Enrollment.findOne({ student: req.user._id, course: courseId })))
+      return res.status(403).json({ message: "Not enrolled in this course" });
 
     let progress = await Progress.findOne({ student: req.user._id, courseId });
-    if (!progress) {
-      progress = new Progress({ student: req.user._id, courseId, completedLectures: [] });
-    }
-    const lecIdStr = String(lectureId);
-    if (!progress.completedLectures.includes(lecIdStr)) {
-      progress.completedLectures.push(lecIdStr);
-    }
+    if (!progress) progress = new Progress({ student: req.user._id, courseId, completedLectures: [] });
+    const lid = String(lectureId);
+    if (!progress.completedLectures.includes(lid)) progress.completedLectures.push(lid);
     await progress.save();
     res.json(progress);
-  } catch (err) {
-    res.status(500).json({ message: err.message });
-  }
+  } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// Get all progress for current student
 app.get("/api/progress/my", protect, async (req, res) => {
   try {
-    const progress = await Progress.find({ student: req.user._id });
-    res.json(progress);
-  } catch (err) {
-    res.status(500).json({ message: err.message });
-  }
+    res.json(await Progress.find({ student: req.user._id }));
+  } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// ─── REVIEW ROUTES ────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+// REVIEW ROUTES
+// ══════════════════════════════════════════════════════════════════════════════
 
-// Get reviews for a course (public)
 app.get("/api/courses/:courseId/reviews", async (req, res) => {
   try {
     const reviews = await Review.find({ course: req.params.courseId })
       .populate("student", "name avatar")
       .sort("-createdAt")
       .limit(100);
-
-    const mapped = reviews.map(r => ({
+    res.json(reviews.map(r => ({
       _id:       r._id,
       rating:    r.rating,
       comment:   r.comment || r.text,
@@ -641,23 +574,18 @@ app.get("/api/courses/:courseId/reviews", async (req, res) => {
       createdAt: r.createdAt,
       user:      r.student,
       author:    r.student?.name || "Anonymous",
-    }));
-    res.json(mapped);
-  } catch (err) {
-    res.status(500).json({ message: "Could not fetch reviews" });
-  }
+    })));
+  } catch (err) { res.status(500).json({ message: "Could not fetch reviews" }); }
 });
 
-// Submit a review (authenticated users only)
 app.post("/api/courses/:courseId/reviews", protect, async (req, res) => {
   try {
     const { rating, comment, text } = req.body;
     const reviewText = text || comment || "";
-    
     if (!rating) return res.status(400).json({ message: "Rating is required" });
 
-    const existing = await Review.findOne({ course: req.params.courseId, student: req.user._id });
-    if (existing) return res.status(400).json({ message: "You have already reviewed this course" });
+    if (await Review.findOne({ course: req.params.courseId, student: req.user._id }))
+      return res.status(400).json({ message: "You have already reviewed this course" });
 
     const review = await Review.create({
       course:  req.params.courseId,
@@ -667,12 +595,12 @@ app.post("/api/courses/:courseId/reviews", protect, async (req, res) => {
       text:    reviewText,
     });
 
-    const allReviews = await Review.find({ course: req.params.courseId });
-    const avg = allReviews.reduce((a, r) => a + r.rating, 0) / allReviews.length;
+    const all = await Review.find({ course: req.params.courseId });
+    const avg = all.reduce((a, r) => a + r.rating, 0) / all.length;
     await Course.findByIdAndUpdate(req.params.courseId, {
       rating:       Math.round(avg * 10) / 10,
-      totalRatings: allReviews.length,
-      reviews:      allReviews.length,
+      totalRatings: all.length,
+      reviews:      all.length,
     });
 
     const populated = await Review.findById(review._id).populate("student", "name avatar");
@@ -685,142 +613,171 @@ app.post("/api/courses/:courseId/reviews", protect, async (req, res) => {
       user:      populated.student,
     });
   } catch (err) {
-    if (err.code === 11000) return res.status(400).json({ message: "You have already reviewed this course" });
+    if (err.code === 11000) return res.status(400).json({ message: "Already reviewed" });
     res.status(500).json({ message: err.message });
   }
 });
 
-// ─── IMAGE UPLOAD: temp disk → Cloudinary uploader.upload() → unlink temp ─────
-const UPLOAD_TMP = path.join(__dirname, "uploads", "tmp");
-if (!fs.existsSync(UPLOAD_TMP)) fs.mkdirSync(UPLOAD_TMP, { recursive: true });
+// ══════════════════════════════════════════════════════════════════════════════
+// UPLOAD ROUTES — CLOUDINARY (stream, no disk)
+// ══════════════════════════════════════════════════════════════════════════════
 
-const tempImageStorage = multer.diskStorage({
-  destination: (_, __, cb) => cb(null, UPLOAD_TMP),
-  filename: (_, file, cb) => {
-    const ext = path.extname(file.originalname || "") || ".jpg";
-    cb(null, `img-${Date.now()}-${Math.random().toString(36).slice(2, 9)}${ext}`);
-  },
-});
-const tempImageUpload = multer({
-  storage: tempImageStorage,
-  limits: { fileSize: 5 * 1024 * 1024 },
-  fileFilter: (req, file, cb) => {
-    const allowed = ["image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif"];
-    if (allowed.includes(file.mimetype)) cb(null, true);
-    else cb(new Error("Only image files are allowed (JPG, PNG, WebP, GIF)"), false);
+// ── Multer instances (memory storage) ────────────────────────────────────────
+const imageMulter = multer({
+  storage: multer.memoryStorage(),
+  limits:  { fileSize: 10 * 1024 * 1024 },          // 10 MB
+  fileFilter: (_, file, cb) => {
+    const ok = ["image/jpeg","image/jpg","image/png","image/webp","image/gif"];
+    ok.includes(file.mimetype) ? cb(null, true) : cb(new Error("Only image files are allowed (JPG, PNG, WebP, GIF)"));
   },
 });
 
-app.post("/api/upload/image", protect, instructorOnly, tempImageUpload.single("image"), async (req, res) => {
-  console.log('🚀 [POST] /api/upload/image - Request received');
-  
-  if (!req.file) {
-    console.log('⚠️  Upload failed: No file found in request');
-    return res.status(400).json({ message: "No file uploaded" });
-  }
+const videoMulter = multer({
+  storage: multer.memoryStorage(),
+  limits:  { fileSize: 500 * 1024 * 1024 },          // 500 MB
+  fileFilter: (_, file, cb) => {
+    const ok = ["video/mp4","video/webm","video/ogg","video/quicktime","video/x-msvideo"];
+    ok.includes(file.mimetype) ? cb(null, true) : cb(new Error("Only video files are allowed (MP4, WebM, MOV, AVI)"));
+  },
+});
 
-  const localPath = req.file.path;
-  const courseId = req.body.courseId;
-  
-  console.log(`📂 File detected: ${req.file.originalname} (${req.file.size} bytes)`);
-  console.log(`📍 Local temporary path: ${localPath}`);
-  console.log(`🆔 Course ID provided: ${courseId || 'None (General Upload)'}`);
-
-  const cleanupLocal = async () => {
-    try {
-      await fs.promises.unlink(localPath);
-      console.log('🧹 Cleanup: Local temporary file deleted');
-    } catch (err) {
-      console.error('❌ Cleanup Error: Failed to delete local file', err.message);
-    }
-  };
-
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/upload/image
+// Used by: course thumbnail, image testimonials, project gallery, profile avatar
+// Access:  any authenticated user (instructors AND students — avatars need it)
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/api/upload/image", protect, requireCloudinary, imageMulter.single("image"), async (req, res) => {
   try {
-    // --- Validation Logic ---
-    if (courseId) {
-      if (!mongoose.Types.ObjectId.isValid(courseId)) {
-        console.log('🚫 Validation Error: Invalid Course ID format');
-        await cleanupLocal();
-        return res.status(400).json({ message: "Invalid course id" });
-      }
+    if (!req.file) return res.status(400).json({ message: "No file uploaded" });
 
-      const allowed = await Course.findOne({ _id: courseId, instructor: req.user._id }).select("_id");
-      if (!allowed) {
-        console.log(`🚫 Auth Error: User ${req.user._id} not authorized for Course ${courseId}`);
-        await cleanupLocal();
-        return res.status(404).json({ message: "Course not found or unauthorized" });
-      }
-      console.log('✅ Authorization: Course ownership verified');
-    }
+    // Choose Cloudinary folder based on caller role
+    const folder = req.user.role === "instructor"
+      ? "learnify/course-images"
+      : "learnify/avatars";
 
-    // --- Cloudinary Upload ---
-    console.log('☁️  Starting Cloudinary upload...');
-    const result = await cloudinary.uploader.upload(localPath, {
-      folder: "udemy-clone",
-      resource_type: "image",
+    const result = await streamToCloudinary(req.file.buffer, {
+      folder,
+      resource_type:   "image",
+      allowed_formats: ["jpg","jpeg","png","webp","gif"],
+      transformation:  [
+        { width: 1280, height: 720, crop: "limit" },
+        { quality: "auto:good" },
+        { fetch_format: "auto" },
+      ],
     });
-    console.log('✨ Cloudinary upload successful!');
-    console.log(`🔗 URL: ${result.secure_url}`);
 
-    await cleanupLocal();
-
-    // --- Database Update ---
-    if (courseId) {
-      console.log('💾 Updating database with new thumbnail URL...');
-      const updated = await Course.findOneAndUpdate(
-        { _id: courseId, instructor: req.user._id },
-        { $set: { thumbnail: result.secure_url } },
-        { new: true }
-      ).select("thumbnail");
-
-      console.log('🏁 Success: Database updated and response sent');
-      return res.json({
-        url: result.secure_url,
-        secure_url: result.secure_url,
-        public_id: result.public_id,
-        thumbnail: updated.thumbnail,
-      });
+    // If a courseId was supplied with the thumbnail upload, persist it immediately
+    if (req.body.courseId && mongoose.Types.ObjectId.isValid(req.body.courseId)) {
+      await Course.findOneAndUpdate(
+        { _id: req.body.courseId, instructor: req.user._id },
+        { thumbnail: result.secure_url }
+      );
     }
 
-    console.log('🏁 Success: General upload completed (No DB update required)');
+    console.log("✅ Image uploaded:", result.secure_url);
     res.json({
-      url: result.secure_url,
+      url:        result.secure_url,
       secure_url: result.secure_url,
-      public_id: result.public_id,
+      imageUrl:   result.secure_url,
+      publicId:   result.public_id,
+      width:      result.width,
+      height:     result.height,
+      format:     result.format,
     });
-
   } catch (err) {
-    console.error('💥 CRITICAL ERROR during upload process:');
-    console.error(err);
-    await cleanupLocal();
-    res.status(500).json({ message: err.message || "Upload failed" });
+    console.error("❌ Image upload error:", err.message);
+    res.status(500).json({ message: "Failed to upload image", error: err.message });
   }
 });
 
-// ─── HEALTH CHECK ─────────────────────────────────────────────────────────────
-app.get("/api/health", (req, res) => {
-  res.json({
-    status:   "ok",
-    database: mongoose.connection.readyState === 1 ? "connected" : "disconnected",
-    time:     new Date().toISOString(),
-  });
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/upload/video
+// Used by: video testimonials upload in InstructorDashboard
+// Access:  instructors only
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/api/upload/video", protect, instructorOnly, requireCloudinary, videoMulter.single("video"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ message: "No video file uploaded" });
+
+    const result = await streamToCloudinary(req.file.buffer, {
+      folder:        "learnify/video-testimonials",
+      resource_type: "video",
+      // async transcoding — response is instant, Cloudinary processes in background
+      eager: [
+        { streaming_profile: "hd", format: "m3u8" },              // HLS
+        { width: 1280, height: 720, crop: "limit", format: "mp4" }, // 720p MP4
+      ],
+      eager_async: true,
+    });
+
+    console.log("✅ Video uploaded:", result.secure_url);
+    res.json({
+      url:        result.secure_url,
+      secure_url: result.secure_url,
+      videoUrl:   result.secure_url,
+      publicId:   result.public_id,
+      duration:   result.duration,  // seconds (Cloudinary auto-detects)
+      format:     result.format,
+      bytes:      result.bytes,
+    });
+  } catch (err) {
+    console.error("❌ Video upload error:", err.message);
+    res.status(500).json({ message: "Failed to upload video", error: err.message });
+  }
 });
 
-// ─── 404 HANDLER ──────────────────────────────────────────────────────────────
-app.use((req, res) => {
-  res.status(404).json({ message: `Route ${req.method} ${req.path} not found` });
+// ─────────────────────────────────────────────────────────────────────────────
+// DELETE /api/upload/image/:publicId  &  DELETE /api/upload/video/:publicId
+// ─────────────────────────────────────────────────────────────────────────────
+app.delete("/api/upload/image/:publicId", protect, instructorOnly, async (req, res) => {
+  try {
+    const result = await cloudinary.uploader.destroy(decodeURIComponent(req.params.publicId), { resource_type: "image" });
+    result.result === "ok"
+      ? res.json({ message: "Image deleted", publicId: req.params.publicId })
+      : res.status(404).json({ message: "Image not found or already deleted" });
+  } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// ─── ERROR HANDLER ────────────────────────────────────────────────────────────
+app.delete("/api/upload/video/:publicId", protect, instructorOnly, async (req, res) => {
+  try {
+    const result = await cloudinary.uploader.destroy(decodeURIComponent(req.params.publicId), { resource_type: "video" });
+    result.result === "ok"
+      ? res.json({ message: "Video deleted", publicId: req.params.publicId })
+      : res.status(404).json({ message: "Video not found or already deleted" });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// MULTER ERROR HANDLER — must be after all routes
+// Catches file-size and MIME-type rejections; returns clean JSON
+// ══════════════════════════════════════════════════════════════════════════════
 app.use((err, req, res, next) => {
-  console.error("Unhandled error:", err.message);
-  res.status(500).json({ message: err.message || "Internal server error" });
+  if (err instanceof multer.MulterError) {
+    if (err.code === "LIMIT_FILE_SIZE")
+      return res.status(413).json({ message: "File too large. Max: 10 MB for images, 500 MB for videos." });
+    return res.status(400).json({ message: `Upload error: ${err.message}` });
+  }
+  if (err?.message?.match(/^Only (image|video) files/))
+    return res.status(415).json({ message: err.message });
+  next(err);
 });
 
-// ─── START SERVER ─────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+// 404 + GLOBAL ERROR HANDLER
+// ══════════════════════════════════════════════════════════════════════════════
+app.use((req, res) => res.status(404).json({ message: `Route ${req.method} ${req.path} not found` }));
+
+app.use((err, req, res, next) => {
+  console.error("❌ Unhandled error:", err.message);
+  res.status(500).json({ success: false, message: err.message || "Internal Server Error" });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// START
+// ══════════════════════════════════════════════════════════════════════════════
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on http://localhost:${PORT}`);
-  console.log(`📦 Database: learnify @ cluster0.27tk541.mongodb.net`);
-  console.log(`🌍 CORS allowed origins: ${allowedOrigins.join(", ")}`);
+  console.log(`🚀  Server  →  http://localhost:${PORT}`);
+  console.log(`🌍  CORS    →  ${allowedOrigins.join(", ")}`);
+  console.log(`☁️   Cloud  →  ${process.env.CLOUDINARY_CLOUD_NAME ?? "⚠️  NOT SET"}`);
 });
