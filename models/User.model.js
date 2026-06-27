@@ -28,14 +28,20 @@ const UserSchema = new mongoose.Schema(
       enum: ["student", "instructor"],
       default: "student",
     },
-    // Instructor-specific fields
-    bio:      { type: String, default: "" },
-    title:    { type: String, default: "" },
-    avatar:   { type: String, default: "" },
-    location: { type: String, default: "" },
-    website:  { type: String, default: "" },
-    twitter:  { type: String, default: "" },
-    linkedin: { type: String, default: "" },
+    // Instructor profile fields
+    bio:                   { type: String, default: "" },
+    title:                 { type: String, default: "" },
+    avatar:                { type: String, default: "" },
+    location:              { type: String, default: "" },
+    website:               { type: String, default: "" },
+    twitter:               { type: String, default: "" },
+    linkedin:              { type: String, default: "" },
+    instructorDescription: { type: String, default: "" },
+    // Manually set display stats (not auto-calculated)
+    totalRatings:  { type: Number, default: 0 },
+    totalReviews:  { type: Number, default: 0 },
+    totalStudents: { type: Number, default: 0 },
+    totalCourses:  { type: Number, default: 0 },
 
     // Student-specific: list of enrolled course IDs
     enrolledCourses: [
@@ -48,7 +54,6 @@ const UserSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-// ── Hash password before saving ───────────────────────────────────────────────
 UserSchema.pre("save", async function (next) {
   if (!this.isModified("password")) return next();
   const salt = await bcrypt.genSalt(10);
@@ -56,7 +61,6 @@ UserSchema.pre("save", async function (next) {
   next();
 });
 
-// ── Compare plain password with hashed ───────────────────────────────────────
 UserSchema.methods.matchPassword = async function (enteredPassword) {
   return await bcrypt.compare(enteredPassword, this.password);
 };

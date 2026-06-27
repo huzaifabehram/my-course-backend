@@ -66,6 +66,12 @@ const UserSchema = new mongoose.Schema({
   website:  String,
   twitter:  String,
   linkedin: String,
+  // Instructor display stats (manually set — not auto-calculated)
+  totalRatings:        { type: Number, default: 0 },
+  totalReviews:        { type: Number, default: 0 },
+  totalStudents:       { type: Number, default: 0 },
+  totalCourses:        { type: Number, default: 0 },
+  instructorDescription: { type: String, default: "" },
 }, { timestamps: true });
 
 UserSchema.pre("save", async function(next) {
@@ -241,6 +247,11 @@ function serializeUser(user) {
     website:   user.website   || "",
     twitter:   user.twitter   || "",
     linkedin:  user.linkedin  || "",
+    totalRatings:          Number(user.totalRatings)  || 0,
+    totalReviews:          Number(user.totalReviews)  || 0,
+    totalStudents:         Number(user.totalStudents) || 0,
+    totalCourses:          Number(user.totalCourses)  || 0,
+    instructorDescription: user.instructorDescription || "",
     createdAt: user.createdAt,
   };
 }
@@ -375,13 +386,25 @@ app.get("/api/auth/me", protect, (req, res) => {
 
 async function handleUpdateProfile(req, res) {
   try {
-    const allowed = ["name", "bio", "title", "location", "website", "avatar", "twitter", "linkedin"];
+    const allowed = [
+      "name", "bio", "title", "location", "website", "avatar", "twitter", "linkedin",
+      "totalRatings", "totalReviews", "totalStudents", "totalCourses", "instructorDescription",
+    ];
     const updates = {};
     for (const key of allowed) {
       if (req.body[key] !== undefined) {
         let value = req.body[key];
-        // Never persist temporary browser blob URLs
         if (key === "avatar" && value && !String(value).startsWith("http")) {
+          continue;
+        }
+        if (key === "totalRatings") {
+          const n = parseFloat(value);
+          updates[key] = isNaN(n) ? 0 : Math.min(5, Math.max(0, Math.round(n * 10) / 10));
+          continue;
+        }
+        if (["totalReviews", "totalStudents", "totalCourses"].includes(key)) {
+          const n = parseInt(value, 10);
+          updates[key] = isNaN(n) ? 0 : Math.max(0, n);
           continue;
         }
         updates[key] = value;
@@ -455,7 +478,7 @@ app.get("/api/courses", async (req, res) => {
 app.get("/api/courses/:id", async (req, res) => {
   try {
     const course = await Course.findById(req.params.id)
-      .populate("instructor", "name avatar title bio location website twitter linkedin");
+      .populate("instructor", "name avatar title bio location website twitter linkedin totalRatings totalReviews totalStudents totalCourses instructorDescription");
     if (!course) return res.status(404).json({ message: "Course not found" });
 
     // Fetch & format reviews
