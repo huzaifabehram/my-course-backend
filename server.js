@@ -373,12 +373,19 @@ app.get("/api/auth/me", protect, (req, res) => {
   res.json(serializeUser(req.user));
 });
 
-app.patch("/api/auth/profile", protect, async (req, res) => {
+async function handleUpdateProfile(req, res) {
   try {
     const allowed = ["name", "bio", "title", "location", "website", "avatar", "twitter", "linkedin"];
     const updates = {};
     for (const key of allowed) {
-      if (req.body[key] !== undefined) updates[key] = req.body[key];
+      if (req.body[key] !== undefined) {
+        let value = req.body[key];
+        // Never persist temporary browser blob URLs
+        if (key === "avatar" && value && !String(value).startsWith("http")) {
+          continue;
+        }
+        updates[key] = value;
+      }
     }
     if (Object.keys(updates).length === 0) {
       return res.status(400).json({ message: "No profile fields to update" });
@@ -389,12 +396,20 @@ app.patch("/api/auth/profile", protect, async (req, res) => {
       { new: true, runValidators: true }
     ).select("-password");
     res.json(serializeUser(user));
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+}
+
+app.patch("/api/auth/profile", protect, handleUpdateProfile);
 
 // ══════════════════════════════════════════════════════════════════════════════
 // USER ROUTES
 // ══════════════════════════════════════════════════════════════════════════════
+
+// Named route MUST come before /:id — InstructorDashboard calls PUT /api/users/profile
+app.put("/api/users/profile", protect, handleUpdateProfile);
+app.patch("/api/users/profile", protect, handleUpdateProfile);
 
 app.get("/api/users/:id", async (req, res) => {
   try {
