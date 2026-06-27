@@ -29,9 +29,13 @@ const UserSchema = new mongoose.Schema(
       default: "student",
     },
     // Instructor-specific fields
-    bio: { type: String, default: "" },
-    title: { type: String, default: "" },
-    avatar: { type: String, default: "" },
+    bio:      { type: String, default: "" },
+    title:    { type: String, default: "" },
+    avatar:   { type: String, default: "" },
+    location: { type: String, default: "" },
+    website:  { type: String, default: "" },
+    twitter:  { type: String, default: "" },
+    linkedin: { type: String, default: "" },
 
     // Student-specific: list of enrolled course IDs
     enrolledCourses: [

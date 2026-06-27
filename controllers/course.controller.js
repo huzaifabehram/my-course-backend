@@ -56,12 +56,13 @@ const getCourseById = async (req, res) => {
     // Map reviews to the format expected by frontend
     const reviews_list = reviews.map((r) => ({
       id: r._id,
-      author: r.student?.name || "Anonymous",
+      author: r.authorName || r.student?.name || "Anonymous",
+      authorName: r.authorName || r.student?.name || "",
       avatar: r.student?.avatar || "",
       rating: r.rating,
-      text: r.comment || "",
+      text: r.comment || r.text || "",
       date: r.createdAt ? new Date(r.createdAt).toLocaleDateString() : "Recently",
-      verified: true,
+      verified: Boolean(r.student),
     }));
 
     // Return course with reviews

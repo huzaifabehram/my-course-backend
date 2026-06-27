@@ -64,6 +64,8 @@ const UserSchema = new mongoose.Schema({
   title:    String,
   location: String,
   website:  String,
+  twitter:  String,
+  linkedin: String,
 }, { timestamps: true });
 
 UserSchema.pre("save", async function(next) {
@@ -170,14 +172,24 @@ const Progress = mongoose.model("Progress", ProgressSchema);
 
 // ── Review ────────────────────────────────────────────────────────────────────
 const ReviewSchema = new mongoose.Schema({
-  course:  { type: mongoose.Schema.Types.ObjectId, ref: "Course", required: true },
-  student: { type: mongoose.Schema.Types.ObjectId, ref: "User",   required: true },
-  rating:  { type: Number, required: true, min: 1, max: 5 },
-  comment: { type: String, default: "" },
-  text:    { type: String, default: "" },
+  course:     { type: mongoose.Schema.Types.ObjectId, ref: "Course", required: true },
+  student:    { type: mongoose.Schema.Types.ObjectId, ref: "User" }, // optional — guest reviews allowed
+  authorName: { type: String, default: "" },
+  rating:     { type: Number, required: true, min: 1, max: 5 },
+  comment:    { type: String, default: "" },
+  text:       { type: String, default: "" },
 }, { timestamps: true });
-ReviewSchema.index({ course: 1, student: 1 }, { unique: true });
 const Review = mongoose.model("Review", ReviewSchema);
+
+// Drop legacy one-review-per-student index (allows unlimited guest + member reviews)
+mongoose.connection.once("open", async () => {
+  try {
+    await Review.collection.dropIndex("course_1_student_1");
+    console.log("✓ Dropped legacy unique review index");
+  } catch {
+    /* index may not exist */
+  }
+});
 
 // ══════════════════════════════════════════════════════════════════════════════
 // AUTH MIDDLEWARE
@@ -198,11 +210,40 @@ const protect = async (req, res, next) => {
   }
 };
 
+// Attach user when a valid token is present; guests proceed without auth
+const optionalProtect = async (req, res, next) => {
+  const token = req.headers.authorization?.split(" ")[1];
+  if (!token) return next();
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = await User.findById(decoded.id).select("-password");
+  } catch { /* invalid token — treat as guest */ }
+  next();
+};
+
 const instructorOnly = (req, res, next) => {
   if (req.user?.role !== "instructor")
     return res.status(403).json({ message: "Access denied — instructors only" });
   next();
 };
+
+function serializeUser(user) {
+  if (!user) return null;
+  return {
+    _id:       user._id,
+    name:      user.name,
+    email:     user.email,
+    role:      user.role,
+    avatar:    user.avatar    || "",
+    bio:       user.bio       || "",
+    title:     user.title     || "",
+    location:  user.location  || "",
+    website:   user.website   || "",
+    twitter:   user.twitter   || "",
+    linkedin:  user.linkedin  || "",
+    createdAt: user.createdAt,
+  };
+}
 
 // ══════════════════════════════════════════════════════════════════════════════
 // HELPERS
@@ -303,7 +344,7 @@ app.post("/api/auth/register", async (req, res) => {
     });
     res.status(201).json({
       token: signToken(user._id),
-      user:  { _id: user._id, name: user.name, email: user.email, role: user.role, avatar: user.avatar },
+      user:  serializeUser(user),
     });
   } catch (err) {
     console.error("Register error:", err.message);
@@ -320,7 +361,7 @@ app.post("/api/auth/login", async (req, res) => {
       return res.status(401).json({ message: "Invalid email or password" });
     res.json({
       token: signToken(user._id),
-      user:  { _id: user._id, name: user.name, email: user.email, role: user.role, avatar: user.avatar, bio: user.bio, title: user.title, createdAt: user.createdAt },
+      user:  serializeUser(user),
     });
   } catch (err) {
     console.error("Login error:", err.message);
@@ -329,15 +370,25 @@ app.post("/api/auth/login", async (req, res) => {
 });
 
 app.get("/api/auth/me", protect, (req, res) => {
-  const u = req.user;
-  res.json({ _id: u._id, name: u.name, email: u.email, role: u.role, avatar: u.avatar, bio: u.bio, title: u.title, location: u.location, website: u.website, createdAt: u.createdAt });
+  res.json(serializeUser(req.user));
 });
 
 app.patch("/api/auth/profile", protect, async (req, res) => {
   try {
-    const { name, bio, title, location, website, avatar } = req.body;
-    const user = await User.findByIdAndUpdate(req.user._id, { name, bio, title, location, website, avatar }, { new: true, runValidators: true }).select("-password");
-    res.json(user);
+    const allowed = ["name", "bio", "title", "location", "website", "avatar", "twitter", "linkedin"];
+    const updates = {};
+    for (const key of allowed) {
+      if (req.body[key] !== undefined) updates[key] = req.body[key];
+    }
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ message: "No profile fields to update" });
+    }
+    const user = await User.findByIdAndUpdate(
+      req.user._id,
+      updates,
+      { new: true, runValidators: true }
+    ).select("-password");
+    res.json(serializeUser(user));
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
@@ -349,7 +400,7 @@ app.get("/api/users/:id", async (req, res) => {
   try {
     const user = await User.findById(req.params.id).select("-password");
     if (!user) return res.status(404).json({ message: "User not found" });
-    res.json(user);
+    res.json(serializeUser(user));
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
@@ -389,7 +440,7 @@ app.get("/api/courses", async (req, res) => {
 app.get("/api/courses/:id", async (req, res) => {
   try {
     const course = await Course.findById(req.params.id)
-      .populate("instructor", "name avatar title bio location website");
+      .populate("instructor", "name avatar title bio location website twitter linkedin");
     if (!course) return res.status(404).json({ message: "Course not found" });
 
     // Fetch & format reviews
@@ -399,12 +450,13 @@ app.get("/api/courses/:id", async (req, res) => {
       .limit(50);
 
     const reviews_list = dbReviews.map(r => ({
-      _id:     r._id,
-      author:  r.student?.name || "Anonymous",
-      avatar:  r.student?.avatar || "",
-      rating:  r.rating,
-      text:    r.comment || r.text || "",
-      date:    r.createdAt ? new Date(r.createdAt).toLocaleDateString() : "Recently",
+      _id:        r._id,
+      author:     r.authorName || r.student?.name || "Anonymous",
+      authorName: r.authorName || r.student?.name || "",
+      avatar:     r.student?.avatar || "",
+      rating:     r.rating,
+      text:       r.comment || r.text || "",
+      date:       r.createdAt ? new Date(r.createdAt).toLocaleDateString() : "Recently",
     }));
 
     // Add lectures_list to each section (Shopify.jsx reads `section.lectures_list`)
@@ -567,32 +619,35 @@ app.get("/api/courses/:courseId/reviews", async (req, res) => {
       .sort("-createdAt")
       .limit(100);
     res.json(reviews.map(r => ({
-      _id:       r._id,
-      rating:    r.rating,
-      comment:   r.comment || r.text,
-      text:      r.comment || r.text,
-      createdAt: r.createdAt,
-      user:      r.student,
-      author:    r.student?.name || "Anonymous",
+      _id:        r._id,
+      rating:     r.rating,
+      comment:    r.comment || r.text,
+      text:       r.comment || r.text,
+      createdAt:  r.createdAt,
+      user:       r.student,
+      author:     r.authorName || r.student?.name || "Anonymous",
+      authorName: r.authorName || r.student?.name || "",
     })));
   } catch (err) { res.status(500).json({ message: "Could not fetch reviews" }); }
 });
 
-app.post("/api/courses/:courseId/reviews", protect, async (req, res) => {
+app.post("/api/courses/:courseId/reviews", optionalProtect, async (req, res) => {
   try {
-    const { rating, comment, text } = req.body;
-    const reviewText = text || comment || "";
-    if (!rating) return res.status(400).json({ message: "Rating is required" });
+    const { rating, comment, text, authorName, name } = req.body;
+    const reviewText = (text || comment || "").trim();
+    const reviewerName = (authorName || name || req.user?.name || "").trim();
 
-    if (await Review.findOne({ course: req.params.courseId, student: req.user._id }))
-      return res.status(400).json({ message: "You have already reviewed this course" });
+    if (!rating) return res.status(400).json({ message: "Rating is required" });
+    if (!reviewerName) return res.status(400).json({ message: "Reviewer name is required" });
+    if (!reviewText) return res.status(400).json({ message: "Review text is required" });
 
     const review = await Review.create({
-      course:  req.params.courseId,
-      student: req.user._id,
-      rating:  Number(rating),
-      comment: reviewText,
-      text:    reviewText,
+      course:     req.params.courseId,
+      student:    req.user?._id || undefined,
+      authorName: reviewerName,
+      rating:     Number(rating),
+      comment:    reviewText,
+      text:       reviewText,
     });
 
     const all = await Review.find({ course: req.params.courseId });
@@ -604,16 +659,18 @@ app.post("/api/courses/:courseId/reviews", protect, async (req, res) => {
     });
 
     const populated = await Review.findById(review._id).populate("student", "name avatar");
+    const displayName = populated.authorName || populated.student?.name || reviewerName;
     res.status(201).json({
-      _id:       populated._id,
-      rating:    populated.rating,
-      comment:   populated.comment,
-      text:      populated.text,
-      createdAt: populated.createdAt,
-      user:      populated.student,
+      _id:        populated._id,
+      rating:     populated.rating,
+      comment:    populated.comment,
+      text:       populated.text,
+      createdAt:  populated.createdAt,
+      author:     displayName,
+      authorName: displayName,
+      user:       populated.student,
     });
   } catch (err) {
-    if (err.code === 11000) return res.status(400).json({ message: "Already reviewed" });
     res.status(500).json({ message: err.message });
   }
 });
@@ -650,20 +707,30 @@ app.post("/api/upload/image", protect, requireCloudinary, imageMulter.single("im
   try {
     if (!req.file) return res.status(400).json({ message: "No file uploaded" });
 
-    // Choose Cloudinary folder based on caller role
-    const folder = req.user.role === "instructor"
-      ? "learnify/course-images"
-      : "learnify/avatars";
+    const isAvatar = req.body.type === "avatar" || req.body.uploadType === "avatar";
+
+    // Choose Cloudinary folder based on upload type
+    const folder = isAvatar
+      ? "learnify/instructor-avatars"
+      : req.user.role === "instructor"
+        ? "learnify/course-images"
+        : "learnify/avatars";
 
     const result = await streamToCloudinary(req.file.buffer, {
       folder,
       resource_type:   "image",
       allowed_formats: ["jpg","jpeg","png","webp","gif"],
-      transformation:  [
-        { width: 1280, height: 720, crop: "limit" },
-        { quality: "auto:good" },
-        { fetch_format: "auto" },
-      ],
+      transformation:  isAvatar
+        ? [
+            { width: 400, height: 400, crop: "fill", gravity: "auto" },
+            { quality: "auto:good" },
+            { fetch_format: "auto" },
+          ]
+        : [
+            { width: 1280, height: 720, crop: "limit" },
+            { quality: "auto:good" },
+            { fetch_format: "auto" },
+          ],
     });
 
     // If a courseId was supplied with the thumbnail upload, persist it immediately

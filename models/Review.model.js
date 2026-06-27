@@ -11,7 +11,10 @@ const ReviewSchema = new mongoose.Schema(
     student: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",
-      required: true,
+    },
+    authorName: {
+      type: String,
+      default: "",
     },
     rating: {
       type: Number,
@@ -23,11 +26,12 @@ const ReviewSchema = new mongoose.Schema(
       type: String,
       default: "",
     },
+    text: {
+      type: String,
+      default: "",
+    },
   },
   { timestamps: true }
 );
-
-// Ensure one review per student per course
-ReviewSchema.index({ course: 1, student: 1 }, { unique: true });
 
 module.exports = mongoose.model("Review", ReviewSchema);
