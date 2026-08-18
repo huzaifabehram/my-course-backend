@@ -28,6 +28,8 @@ console.log("☁️  Cloudinary:", process.env.CLOUDINARY_CLOUD_NAME ? "✓ conf
 const allowedOrigins = [
   "http://localhost:3000",
   "http://localhost:5173",
+  "https://motiviam.com",
+  "https://www.motiviam.com",
   process.env.CLIENT_URL,
   process.env.PUBLIC_URL,
 ].filter(Boolean);
