@@ -855,6 +855,214 @@ app.delete("/api/upload/video/:publicId", protect, instructorOnly, async (req, r
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
+// SITE THEME — Schema, Middleware, Routes
+// ══════════════════════════════════════════════════════════════════════════════
+
+const SiteThemeSchema = new mongoose.Schema({
+  status: { type: String, enum: ["draft", "published"], default: "draft" },
+  version: { type: Number, default: 1 },
+  createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+  publishedAt: Date,
+  settings: { type: mongoose.Schema.Types.Mixed, default: {} },
+}, { timestamps: true });
+const SiteTheme = mongoose.model("SiteTheme", SiteThemeSchema);
+
+const SiteThemeHistorySchema = new mongoose.Schema({
+  themeId: { type: mongoose.Schema.Types.ObjectId, ref: "SiteTheme", required: true },
+  version: { type: Number, required: true },
+  settings: { type: mongoose.Schema.Types.Mixed, required: true },
+  changedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+  status: { type: String, enum: ["draft", "published"], required: true },
+}, { timestamps: true });
+const SiteThemeHistory = mongoose.model("SiteThemeHistory", SiteThemeHistorySchema);
+
+const ThemePresetSchema = new mongoose.Schema({
+  name: { type: String, required: true },
+  settings: { type: mongoose.Schema.Types.Mixed, required: true },
+  isDefault: { type: Boolean, default: false },
+  createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+}, { timestamps: true });
+const ThemePreset = mongoose.model("ThemePreset", ThemePresetSchema);
+
+const themeEditorOnly = (req, res, next) => {
+  const adminEmail = (process.env.THEME_EDITOR_ADMIN_EMAIL || "").toLowerCase().trim();
+  if (!adminEmail) return res.status(403).json({ message: "Theme editor is not configured" });
+  if (!req.user || req.user.email.toLowerCase().trim() !== adminEmail)
+    return res.status(403).json({ message: "Access denied — theme editor permission required" });
+  next();
+};
+
+// Check if current user has theme editor access
+app.get("/api/theme/access", protect, (req, res) => {
+  const adminEmail = (process.env.THEME_EDITOR_ADMIN_EMAIL || "").toLowerCase().trim();
+  const hasAccess = req.user.email.toLowerCase().trim() === adminEmail;
+  res.json({ hasAccess });
+});
+
+// Get published theme (public — used by the course page)
+app.get("/api/theme/published", async (req, res) => {
+  try {
+    const theme = await SiteTheme.findOne({ status: "published" }).sort("-publishedAt");
+    res.json(theme ? theme.settings : null);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Get draft theme
+app.get("/api/theme/draft", protect, themeEditorOnly, async (req, res) => {
+  try {
+    let draft = await SiteTheme.findOne({ status: "draft", createdBy: req.user._id }).sort("-updatedAt");
+    if (!draft) {
+      const published = await SiteTheme.findOne({ status: "published" }).sort("-publishedAt");
+      draft = await SiteTheme.create({
+        status: "draft",
+        createdBy: req.user._id,
+        settings: published ? published.settings : {},
+        version: published ? published.version + 1 : 1,
+      });
+    }
+    res.json(draft);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Save draft
+app.put("/api/theme/draft", protect, themeEditorOnly, async (req, res) => {
+  try {
+    const { settings } = req.body;
+    if (!settings) return res.status(400).json({ message: "Settings are required" });
+    let draft = await SiteTheme.findOne({ status: "draft", createdBy: req.user._id }).sort("-updatedAt");
+    if (draft) {
+      draft.settings = settings;
+      draft.version = (draft.version || 0) + 1;
+      await draft.save();
+    } else {
+      draft = await SiteTheme.create({ status: "draft", createdBy: req.user._id, settings, version: 1 });
+    }
+    res.json(draft);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Publish theme
+app.post("/api/theme/publish", protect, themeEditorOnly, async (req, res) => {
+  try {
+    const { settings } = req.body;
+    if (!settings) return res.status(400).json({ message: "Settings are required" });
+    // Archive previous published
+    await SiteTheme.updateMany({ status: "published" }, { status: "draft" });
+    // Create published version
+    const nextVersion = (await SiteTheme.countDocuments()) + 1;
+    const theme = await SiteTheme.create({
+      status: "published",
+      createdBy: req.user._id,
+      settings,
+      version: nextVersion,
+      publishedAt: new Date(),
+    });
+    // Save to history
+    await SiteThemeHistory.create({
+      themeId: theme._id,
+      version: nextVersion,
+      settings,
+      changedBy: req.user._id,
+      status: "published",
+    });
+    // Clean up user's drafts
+    await SiteTheme.deleteMany({ status: "draft", createdBy: req.user._id });
+    res.json(theme);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Reset theme (delete all drafts for this user)
+app.post("/api/theme/reset", protect, themeEditorOnly, async (req, res) => {
+  try {
+    await SiteTheme.deleteMany({ status: "draft", createdBy: req.user._id });
+    res.json({ message: "Draft reset successfully" });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Theme history
+app.get("/api/theme/history", protect, themeEditorOnly, async (req, res) => {
+  try {
+    const history = await SiteThemeHistory.find()
+      .populate("changedBy", "name email")
+      .sort("-createdAt")
+      .limit(50);
+    res.json(history);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Restore from history
+app.post("/api/theme/restore/:historyId", protect, themeEditorOnly, async (req, res) => {
+  try {
+    const entry = await SiteThemeHistory.findById(req.params.historyId);
+    if (!entry) return res.status(404).json({ message: "History entry not found" });
+    let draft = await SiteTheme.findOne({ status: "draft", createdBy: req.user._id }).sort("-updatedAt");
+    if (draft) {
+      draft.settings = entry.settings;
+      draft.version = (draft.version || 0) + 1;
+      await draft.save();
+    } else {
+      draft = await SiteTheme.create({ status: "draft", createdBy: req.user._id, settings: entry.settings, version: entry.version });
+    }
+    res.json(draft);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Theme presets
+app.get("/api/theme/presets", protect, themeEditorOnly, async (req, res) => {
+  try { res.json(await ThemePreset.find().sort("-updatedAt")); }
+  catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+app.post("/api/theme/presets", protect, themeEditorOnly, async (req, res) => {
+  try {
+    const { name, settings } = req.body;
+    if (!name || !settings) return res.status(400).json({ message: "Name and settings are required" });
+    const preset = await ThemePreset.create({ name, settings, createdBy: req.user._id });
+    res.status(201).json(preset);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+app.put("/api/theme/presets/:id", protect, themeEditorOnly, async (req, res) => {
+  try {
+    const preset = await ThemePreset.findByIdAndUpdate(req.params.id, req.body, { new: true });
+    if (!preset) return res.status(404).json({ message: "Preset not found" });
+    res.json(preset);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+app.delete("/api/theme/presets/:id", protect, themeEditorOnly, async (req, res) => {
+  try {
+    await ThemePreset.findByIdAndDelete(req.params.id);
+    res.json({ message: "Preset deleted" });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Export theme
+app.get("/api/theme/export", protect, themeEditorOnly, async (req, res) => {
+  try {
+    const theme = await SiteTheme.findOne({ status: "published" }).sort("-publishedAt");
+    res.json({ settings: theme ? theme.settings : {}, exportedAt: new Date().toISOString(), version: theme?.version || 0 });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Import theme
+app.post("/api/theme/import", protect, themeEditorOnly, async (req, res) => {
+  try {
+    const { settings } = req.body;
+    if (!settings || typeof settings !== "object") return res.status(400).json({ message: "Invalid theme data" });
+    let draft = await SiteTheme.findOne({ status: "draft", createdBy: req.user._id }).sort("-updatedAt");
+    if (draft) {
+      draft.settings = settings;
+      draft.version = (draft.version || 0) + 1;
+      await draft.save();
+    } else {
+      draft = await SiteTheme.create({ status: "draft", createdBy: req.user._id, settings, version: 1 });
+    }
+    res.json(draft);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
 // MULTER ERROR HANDLER — must be after all routes
 // Catches file-size and MIME-type rejections; returns clean JSON
 // ══════════════════════════════════════════════════════════════════════════════
