@@ -165,6 +165,10 @@ const Course = mongoose.model("Course", CourseSchema);
 const EnrollmentSchema = new mongoose.Schema({
   student: { type: mongoose.Schema.Types.ObjectId, ref: "User",   required: true },
   course:  { type: mongoose.Schema.Types.ObjectId, ref: "Course", required: true },
+  // ── NEW: captured on the Enrollment page (Step 1 + Step 2) ────────────────
+  whatsapp:      { type: String, default: "" },
+  paymentMethod: { type: String, enum: ["bank", "jazzcash", "easypaisa", "card", ""], default: "" },
+  paymentStatus: { type: String, enum: ["pending", "verified"], default: "pending" },
 }, { timestamps: true });
 EnrollmentSchema.index({ student: 1, course: 1 }, { unique: true });
 const Enrollment = mongoose.model("Enrollment", EnrollmentSchema);
@@ -611,7 +615,18 @@ app.post("/api/enrollments/:courseId", protect, async (req, res) => {
     const existing = await Enrollment.findOne({ student: req.user._id, course: req.params.courseId });
     if (existing) return res.status(400).json({ message: "Already enrolled" });
 
-    const enrollment = await Enrollment.create({ student: req.user._id, course: req.params.courseId });
+    // ── NEW: WhatsApp number + chosen payment method, from the Enrollment
+    // page (Step 1 + Step 2). Both optional — enrollment still works without
+    // them so this route stays backward compatible with older callers.
+    const { whatsapp, paymentMethod } = req.body || {};
+    const validMethods = ["bank", "jazzcash", "easypaisa", "card"];
+
+    const enrollment = await Enrollment.create({
+      student: req.user._id,
+      course:  req.params.courseId,
+      whatsapp:      typeof whatsapp === "string" ? whatsapp.trim() : "",
+      paymentMethod: validMethods.includes(paymentMethod) ? paymentMethod : "",
+    });
     await Course.findByIdAndUpdate(req.params.courseId, { $inc: { studentsEnrolled: 1, students: 1 } });
     await Progress.findOneAndUpdate(
       { student: req.user._id, courseId: req.params.courseId },
