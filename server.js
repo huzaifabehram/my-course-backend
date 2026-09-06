@@ -168,6 +168,7 @@ const EnrollmentSchema = new mongoose.Schema({
   // ── NEW: captured on the Enrollment page (Step 1 + Step 2) ────────────────
   whatsapp:      { type: String, default: "" },
   paymentMethod: { type: String, enum: ["bank", "jazzcash", "easypaisa", "card", ""], default: "" },
+  paymentScreenshotUrl: { type: String, default: "" },
   paymentStatus: { type: String, enum: ["pending", "verified"], default: "pending" },
 }, { timestamps: true });
 EnrollmentSchema.index({ student: 1, course: 1 }, { unique: true });
@@ -615,10 +616,11 @@ app.post("/api/enrollments/:courseId", protect, async (req, res) => {
     const existing = await Enrollment.findOne({ student: req.user._id, course: req.params.courseId });
     if (existing) return res.status(400).json({ message: "Already enrolled" });
 
-    // ── NEW: WhatsApp number + chosen payment method, from the Enrollment
-    // page (Step 1 + Step 2). Both optional — enrollment still works without
-    // them so this route stays backward compatible with older callers.
-    const { whatsapp, paymentMethod } = req.body || {};
+    // ── NEW: WhatsApp number, chosen payment method, and payment screenshot
+    // URL, from the Enrollment page (Step 1 + Step 2). All optional — enrollment
+    // still works without them so this route stays backward compatible with
+    // older callers.
+    const { whatsapp, paymentMethod, paymentScreenshotUrl } = req.body || {};
     const validMethods = ["bank", "jazzcash", "easypaisa", "card"];
 
     const enrollment = await Enrollment.create({
@@ -626,6 +628,7 @@ app.post("/api/enrollments/:courseId", protect, async (req, res) => {
       course:  req.params.courseId,
       whatsapp:      typeof whatsapp === "string" ? whatsapp.trim() : "",
       paymentMethod: validMethods.includes(paymentMethod) ? paymentMethod : "",
+      paymentScreenshotUrl: typeof paymentScreenshotUrl === "string" ? paymentScreenshotUrl.trim() : "",
     });
     await Course.findByIdAndUpdate(req.params.courseId, { $inc: { studentsEnrolled: 1, students: 1 } });
     await Progress.findOneAndUpdate(
@@ -809,6 +812,46 @@ app.post("/api/upload/image", protect, requireCloudinary, imageMulter.single("im
   } catch (err) {
     console.error("❌ Image upload error:", err.message);
     res.status(500).json({ message: "Failed to upload image", error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/upload/payment-screenshot
+// Used by: EnrolledPage.jsx (Step 2) — the visitor attaches a screenshot of
+// their bank/JazzCash/Easypaisa/etc. payment before enrollment is confirmed.
+// Access:  PUBLIC — deliberately no `protect` here. A guest submits this
+// screenshot BEFORE they have an account (account creation happens right
+// after, via /auth/register), so there is no auth token to check yet.
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/api/upload/payment-screenshot", requireCloudinary, imageMulter.single("screenshot"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ message: "No screenshot uploaded" });
+
+    const result = await streamToCloudinary(req.file.buffer, {
+      folder:           "learnify/payment-screenshots",
+      resource_type:    "image",
+      allowed_formats:  ["jpg", "jpeg", "png", "webp"],
+      transformation:   [
+        { width: 1600, height: 1600, crop: "limit" },
+        { quality: "auto:good" },
+        { fetch_format: "auto" },
+      ],
+      // Tag with the course so screenshots are easy to find/audit per course
+      context: req.body.courseId ? { courseId: String(req.body.courseId) } : undefined,
+    });
+
+    console.log("✅ Payment screenshot uploaded:", result.secure_url);
+    res.json({
+      url:        result.secure_url,
+      secure_url: result.secure_url,
+      publicId:   result.public_id,
+      width:      result.width,
+      height:     result.height,
+      format:     result.format,
+    });
+  } catch (err) {
+    console.error("❌ Payment screenshot upload error:", err.message);
+    res.status(500).json({ message: "Failed to upload payment screenshot", error: err.message });
   }
 });
 
