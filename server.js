@@ -1183,17 +1183,18 @@ const ThemePresetSchema = new mongoose.Schema({
 const ThemePreset = mongoose.model("ThemePreset", ThemePresetSchema);
 
 const themeEditorOnly = (req, res, next) => {
+  // Super Admin always has access, regardless of the env-var email below —
+  // this is what SuperAdminDashboard.jsx's Theme Editor tab relies on.
+  if (req.user?.role === "admin") return next();
   const adminEmail = (process.env.THEME_EDITOR_ADMIN_EMAIL || "").toLowerCase().trim();
-  if (!adminEmail) return res.status(403).json({ message: "Theme editor is not configured" });
-  if (!req.user || req.user.email.toLowerCase().trim() !== adminEmail)
-    return res.status(403).json({ message: "Access denied — theme editor permission required" });
-  next();
+  if (adminEmail && req.user && req.user.email.toLowerCase().trim() === adminEmail) return next();
+  return res.status(403).json({ message: "Access denied — theme editor permission required" });
 };
 
 // Check if current user has theme editor access
 app.get("/api/theme/access", protect, (req, res) => {
   const adminEmail = (process.env.THEME_EDITOR_ADMIN_EMAIL || "").toLowerCase().trim();
-  const hasAccess = req.user.email.toLowerCase().trim() === adminEmail;
+  const hasAccess = req.user.role === "admin" || (Boolean(adminEmail) && req.user.email.toLowerCase().trim() === adminEmail);
   res.json({ hasAccess });
 });
 
