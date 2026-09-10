@@ -61,6 +61,7 @@ const UserSchema = new mongoose.Schema({
   email:    { type: String, required: true, unique: true, lowercase: true, trim: true },
   password: { type: String, required: true, minlength: 6 },
   role:     { type: String, enum: ["student","instructor","admin"], default: "student" },
+  status:   { type: String, enum: ["active","suspended"], default: "active" },
   avatar:   String,
   bio:      String,
   title:    String,
@@ -169,7 +170,13 @@ const EnrollmentSchema = new mongoose.Schema({
   whatsapp:      { type: String, default: "" },
   paymentMethod: { type: String, enum: ["bank", "jazzcash", "easypaisa", "card", ""], default: "" },
   paymentScreenshotUrl: { type: String, default: "" },
-  paymentStatus: { type: String, enum: ["pending", "verified"], default: "pending" },
+  paymentStatus: { type: String, enum: ["pending", "verified", "rejected"], default: "pending" },
+  // ── NEW: Super Admin verification ──────────────────────────────────────
+  amount:          { type: Number, default: 0 },     // PKR price shown to the student at checkout
+  currency:        { type: String, default: "PKR" },
+  rejectionReason: { type: String, default: "" },
+  verifiedBy:      { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+  verifiedAt:      { type: Date },
 }, { timestamps: true });
 EnrollmentSchema.index({ student: 1, course: 1 }, { unique: true });
 const Enrollment = mongoose.model("Enrollment", EnrollmentSchema);
@@ -217,6 +224,8 @@ const protect = async (req, res, next) => {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     req.user = await User.findById(decoded.id).select("-password");
     if (!req.user) return res.status(401).json({ message: "User not found" });
+    if (req.user.status === "suspended")
+      return res.status(403).json({ message: "This account has been suspended." });
     next();
   } catch {
     res.status(401).json({ message: "Token is invalid or expired" });
@@ -240,6 +249,12 @@ const instructorOnly = (req, res, next) => {
   next();
 };
 
+const adminOnly = (req, res, next) => {
+  if (req.user?.role !== "admin")
+    return res.status(403).json({ message: "Access denied — super admin only" });
+  next();
+};
+
 function serializeUser(user) {
   if (!user) return null;
   return {
@@ -247,6 +262,7 @@ function serializeUser(user) {
     name:      user.name,
     email:     user.email,
     role:      user.role,
+    status:    user.status    || "active",
     avatar:    user.avatar    || "",
     bio:       user.bio       || "",
     title:     user.title     || "",
@@ -377,6 +393,8 @@ app.post("/api/auth/login", async (req, res) => {
     const user = await User.findOne({ email: email.toLowerCase().trim() });
     if (!user || !(await user.matchPassword(password)))
       return res.status(401).json({ message: "Invalid email or password" });
+    if (user.status === "suspended")
+      return res.status(403).json({ message: "This account has been suspended. Contact support." });
     res.json({
       token: signToken(user._id),
       user:  serializeUser(user),
@@ -602,7 +620,14 @@ app.get("/api/enrollments/my", protect, async (req, res) => {
 app.get("/api/enrollments/check/:courseId", protect, async (req, res) => {
   try {
     const enrollment = await Enrollment.findOne({ student: req.user._id, course: req.params.courseId });
-    res.json({ enrolled: Boolean(enrollment), isEnrolled: Boolean(enrollment) });
+    // "enrolled" now means verified access, not just "submitted a payment" —
+    // consistent with the gating change below in POST /api/enrollments/:courseId.
+    const hasAccess = Boolean(enrollment && enrollment.paymentStatus === "verified");
+    res.json({
+      enrolled: hasAccess,
+      isEnrolled: hasAccess,
+      status: enrollment ? enrollment.paymentStatus : null, // 'pending' | 'verified' | 'rejected' | null
+    });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
@@ -629,14 +654,229 @@ app.post("/api/enrollments/:courseId", protect, async (req, res) => {
       whatsapp:      typeof whatsapp === "string" ? whatsapp.trim() : "",
       paymentMethod: validMethods.includes(paymentMethod) ? paymentMethod : "",
       paymentScreenshotUrl: typeof paymentScreenshotUrl === "string" ? paymentScreenshotUrl.trim() : "",
+      // Snapshot of what the student was shown at checkout (Shopify.jsx /
+      // EnrolledPage.jsx both display PKR = price * 280) — read by the
+      // Super Admin verification queue.
+      amount:   Math.round((course.price || 0) * 280),
+      currency: "PKR",
     });
-    await Course.findByIdAndUpdate(req.params.courseId, { $inc: { studentsEnrolled: 1, students: 1 } });
-    await Progress.findOneAndUpdate(
-      { student: req.user._id, courseId: req.params.courseId },
-      { $setOnInsert: { student: req.user._id, courseId: req.params.courseId, completedLectures: [] } },
-      { upsert: true, new: true }
-    );
+
+    // NOTE — behavior change: course access (the studentsEnrolled/students
+    // count bump and the Progress record) used to be granted right here,
+    // immediately on submission. It's now granted only once a super admin
+    // verifies the payment screenshot — see
+    // PATCH /api/admin/enrollments/:id/verify further down — so a student
+    // can no longer reach paid content before their payment has actually
+    // been checked. If you'd rather keep instant access and use the admin
+    // panel purely as an audit trail, move the two calls that used to be
+    // here (Course $inc + Progress upsert) back to this spot.
+
     res.status(201).json(enrollment);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SUPER ADMIN ROUTES
+// ══════════════════════════════════════════════════════════════════════════════
+
+app.get("/api/admin/stats", protect, adminOnly, async (req, res) => {
+  try {
+    const [totalStudents, totalInstructors, totalCourses, pendingVerifications, allCourses] = await Promise.all([
+      User.countDocuments({ role: "student" }),
+      User.countDocuments({ role: "instructor" }),
+      Course.countDocuments({}),
+      Enrollment.countDocuments({ paymentStatus: "pending" }),
+      Course.find({}).select("revenue"),
+    ]);
+    const totalRevenue = allCourses.reduce((sum, c) => sum + (c.revenue || 0), 0);
+    res.json({ totalStudents, totalInstructors, totalCourses, pendingVerifications, totalRevenue });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+app.get("/api/admin/students", protect, adminOnly, async (req, res) => {
+  try {
+    const students = await User.find({ role: "student" }).select("-password").sort("-createdAt");
+    const enrollments = await Enrollment.find({}).populate("course", "title");
+
+    const byStudent = {};
+    for (const e of enrollments) {
+      const sid = String(e.student);
+      if (!byStudent[sid]) byStudent[sid] = [];
+      byStudent[sid].push({
+        _id: e._id,
+        courseId: e.course?._id,
+        courseTitle: e.course?.title || "Untitled course",
+        status: e.paymentStatus,
+        amount: e.amount,
+        paymentMethod: e.paymentMethod,
+        createdAt: e.createdAt,
+      });
+    }
+
+    res.json(students.map((s) => ({
+      ...s.toObject(),
+      status: s.status || "active",
+      enrollments: byStudent[String(s._id)] || [],
+    })));
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+app.get("/api/admin/instructors", protect, adminOnly, async (req, res) => {
+  try {
+    const instructors = await User.find({ role: "instructor" }).select("-password").sort("-createdAt");
+    const courses = await Course.find({});
+
+    const byInstructor = {};
+    for (const c of courses) {
+      const iid = String(c.instructor);
+      if (!byInstructor[iid]) byInstructor[iid] = [];
+      byInstructor[iid].push(c);
+    }
+
+    res.json(instructors.map((i) => {
+      const myCourses = byInstructor[String(i._id)] || [];
+      return {
+        ...i.toObject(),
+        status: i.status || "active",
+        courses: myCourses.map((c) => ({ _id: c._id, title: c.title, status: c.status, studentsEnrolled: c.studentsEnrolled || 0 })),
+        totalCourses: myCourses.length,
+        totalStudents: myCourses.reduce((a, c) => a + (c.studentsEnrolled || 0), 0),
+        totalRevenue: myCourses.reduce((a, c) => a + (c.revenue || 0), 0),
+      };
+    }));
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+app.get("/api/admin/courses", protect, adminOnly, async (req, res) => {
+  try {
+    const courses = await Course.find({}).populate("instructor", "name email").sort("-createdAt");
+    res.json(courses);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+app.patch("/api/admin/courses/:id/status", protect, adminOnly, async (req, res) => {
+  try {
+    const { status } = req.body;
+    if (!["published", "draft", "review"].includes(status)) return res.status(400).json({ message: "Invalid status." });
+    const course = await Course.findByIdAndUpdate(req.params.id, { status }, { new: true });
+    if (!course) return res.status(404).json({ message: "Course not found." });
+    res.json(course);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+app.get("/api/admin/enrollments", protect, adminOnly, async (req, res) => {
+  try {
+    const { status } = req.query;
+    const query = status && status !== "all" ? { paymentStatus: status } : {};
+    const enrollments = await Enrollment.find(query)
+      .sort("-createdAt")
+      .populate("student", "name email")
+      .populate("course", "title thumbnail price");
+    res.json(enrollments.map((e) => ({
+      _id: e._id,
+      status: e.paymentStatus,
+      student: e.student,
+      course: e.course,
+      whatsapp: e.whatsapp,
+      paymentMethod: e.paymentMethod,
+      paymentScreenshotUrl: e.paymentScreenshotUrl,
+      amount: e.amount,
+      currency: e.currency,
+      rejectionReason: e.rejectionReason,
+      createdAt: e.createdAt,
+      verifiedAt: e.verifiedAt,
+    })));
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+app.patch("/api/admin/enrollments/:id/verify", protect, adminOnly, async (req, res) => {
+  try {
+    const enrollment = await Enrollment.findById(req.params.id);
+    if (!enrollment) return res.status(404).json({ message: "Enrollment not found." });
+
+    const alreadyVerified = enrollment.paymentStatus === "verified";
+    enrollment.paymentStatus = "verified";
+    enrollment.verifiedBy = req.user._id;
+    enrollment.verifiedAt = new Date();
+    await enrollment.save();
+
+    // Grant course access now — this is the step that used to run
+    // immediately on submission (see the note above in
+    // POST /api/enrollments/:courseId).
+    if (!alreadyVerified) {
+      const course = await Course.findById(enrollment.course);
+      if (course) {
+        course.studentsEnrolled = (course.studentsEnrolled || 0) + 1;
+        course.students         = (course.students || 0) + 1;
+        course.revenue          = (course.revenue || 0) + (course.price || 0);
+        await course.save();
+      }
+      await Progress.findOneAndUpdate(
+        { student: enrollment.student, courseId: enrollment.course },
+        { $setOnInsert: { student: enrollment.student, courseId: enrollment.course, completedLectures: [] } },
+        { upsert: true, new: true }
+      );
+    }
+
+    const populated = await Enrollment.findById(enrollment._id)
+      .populate("student", "name email")
+      .populate("course", "title thumbnail price");
+    res.json({
+      _id: populated._id,
+      status: populated.paymentStatus,
+      student: populated.student,
+      course: populated.course,
+      whatsapp: populated.whatsapp,
+      paymentMethod: populated.paymentMethod,
+      paymentScreenshotUrl: populated.paymentScreenshotUrl,
+      amount: populated.amount,
+      rejectionReason: populated.rejectionReason,
+      createdAt: populated.createdAt,
+      verifiedAt: populated.verifiedAt,
+    });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+app.patch("/api/admin/enrollments/:id/reject", protect, adminOnly, async (req, res) => {
+  try {
+    const { reason } = req.body;
+    if (!reason || !reason.trim()) return res.status(400).json({ message: "A rejection reason is required." });
+
+    const enrollment = await Enrollment.findByIdAndUpdate(
+      req.params.id,
+      { paymentStatus: "rejected", rejectionReason: reason.trim(), verifiedBy: req.user._id, verifiedAt: new Date() },
+      { new: true }
+    ).populate("student", "name email").populate("course", "title thumbnail price");
+
+    if (!enrollment) return res.status(404).json({ message: "Enrollment not found." });
+    res.json({
+      _id: enrollment._id,
+      status: enrollment.paymentStatus,
+      student: enrollment.student,
+      course: enrollment.course,
+      whatsapp: enrollment.whatsapp,
+      paymentMethod: enrollment.paymentMethod,
+      paymentScreenshotUrl: enrollment.paymentScreenshotUrl,
+      amount: enrollment.amount,
+      rejectionReason: enrollment.rejectionReason,
+      createdAt: enrollment.createdAt,
+      verifiedAt: enrollment.verifiedAt,
+    });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+app.patch("/api/admin/users/:id/status", protect, adminOnly, async (req, res) => {
+  try {
+    const { status } = req.body;
+    if (!["active", "suspended"].includes(status)) return res.status(400).json({ message: "Invalid status." });
+
+    const target = await User.findById(req.params.id);
+    if (!target) return res.status(404).json({ message: "User not found." });
+    if (target.role === "admin") return res.status(400).json({ message: "Cannot change status of a super admin account." });
+
+    target.status = status;
+    await target.save();
+    res.json({ _id: target._id, status: target.status });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
