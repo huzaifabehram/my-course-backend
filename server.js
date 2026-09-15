@@ -75,6 +75,14 @@ const UserSchema = new mongoose.Schema({
   totalStudents:       { type: Number, default: 0 },
   totalCourses:        { type: Number, default: 0 },
   instructorDescription: { type: String, default: "" },
+  // FIX: the Instructor Dashboard's Profile → Description page saves an
+  // ordered list of paragraph/photo/video blocks here. This field was
+  // completely missing from the schema, so Mongoose (strict mode, the
+  // default) silently dropped it on every save — that's the "picture/video
+  // disappears right after Save Changes" bug. Mixed (not a strict
+  // sub-schema) because the three block shapes (text / image / video) don't
+  // share the same fields.
+  instructorDescriptionBlocks: { type: [mongoose.Schema.Types.Mixed], default: [] },
 }, { timestamps: true });
 
 UserSchema.pre("save", async function(next) {
@@ -275,6 +283,12 @@ function serializeUser(user) {
     totalStudents:         Number(user.totalStudents) || 0,
     totalCourses:          Number(user.totalCourses)  || 0,
     instructorDescription: user.instructorDescription || "",
+    // FIX: this was never included in the response, so even once the field
+    // above is actually saved to MongoDB, the frontend's `user` object never
+    // received it back — login, GET /api/auth/me, and the profile-save
+    // response would all silently strip it, which looks identical to "it
+    // didn't save." Now it round-trips properly.
+    instructorDescriptionBlocks: Array.isArray(user.instructorDescriptionBlocks) ? user.instructorDescriptionBlocks : [],
     createdAt: user.createdAt,
   };
 }
@@ -411,9 +425,16 @@ app.get("/api/auth/me", protect, (req, res) => {
 
 async function handleUpdateProfile(req, res) {
   try {
+    // FIX: "instructorDescriptionBlocks" was missing from this whitelist, so
+    // even with the schema fixed above, this route was throwing the field
+    // away before it ever reached User.findByIdAndUpdate — the request
+    // would still return 200 "saved successfully" while quietly discarding
+    // the one field that matters. This was the second half of the
+    // disappears-after-save bug (the User schema was the first half).
     const allowed = [
       "name", "bio", "title", "location", "website", "avatar", "twitter", "linkedin",
       "totalRatings", "totalReviews", "totalStudents", "totalCourses", "instructorDescription",
+      "instructorDescriptionBlocks",
     ];
     const updates = {};
     for (const key of allowed) {
@@ -430,6 +451,10 @@ async function handleUpdateProfile(req, res) {
         if (["totalReviews", "totalStudents", "totalCourses"].includes(key)) {
           const n = parseInt(value, 10);
           updates[key] = isNaN(n) ? 0 : Math.max(0, n);
+          continue;
+        }
+        if (key === "instructorDescriptionBlocks") {
+          updates[key] = Array.isArray(value) ? value : [];
           continue;
         }
         updates[key] = value;
