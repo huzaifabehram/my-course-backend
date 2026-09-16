@@ -225,6 +225,11 @@ mongoose.connection.once("open", async () => {
 // footer, etc).
 const SiteSettingsSchema = new mongoose.Schema({
   logoUrl: { type: String, default: "" },
+  // NEW CHANGE AK: second, independent logo slot — the header logo (logoUrl)
+  // was originally reused in the footer too, which looked wrong on the dark
+  // brown footer background if the header logo has a white backdrop. Now the
+  // footer can have its own uploaded image, separate from the header's.
+  footerLogoUrl: { type: String, default: "" },
 }, { timestamps: true });
 const SiteSettings = mongoose.model("SiteSettings", SiteSettingsSchema);
 
@@ -1441,15 +1446,20 @@ app.post("/api/theme/import", protect, themeEditorOnly, async (req, res) => {
 app.get("/api/settings", async (req, res) => {
   try {
     const settings = await getSiteSettings();
-    res.json({ logoUrl: settings.logoUrl || "" });
+    res.json({ logoUrl: settings.logoUrl || "", footerLogoUrl: settings.footerLogoUrl || "" });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
 // Super Admin — upload/replace the site logo. Goes to the same Cloudinary
 // account as every other image upload in this file.
+// NEW CHANGE AK: now handles BOTH logo slots. The form sends a "target"
+// field ("header" or "footer") alongside the image; anything other than
+// "footer" is treated as "header" so the existing header-only callers keep
+// working unchanged.
 app.post("/api/admin/settings/logo", protect, adminOnly, requireCloudinary, imageMulter.single("image"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ message: "No file uploaded" });
+    const target = req.body?.target === "footer" ? "footer" : "header";
     const result = await streamToCloudinary(req.file.buffer, {
       folder: "learnify/site-settings",
       resource_type: "image",
@@ -1457,9 +1467,10 @@ app.post("/api/admin/settings/logo", protect, adminOnly, requireCloudinary, imag
       transformation: [{ width: 600, height: 600, crop: "limit" }, { quality: "auto:good" }, { fetch_format: "auto" }],
     });
     const settings = await getSiteSettings();
-    settings.logoUrl = result.secure_url;
+    if (target === "footer") settings.footerLogoUrl = result.secure_url;
+    else settings.logoUrl = result.secure_url;
     await settings.save();
-    res.json({ logoUrl: settings.logoUrl });
+    res.json({ logoUrl: settings.logoUrl, footerLogoUrl: settings.footerLogoUrl });
   } catch (err) {
     console.error("❌ Logo upload error:", err.message);
     res.status(500).json({ message: "Failed to upload logo", error: err.message });
