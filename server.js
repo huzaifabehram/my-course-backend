@@ -219,6 +219,36 @@ mongoose.connection.once("open", async () => {
   }
 });
 
+// ── Site Settings — singleton document (logo, etc.) ────────────────────────────
+// Only ever one document. Set from Super Admin Dashboard → Settings, read
+// publicly by every page that needs to render the site logo (course pages,
+// footer, etc).
+const SiteSettingsSchema = new mongoose.Schema({
+  logoUrl: { type: String, default: "" },
+}, { timestamps: true });
+const SiteSettings = mongoose.model("SiteSettings", SiteSettingsSchema);
+
+async function getSiteSettings() {
+  let doc = await SiteSettings.findOne();
+  if (!doc) doc = await SiteSettings.create({});
+  return doc;
+}
+
+// ── Contact Us submissions — from the public Contact Us page ───────────────────
+const ContactSubmissionSchema = new mongoose.Schema({
+  name:    { type: String, required: true, trim: true },
+  email:   { type: String, required: true, trim: true, lowercase: true },
+  message: { type: String, required: true, trim: true },
+  status:  { type: String, enum: ["new", "read"], default: "new" },
+}, { timestamps: true });
+const ContactSubmission = mongoose.model("ContactSubmission", ContactSubmissionSchema);
+
+// ── Newsletter subscribers — from the footer newsletter box ────────────────────
+const NewsletterSubscriberSchema = new mongoose.Schema({
+  email: { type: String, required: true, trim: true, lowercase: true, unique: true },
+}, { timestamps: true });
+const NewsletterSubscriber = mongoose.model("NewsletterSubscriber", NewsletterSubscriberSchema);
+
 // ══════════════════════════════════════════════════════════════════════════════
 // AUTH MIDDLEWARE
 // ══════════════════════════════════════════════════════════════════════════════
@@ -705,6 +735,22 @@ app.post("/api/enrollments/:courseId", protect, async (req, res) => {
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.get("/api/admin/stats", protect, adminOnly, async (req, res) => {
+  try {
+    const [totalStudents, totalInstructors, totalCourses, pendingVerifications, allCourses] = await Promise.all([
+      User.countDocuments({ role: "student" }),
+      User.countDocuments({ role: "instructor" }),
+      Course.countDocuments({}),
+      Enrollment.countDocuments({ paymentStatus: "pending" }),
+      Course.find({}).select("revenue"),
+    ]);
+    const totalRevenue = allCourses.reduce((sum, c) => sum + (c.revenue || 0), 0);
+    res.json({ totalStudents, totalInstructors, totalCourses, pendingVerifications, totalRevenue });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Alias — some frontend builds call this "/overview" instead of "/stats".
+// Same handler, so whichever one the deployed dashboard actually calls works.
+app.get("/api/admin/overview", protect, adminOnly, async (req, res) => {
   try {
     const [totalStudents, totalInstructors, totalCourses, pendingVerifications, allCourses] = await Promise.all([
       User.countDocuments({ role: "student" }),
@@ -1383,6 +1429,92 @@ app.post("/api/theme/import", protect, themeEditorOnly, async (req, res) => {
       draft = await SiteTheme.create({ status: "draft", createdBy: req.user._id, settings, version: 1 });
     }
     res.json(draft);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SITE SETTINGS (LOGO) · CONTACT US · NEWSLETTER
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Public — read the current site settings (logo etc). Used by the footer and
+// anywhere else the logo needs to render.
+app.get("/api/settings", async (req, res) => {
+  try {
+    const settings = await getSiteSettings();
+    res.json({ logoUrl: settings.logoUrl || "" });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Super Admin — upload/replace the site logo. Goes to the same Cloudinary
+// account as every other image upload in this file.
+app.post("/api/admin/settings/logo", protect, adminOnly, requireCloudinary, imageMulter.single("image"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ message: "No file uploaded" });
+    const result = await streamToCloudinary(req.file.buffer, {
+      folder: "learnify/site-settings",
+      resource_type: "image",
+      allowed_formats: ["jpg", "jpeg", "png", "webp", "svg"],
+      transformation: [{ width: 600, height: 600, crop: "limit" }, { quality: "auto:good" }, { fetch_format: "auto" }],
+    });
+    const settings = await getSiteSettings();
+    settings.logoUrl = result.secure_url;
+    await settings.save();
+    res.json({ logoUrl: settings.logoUrl });
+  } catch (err) {
+    console.error("❌ Logo upload error:", err.message);
+    res.status(500).json({ message: "Failed to upload logo", error: err.message });
+  }
+});
+
+// Public — Contact Us page submission.
+app.post("/api/contact", async (req, res) => {
+  try {
+    const { name, email, message } = req.body || {};
+    if (!name?.trim() || !email?.trim() || !message?.trim())
+      return res.status(400).json({ message: "Name, email and message are required." });
+    const submission = await ContactSubmission.create({
+      name: name.trim(), email: email.trim().toLowerCase(), message: message.trim(),
+    });
+    res.status(201).json(submission);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Super Admin — list Contact Us submissions.
+app.get("/api/admin/contact-submissions", protect, adminOnly, async (req, res) => {
+  try {
+    res.json(await ContactSubmission.find({}).sort("-createdAt"));
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Super Admin — mark a submission read.
+app.patch("/api/admin/contact-submissions/:id/read", protect, adminOnly, async (req, res) => {
+  try {
+    const sub = await ContactSubmission.findByIdAndUpdate(req.params.id, { status: "read" }, { new: true });
+    if (!sub) return res.status(404).json({ message: "Submission not found." });
+    res.json(sub);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Public — footer newsletter signup. Upsert so re-submitting the same email
+// doesn't throw a duplicate-key error, it just no-ops.
+app.post("/api/newsletter", async (req, res) => {
+  try {
+    const { email } = req.body || {};
+    if (!email?.trim()) return res.status(400).json({ message: "Email is required." });
+    const clean = email.trim().toLowerCase();
+    const sub = await NewsletterSubscriber.findOneAndUpdate(
+      { email: clean },
+      { email: clean },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+    res.status(201).json(sub);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Super Admin — list newsletter subscribers.
+app.get("/api/admin/newsletter-subscribers", protect, adminOnly, async (req, res) => {
+  try {
+    res.json(await NewsletterSubscriber.find({}).sort("-createdAt"));
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
