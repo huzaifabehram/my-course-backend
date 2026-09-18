@@ -199,6 +199,32 @@ const ProgressSchema = new mongoose.Schema({
 ProgressSchema.index({ student: 1, courseId: 1 }, { unique: true });
 const Progress = mongoose.model("Progress", ProgressSchema);
 
+// ── Notes — per-student, per-lecture timestamped notes (Student Portal) ────
+const NoteSchema = new mongoose.Schema({
+  student:   { type: mongoose.Schema.Types.ObjectId, ref: "User",   required: true },
+  courseId:  { type: mongoose.Schema.Types.ObjectId, ref: "Course", required: true },
+  lectureId: { type: String, required: true },
+  lectureTitle: { type: String, default: "" }, // snapshot, so a note still reads sensibly if a lecture is later renamed/removed
+  content:   { type: String, required: true, trim: true },
+}, { timestamps: true });
+const Note = mongoose.model("Note", NoteSchema);
+
+// ── Q&A — per-course questions with embedded answers (Student Portal) ──────
+const AnswerSchema = new mongoose.Schema({
+  author:    { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+  text:      { type: String, required: true, trim: true },
+}, { timestamps: true });
+const QuestionSchema = new mongoose.Schema({
+  author:    { type: mongoose.Schema.Types.ObjectId, ref: "User",   required: true },
+  courseId:  { type: mongoose.Schema.Types.ObjectId, ref: "Course", required: true },
+  lectureId: { type: String, default: "" },
+  lectureTitle: { type: String, default: "" },
+  text:      { type: String, required: true, trim: true },
+  upvotes:   { type: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }], default: [] },
+  answers:   { type: [AnswerSchema], default: [] },
+}, { timestamps: true });
+const Question = mongoose.model("Question", QuestionSchema);
+
 // ── Review ────────────────────────────────────────────────────────────────────
 const ReviewSchema = new mongoose.Schema({
   course:     { type: mongoose.Schema.Types.ObjectId, ref: "Course", required: true },
@@ -1022,6 +1048,98 @@ app.post("/api/progress/mark", protect, async (req, res) => {
 app.get("/api/progress/my", protect, async (req, res) => {
   try {
     res.json(await Progress.find({ student: req.user._id }));
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// NOTES — Student Portal, per-lecture timestamped notes
+// ══════════════════════════════════════════════════════════════════════════════
+
+app.get("/api/notes/:courseId", protect, async (req, res) => {
+  try {
+    const notes = await Note.find({ student: req.user._id, courseId: req.params.courseId }).sort("-createdAt");
+    res.json(notes);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+app.post("/api/notes", protect, async (req, res) => {
+  try {
+    const { courseId, lectureId, lectureTitle, content } = req.body || {};
+    if (!courseId || !lectureId || !content || !content.trim())
+      return res.status(400).json({ message: "courseId, lectureId, and content are required" });
+    if (!(await Enrollment.findOne({ student: req.user._id, course: courseId, paymentStatus: "verified" })))
+      return res.status(403).json({ message: "Not enrolled in this course" });
+    const note = await Note.create({
+      student: req.user._id, courseId, lectureId: String(lectureId),
+      lectureTitle: lectureTitle || "", content: content.trim(),
+    });
+    res.status(201).json(note);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+app.delete("/api/notes/:id", protect, async (req, res) => {
+  try {
+    const note = await Note.findOneAndDelete({ _id: req.params.id, student: req.user._id });
+    if (!note) return res.status(404).json({ message: "Note not found" });
+    res.json({ deleted: true });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Q&A — Student Portal, per-course questions with embedded answers
+// ══════════════════════════════════════════════════════════════════════════════
+
+app.get("/api/courses/:courseId/questions", protect, async (req, res) => {
+  try {
+    const questions = await Question.find({ courseId: req.params.courseId })
+      .populate("author", "name avatar")
+      .populate("answers.author", "name avatar")
+      .sort("-createdAt");
+    res.json(questions);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+app.post("/api/courses/:courseId/questions", protect, async (req, res) => {
+  try {
+    const { lectureId, lectureTitle, text } = req.body || {};
+    if (!text || !text.trim()) return res.status(400).json({ message: "Question text is required" });
+    if (!(await Enrollment.findOne({ student: req.user._id, course: req.params.courseId, paymentStatus: "verified" })))
+      return res.status(403).json({ message: "Not enrolled in this course" });
+    const question = await Question.create({
+      author: req.user._id, courseId: req.params.courseId,
+      lectureId: lectureId ? String(lectureId) : "", lectureTitle: lectureTitle || "",
+      text: text.trim(),
+    });
+    const populated = await Question.findById(question._id).populate("author", "name avatar");
+    res.status(201).json(populated);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+app.post("/api/questions/:id/answers", protect, async (req, res) => {
+  try {
+    const { text } = req.body || {};
+    if (!text || !text.trim()) return res.status(400).json({ message: "Answer text is required" });
+    const question = await Question.findById(req.params.id);
+    if (!question) return res.status(404).json({ message: "Question not found" });
+    question.answers.push({ author: req.user._id, text: text.trim() });
+    await question.save();
+    const populated = await Question.findById(question._id)
+      .populate("author", "name avatar")
+      .populate("answers.author", "name avatar");
+    res.json(populated);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+app.post("/api/questions/:id/upvote", protect, async (req, res) => {
+  try {
+    const question = await Question.findById(req.params.id);
+    if (!question) return res.status(404).json({ message: "Question not found" });
+    const uid = String(req.user._id);
+    const already = question.upvotes.some((u) => String(u) === uid);
+    if (already) question.upvotes = question.upvotes.filter((u) => String(u) !== uid);
+    else question.upvotes.push(req.user._id);
+    await question.save();
+    res.json({ upvotes: question.upvotes.length, upvoted: !already });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
