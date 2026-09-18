@@ -231,6 +231,14 @@ const SiteSettingsSchema = new mongoose.Schema({
   // brown footer background if the header logo has a white backdrop. Now the
   // footer can have its own uploaded image, separate from the header's.
   footerLogoUrl: { type: String, default: "" },
+  // NEW: payment-method logos shown on the Enrollment page (Bank Transfer's
+  // two banks, JazzCash, Easypaisa) — uploaded from Super Admin → Settings,
+  // same as the header/footer logo, instead of being bundled as static
+  // image files the developer has to place by hand.
+  paymentLogoUbl:       { type: String, default: "" },
+  paymentLogoAllied:    { type: String, default: "" },
+  paymentLogoJazzcash:  { type: String, default: "" },
+  paymentLogoEasypaisa: { type: String, default: "" },
 }, { timestamps: true });
 const SiteSettings = mongoose.model("SiteSettings", SiteSettingsSchema);
 
@@ -251,7 +259,10 @@ async function getSiteSettings() {
   // here keeps the upsert meaningful without that error.
   return SiteSettings.findOneAndUpdate(
     {},
-    { $setOnInsert: { logoUrl: "", footerLogoUrl: "" } },
+    { $setOnInsert: {
+        logoUrl: "", footerLogoUrl: "",
+        paymentLogoUbl: "", paymentLogoAllied: "", paymentLogoJazzcash: "", paymentLogoEasypaisa: "",
+      } },
     { new: true, upsert: true, sort: { _id: 1 } }
   );
 }
@@ -1505,20 +1516,35 @@ app.post("/api/theme/import", protect, themeEditorOnly, async (req, res) => {
 app.get("/api/settings", async (req, res) => {
   try {
     const settings = await getSiteSettings();
-    res.json({ logoUrl: settings.logoUrl || "", footerLogoUrl: settings.footerLogoUrl || "" });
+    res.json({
+      logoUrl:       settings.logoUrl       || "",
+      footerLogoUrl: settings.footerLogoUrl || "",
+      paymentLogoUbl:       settings.paymentLogoUbl       || "",
+      paymentLogoAllied:    settings.paymentLogoAllied    || "",
+      paymentLogoJazzcash:  settings.paymentLogoJazzcash  || "",
+      paymentLogoEasypaisa: settings.paymentLogoEasypaisa || "",
+    });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// Super Admin — upload/replace the site logo. Goes to the same Cloudinary
+// Super Admin — upload/replace a site logo. Goes to the same Cloudinary
 // account as every other image upload in this file.
-// NEW CHANGE AK: now handles BOTH logo slots. The form sends a "target"
-// field ("header" or "footer") alongside the image; anything other than
-// "footer" is treated as "header" so the existing header-only callers keep
-// working unchanged.
+// The form sends a "target" field alongside the image: "header", "footer",
+// or one of the four payment-method logos ("payment_ubl", "payment_allied",
+// "payment_jazzcash", "payment_easypaisa"). Anything unrecognized falls back
+// to "header" so existing callers keep working unchanged.
+const LOGO_TARGET_FIELDS = {
+  header:            "logoUrl",
+  footer:             "footerLogoUrl",
+  payment_ubl:        "paymentLogoUbl",
+  payment_allied:     "paymentLogoAllied",
+  payment_jazzcash:   "paymentLogoJazzcash",
+  payment_easypaisa:  "paymentLogoEasypaisa",
+};
 app.post("/api/admin/settings/logo", protect, adminOnly, requireCloudinary, imageMulter.single("image"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ message: "No file uploaded" });
-    const target = req.body?.target === "footer" ? "footer" : "header";
+    const targetField = LOGO_TARGET_FIELDS[req.body?.target] || "logoUrl";
     const result = await streamToCloudinary(req.file.buffer, {
       folder: "learnify/site-settings",
       resource_type: "image",
@@ -1526,10 +1552,16 @@ app.post("/api/admin/settings/logo", protect, adminOnly, requireCloudinary, imag
       transformation: [{ width: 600, height: 600, crop: "limit" }, { quality: "auto:good" }, { fetch_format: "auto" }],
     });
     const settings = await getSiteSettings();
-    if (target === "footer") settings.footerLogoUrl = result.secure_url;
-    else settings.logoUrl = result.secure_url;
+    settings[targetField] = result.secure_url;
     await settings.save();
-    res.json({ logoUrl: settings.logoUrl, footerLogoUrl: settings.footerLogoUrl });
+    res.json({
+      logoUrl:       settings.logoUrl       || "",
+      footerLogoUrl: settings.footerLogoUrl || "",
+      paymentLogoUbl:       settings.paymentLogoUbl       || "",
+      paymentLogoAllied:    settings.paymentLogoAllied    || "",
+      paymentLogoJazzcash:  settings.paymentLogoJazzcash  || "",
+      paymentLogoEasypaisa: settings.paymentLogoEasypaisa || "",
+    });
   } catch (err) {
     console.error("❌ Logo upload error:", err.message);
     res.status(500).json({ message: "Failed to upload logo", error: err.message });
