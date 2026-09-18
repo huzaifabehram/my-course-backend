@@ -235,24 +235,23 @@ const SiteSettingsSchema = new mongoose.Schema({
 const SiteSettings = mongoose.model("SiteSettings", SiteSettingsSchema);
 
 async function getSiteSettings() {
-  // NEW: findOneAndUpdate with upsert makes "get the settings doc, creating
-  // it if it doesn't exist yet" a single atomic operation, instead of the
-  // previous find-then-create-if-missing pattern. That older pattern had a
-  // race: if two requests both saw "no doc yet" at the same moment (e.g. an
-  // admin upload and a page's /settings fetch landing at the same time),
-  // each could create its OWN new document — leaving two settings documents
-  // in the collection from then on. Whenever that happened, an admin's
-  // upload could save onto one of them while every page's GET /settings
-  // kept reading the other, which is exactly what made a freshly-uploaded
-  // footer logo "disappear" again on refresh: it wasn't gone, it was saved
-  // to a document nothing else was reading.
-  // Sorting by _id (ascending) also makes the choice deterministic — if two
-  // such documents already exist from before this fix, everything now
-  // consistently reads/writes the oldest one instead of whichever findOne()
-  // happened to return.
+  // findOneAndUpdate with upsert makes "get the settings doc, creating it if
+  // it doesn't exist yet" a single atomic operation, instead of the earlier
+  // find-then-create-if-missing pattern (which could race and create two
+  // separate documents if a request landed at just the wrong moment).
+  // Sorting by _id (ascending) makes the choice deterministic if more than
+  // one such document already exists from before this fix.
+  //
+  // IMPORTANT: $setOnInsert must not be an empty object — MongoDB rejects
+  // that with "'$setOnInsert' is empty" and the whole call throws. An
+  // earlier version of this fix passed {} here, which broke EVERY call to
+  // getSiteSettings() (both the GET /api/settings every page uses, and the
+  // logo upload route) — this is what made the logo stop showing up
+  // anywhere at all, not just the footer. Passing the schema's own defaults
+  // here keeps the upsert meaningful without that error.
   return SiteSettings.findOneAndUpdate(
     {},
-    { $setOnInsert: {} },
+    { $setOnInsert: { logoUrl: "", footerLogoUrl: "" } },
     { new: true, upsert: true, sort: { _id: 1 } }
   );
 }
