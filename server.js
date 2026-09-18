@@ -235,9 +235,26 @@ const SiteSettingsSchema = new mongoose.Schema({
 const SiteSettings = mongoose.model("SiteSettings", SiteSettingsSchema);
 
 async function getSiteSettings() {
-  let doc = await SiteSettings.findOne();
-  if (!doc) doc = await SiteSettings.create({});
-  return doc;
+  // NEW: findOneAndUpdate with upsert makes "get the settings doc, creating
+  // it if it doesn't exist yet" a single atomic operation, instead of the
+  // previous find-then-create-if-missing pattern. That older pattern had a
+  // race: if two requests both saw "no doc yet" at the same moment (e.g. an
+  // admin upload and a page's /settings fetch landing at the same time),
+  // each could create its OWN new document — leaving two settings documents
+  // in the collection from then on. Whenever that happened, an admin's
+  // upload could save onto one of them while every page's GET /settings
+  // kept reading the other, which is exactly what made a freshly-uploaded
+  // footer logo "disappear" again on refresh: it wasn't gone, it was saved
+  // to a document nothing else was reading.
+  // Sorting by _id (ascending) also makes the choice deterministic — if two
+  // such documents already exist from before this fix, everything now
+  // consistently reads/writes the oldest one instead of whichever findOne()
+  // happened to return.
+  return SiteSettings.findOneAndUpdate(
+    {},
+    { $setOnInsert: {} },
+    { new: true, upsert: true, sort: { _id: 1 } }
+  );
 }
 
 // ── Contact Us submissions — from the public Contact Us page ───────────────────
