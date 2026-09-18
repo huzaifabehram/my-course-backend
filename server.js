@@ -13,6 +13,7 @@ const multer   = require("multer");
 const bcrypt   = require("bcryptjs");
 const jwt      = require("jsonwebtoken");
 const cloudinary = require("cloudinary").v2;
+const crypto      = require("crypto"); // used to hash payment screenshots (fraud/dedup check below)
 
 const app = express();
 
@@ -253,6 +254,21 @@ const NewsletterSubscriberSchema = new mongoose.Schema({
   email: { type: String, required: true, trim: true, lowercase: true, unique: true },
 }, { timestamps: true });
 const NewsletterSubscriber = mongoose.model("NewsletterSubscriber", NewsletterSubscriberSchema);
+
+// ── Payment screenshot hashes — fraud prevention ────────────────────────────
+// Stores a SHA-256 hash of every payment screenshot that's ever been
+// submitted (see POST /api/upload/payment-screenshot below). Before
+// accepting a new screenshot we hash it and check this collection — if the
+// exact same image file has been submitted before (by anyone, for any
+// course), the upload is rejected. This stops one payment screenshot being
+// reused to "confirm" more than one enrollment. A different screenshot from
+// the same person is unaffected — only an exact repeat of the same file.
+const PaymentScreenshotHashSchema = new mongoose.Schema({
+  hash:     { type: String, required: true, unique: true, index: true },
+  courseId: { type: String, default: "" },
+  url:      { type: String, default: "" }, // the Cloudinary URL it resolved to, for admin lookup
+}, { timestamps: true });
+const PaymentScreenshotHash = mongoose.model("PaymentScreenshotHash", PaymentScreenshotHashSchema);
 
 // ══════════════════════════════════════════════════════════════════════════════
 // AUTH MIDDLEWARE
@@ -1143,6 +1159,18 @@ app.post("/api/upload/payment-screenshot", requireCloudinary, imageMulter.single
   try {
     if (!req.file) return res.status(400).json({ message: "No screenshot uploaded" });
 
+    // ── Fraud check: has this exact screenshot been submitted before? ──────
+    // Hash the raw file bytes and look it up before uploading anywhere. This
+    // catches the same image being reused for a second enrollment, whether
+    // it's the same person trying again or someone else forwarding it.
+    const screenshotHash = crypto.createHash("sha256").update(req.file.buffer).digest("hex");
+    const alreadyUsed = await PaymentScreenshotHash.findOne({ hash: screenshotHash });
+    if (alreadyUsed) {
+      return res.status(409).json({
+        message: "This payment screenshot has already been submitted. Please attach a screenshot of a different, unused payment.",
+      });
+    }
+
     const result = await streamToCloudinary(req.file.buffer, {
       folder:           "learnify/payment-screenshots",
       resource_type:    "image",
@@ -1155,6 +1183,21 @@ app.post("/api/upload/payment-screenshot", requireCloudinary, imageMulter.single
       // Tag with the course so screenshots are easy to find/audit per course
       context: req.body.courseId ? { courseId: String(req.body.courseId) } : undefined,
     });
+
+    // Record the hash now that the screenshot has been accepted, so the
+    // very next duplicate submission (of this same file) gets caught above.
+    try {
+      await PaymentScreenshotHash.create({
+        hash:     screenshotHash,
+        courseId: req.body.courseId ? String(req.body.courseId) : "",
+        url:      result.secure_url,
+      });
+    } catch (hashSaveErr) {
+      // A duplicate-key error here means two identical uploads raced each
+      // other — extremely unlikely, but if it happens the upload itself
+      // still succeeded, so we just log it rather than fail the request.
+      console.warn("⚠️  Could not record screenshot hash:", hashSaveErr.message);
+    }
 
     console.log("✅ Payment screenshot uploaded:", result.secure_url);
     res.json({
