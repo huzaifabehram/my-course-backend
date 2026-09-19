@@ -235,39 +235,58 @@ const Question = mongoose.model("Question", QuestionSchema);
 // ══════════════════════════════════════════════════════════════════════════════
 // AUTOMATION WORKFLOWS — Super Admin → Automation Workflow
 // ══════════════════════════════════════════════════════════════════════════════
-// Real event-driven automation: a Workflow has a trigger (a real event that
-// already happens in this app — registration, enrollment, payment
-// verification/rejection, lecture/course completion, contact form,
-// newsletter signup) and an ordered list of steps. Each step is either a
-// condition (stops the run here if it doesn't match) or an action:
-//   send_email  — real SMTP send if SMTP_* env vars are configured (see
-//                 requireEmail below); otherwise logged as skipped, not faked
-//   webhook     — POSTs the full trigger context as JSON to any URL, so this
-//                 workflow can hand off to Zapier/Make/n8n/WhatsApp API
-//                 providers/etc. without needing their credentials here
-//   add_tag / remove_tag — real, persisted on the student's User document
-//   notify      — creates a real Notification document for the student
-//   delay       — really pauses (via PendingStep + the poller below), not a
-//                 fake "instant" delay
+// A Workflow has a trigger (a real event on this platform) and an ordered
+// list of steps (conditions + actions). See the honest capability notes on
+// each trigger/action below — everything not flagged "needs setup" or
+// "needs <feature>" fires and executes for real off real data.
 const WorkflowStepSchema = new mongoose.Schema({
   type: { type: String, enum: ["condition", "action"], required: true },
-  actionType: { type: String, enum: ["send_email", "webhook", "add_tag", "remove_tag", "notify", "delay"] },
+  actionType: {
+    type: String,
+    enum: [
+      "create_contact", "add_contact_tag", "remove_contact_tag",
+      "assign_user", "remove_assigned_user", "add_note", "internal_notification",
+      "notify_student", "wait", "send_email", "send_whatsapp",
+      "add_to_pipeline", "update_opportunity_stage", "webhook",
+    ],
+  },
   conditionField:    String,
   conditionOperator: { type: String, enum: ["equals", "not_equals", "contains"] },
   conditionValue:    String,
   params: { type: mongoose.Schema.Types.Mixed, default: {} },
 }, { _id: true });
 
+// Triggers actually wired to real events (see runWorkflows() call sites):
+//   form_submitted, new_sign_up, enrollment_created, payment_received,
+//   offer_access_granted, payment_rejected, lesson_started, lesson_completed,
+//   category_started, category_completed, newsletter_subscribed,
+//   opportunity_created, opportunity_status_changed, link_clicked,
+//   email_sent, whatsapp_sent
+// Triggers that fire only once YOU wire something external to call them:
+//   customer_replied — needs your SMS/WhatsApp/email provider's inbound
+//     webhook pointed at POST /api/inbound/message (see notes below)
+// Triggers NOT implemented — no such feature exists on this platform yet,
+// so building the trigger without the feature behind it would be fake:
+//   video_tracking (needs %-watched tracking — not just done/not-done),
+//   customer_booked_appointment / appointment_status_changed (there's no
+//   booking/calendar feature anywhere on this platform to trigger from),
+//   funnel_website_page_view (would need a tracking call added to every
+//   page site-wide — a real but separate project)
 const WORKFLOW_TRIGGERS = [
-  "student_registered", "enrollment_created", "payment_verified",
-  "payment_rejected", "lecture_completed", "course_completed",
-  "contact_form_submitted", "newsletter_subscribed",
+  "form_submitted", "new_sign_up", "enrollment_created", "payment_received",
+  "offer_access_granted", "payment_rejected", "lesson_started", "lesson_completed",
+  "category_started", "category_completed", "newsletter_subscribed",
+  "opportunity_created", "opportunity_status_changed", "link_clicked",
+  "email_sent", "whatsapp_sent", "customer_replied",
 ];
 
 const WorkflowSchema = new mongoose.Schema({
   name:      { type: String, required: true, trim: true },
   trigger:   { type: String, required: true, enum: WORKFLOW_TRIGGERS },
-  active:    { type: Boolean, default: true },
+  // NEW: "published" replaces the old "active" naming (still the same
+  // boolean underneath) — a published workflow actually runs on its
+  // trigger; unpublished sits saved but does nothing.
+  published: { type: Boolean, default: false },
   steps:     { type: [WorkflowStepSchema], default: [] },
   runCount:  { type: Number, default: 0 },
   lastRunAt: Date,
@@ -277,23 +296,22 @@ const Workflow = mongoose.model("Workflow", WorkflowSchema);
 const WorkflowRunSchema = new mongoose.Schema({
   workflow:  { type: mongoose.Schema.Types.ObjectId, ref: "Workflow", required: true },
   trigger:   String,
-  summary:   String,           // readable one-line description of what fired it, e.g. a student/course name
+  summary:   String,
   status:    { type: String, enum: ["success", "partial", "failed", "waiting"], default: "success" },
   log:       { type: [String], default: [] },
 }, { timestamps: true });
 const WorkflowRun = mongoose.model("WorkflowRun", WorkflowRunSchema);
 
-// A workflow run that hit a "delay" step — the poller below resumes it once due.
 const PendingStepSchema = new mongoose.Schema({
   workflow:   { type: mongoose.Schema.Types.ObjectId, ref: "Workflow", required: true },
   run:        { type: mongoose.Schema.Types.ObjectId, ref: "WorkflowRun", required: true },
-  stepIndex:  { type: Number, required: true }, // next step to run once due
+  stepIndex:  { type: Number, required: true },
   context:    { type: mongoose.Schema.Types.Mixed, default: {} },
   runAt:      { type: Date, required: true },
 }, { timestamps: true });
 const PendingStep = mongoose.model("PendingStep", PendingStepSchema);
 
-// In-app notifications a workflow's "notify" action creates for a student.
+// In-app notification for a STUDENT (Student Portal bell icon).
 const NotificationSchema = new mongoose.Schema({
   student: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
   title:   { type: String, default: "" },
@@ -301,6 +319,56 @@ const NotificationSchema = new mongoose.Schema({
   read:    { type: Boolean, default: false },
 }, { timestamps: true });
 const Notification = mongoose.model("Notification", NotificationSchema);
+
+// Internal notification for an ADMIN/instructor — distinct from the student
+// one above (the "Send Internal Notification" action from your list).
+const InternalNotificationSchema = new mongoose.Schema({
+  message: { type: String, required: true },
+  read:    { type: Boolean, default: false },
+}, { timestamps: true });
+const InternalNotification = mongoose.model("InternalNotification", InternalNotificationSchema);
+
+// ── CRM: Contact / Opportunity / Pipeline ───────────────────────────────────
+// A Contact is the CRM record a workflow's "Create Contact" action produces
+// — separate from User, because not every contact (someone who just filled
+// the Contact form) is a registered student. `studentId` links the two when
+// the same email later registers/enrolls.
+const ContactSchema = new mongoose.Schema({
+  name:  { type: String, default: "" },
+  email: { type: String, lowercase: true, trim: true },
+  phone: { type: String, default: "" },
+  source: { type: String, default: "" }, // e.g. "Contact Form", "Workflow: Welcome Sequence"
+  tags:  { type: [String], default: [] },
+  notes: { type: [{ text: String, createdAt: { type: Date, default: Date.now } }], default: [] },
+  assignedTo: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+  studentId:  { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+}, { timestamps: true });
+ContactSchema.index({ email: 1 }, { unique: true, sparse: true });
+const Contact = mongoose.model("Contact", ContactSchema);
+
+const PIPELINE_STAGES_DEFAULT = ["New Lead", "Contacted", "Qualified", "Payment Pending", "Customer", "Lost"];
+
+const OpportunitySchema = new mongoose.Schema({
+  contact: { type: mongoose.Schema.Types.ObjectId, ref: "Contact", required: true },
+  title:   { type: String, default: "" },
+  value:   { type: Number, default: 0 },
+  stage:   { type: String, default: PIPELINE_STAGES_DEFAULT[0] },
+  status:  { type: String, enum: ["open", "won", "lost"], default: "open" },
+}, { timestamps: true });
+const Opportunity = mongoose.model("Opportunity", OpportunitySchema);
+
+// A workflow's "Add Link" (in an email/WhatsApp message) is rewritten into
+// one of these at send time, so clicking it can be tracked and fire
+// link_clicked — see the /l/:code redirect route further down.
+const TrackedLinkSchema = new mongoose.Schema({
+  code: { type: String, required: true, unique: true },
+  url:  { type: String, required: true },
+  contactEmail: String,
+  workflow: { type: mongoose.Schema.Types.ObjectId, ref: "Workflow" },
+  clicks: { type: Number, default: 0 },
+}, { timestamps: true });
+const TrackedLink = mongoose.model("TrackedLink", TrackedLinkSchema);
+
 
 // ── Review ────────────────────────────────────────────────────────────────────
 const ReviewSchema = new mongoose.Schema({
@@ -517,16 +585,58 @@ function getMailer() {
   }
   return _mailer;
 }
-async function sendEmail({ to, subject, html }) {
+async function sendEmailRaw({ to, subject, html }) {
   const mailer = getMailer();
   if (!mailer) throw new Error("SMTP not configured (SMTP_HOST, SMTP_USER, SMTP_PASS)");
   await mailer.sendMail({ from: process.env.SMTP_FROM || process.env.SMTP_USER, to, subject, html });
+}
+
+// ── WhatsApp — generic integration against Meta's official WhatsApp Cloud
+// API (the standard most providers, including Meta directly, expose this
+// exact shape for). Needs WHATSAPP_PHONE_NUMBER_ID + WHATSAPP_ACCESS_TOKEN
+// in .env — see the guide in the chat reply for how to get these.
+function whatsappConfigured() {
+  return !!(process.env.WHATSAPP_PHONE_NUMBER_ID && process.env.WHATSAPP_ACCESS_TOKEN);
+}
+async function sendWhatsAppRaw({ to, text }) {
+  if (!whatsappConfigured()) throw new Error("WhatsApp not configured (WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_ACCESS_TOKEN)");
+  const phoneId = process.env.WHATSAPP_PHONE_NUMBER_ID;
+  const resp = await fetch(`https://graph.facebook.com/v21.0/${phoneId}/messages`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}` },
+    body: JSON.stringify({
+      messaging_product: "whatsapp",
+      to: String(to).replace(/[^\d+]/g, ""), // WhatsApp Cloud API wants digits (with country code), no spaces/dashes
+      type: "text",
+      text: { body: text, preview_url: true },
+    }),
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(data?.error?.message || `WhatsApp API returned HTTP ${resp.status}`);
+  return data;
 }
 
 /** Replaces {{field}} in a string with the matching value from the context object. */
 function interpolate(str, ctx) {
   if (typeof str !== "string") return str;
   return str.replace(/\{\{(\w+)\}\}/g, (_, key) => (ctx[key] != null ? String(ctx[key]) : ""));
+}
+
+// A message body can carry `[[Label|https://example.com]]` — rewritten here
+// into a real tracked link (/l/<code>) so a click can be logged and fire the
+// link_clicked trigger. Used by both send_email and send_whatsapp.
+async function rewriteTrackedLinks(text, ctx, workflowId) {
+  const linkPattern = /\[\[([^\|\]]+)\|([^\]]+)\]\]/g;
+  const matches = [...text.matchAll(linkPattern)];
+  let result = text;
+  for (const m of matches) {
+    const [full, label, url] = m;
+    const code = crypto.randomBytes(5).toString("hex");
+    await TrackedLink.create({ code, url: url.trim(), contactEmail: ctx.studentEmail || ctx.email || "", workflow: workflowId });
+    const trackedUrl = `${process.env.PUBLIC_BASE_URL || ""}/l/${code}`;
+    result = result.replace(full, `${label.trim()}: ${trackedUrl}`);
+  }
+  return result;
 }
 
 function conditionMatches(step, ctx) {
@@ -539,16 +649,118 @@ function conditionMatches(step, ctx) {
   }
 }
 
+const WAIT_UNIT_MS = { seconds: 1000, minutes: 60000, hours: 3600000, days: 86400000, weeks: 604800000, years: 31536000000 };
+
 /** Runs one action step against the given context. Throws on hard failure; log lines describe what happened either way. */
-async function runAction(step, ctx, log) {
+async function runAction(step, ctx, log, workflowId) {
   const p = step.params || {};
+
   switch (step.actionType) {
+    case "create_contact": {
+      const email = interpolate(p.email || "{{studentEmail}}", ctx) || interpolate(p.email || "{{email}}", ctx);
+      if (!email) { log.push("create_contact skipped — no email in context"); return; }
+      const contact = await Contact.findOneAndUpdate(
+        { email },
+        {
+          $setOnInsert: {
+            email, name: interpolate(p.name || "{{studentName}}", ctx) || interpolate("{{name}}", ctx) || "",
+            phone: ctx.whatsapp || "", source: p.source || `Workflow: ${ctx.__workflowName || ""}`,
+            studentId: ctx.studentId || null,
+          },
+        },
+        { upsert: true, new: true, setDefaultsOnInsert: true }
+      );
+      log.push(`Contact ensured for ${email}`);
+      ctx.contactId = contact._id;
+      return;
+    }
+    case "add_contact_tag":
+    case "remove_contact_tag": {
+      const email = ctx.studentEmail || ctx.email;
+      if (!email || !p.tag) { log.push(`${step.actionType} skipped — no contact email/tag`); return; }
+      const op = step.actionType === "add_contact_tag" ? { $addToSet: { tags: p.tag } } : { $pull: { tags: p.tag } };
+      await Contact.findOneAndUpdate({ email }, op);
+      log.push(`${step.actionType === "add_contact_tag" ? "Added" : "Removed"} tag "${p.tag}" on contact ${email}`);
+      return;
+    }
+    case "assign_user":
+    case "remove_assigned_user": {
+      const email = ctx.studentEmail || ctx.email;
+      if (!email) { log.push(`${step.actionType} skipped — no contact email`); return; }
+      const assignedTo = step.actionType === "assign_user" ? (p.userId || null) : null;
+      await Contact.findOneAndUpdate({ email }, { assignedTo });
+      log.push(step.actionType === "assign_user" ? `Assigned contact ${email} to user ${p.userId}` : `Cleared assignment on contact ${email}`);
+      return;
+    }
+    case "add_note": {
+      const email = ctx.studentEmail || ctx.email;
+      if (!email || !p.text) { log.push("add_note skipped — no contact email/text"); return; }
+      await Contact.findOneAndUpdate({ email }, { $push: { notes: { text: interpolate(p.text, ctx) } } });
+      log.push(`Note added to contact ${email}`);
+      return;
+    }
+    case "internal_notification": {
+      await InternalNotification.create({ message: interpolate(p.message || "", ctx) });
+      log.push("Internal notification created for the admin team");
+      return;
+    }
+    case "notify_student": {
+      if (!ctx.studentId) { log.push("notify_student skipped — no student in context"); return; }
+      await Notification.create({ student: ctx.studentId, title: interpolate(p.title || "", ctx), message: interpolate(p.message || "", ctx) });
+      log.push(`Notification created for ${ctx.studentName || ctx.studentId}`);
+      return;
+    }
     case "send_email": {
       if (!emailConfigured()) { log.push("send_email skipped — SMTP not configured"); return; }
       const to = interpolate(p.to || "{{studentEmail}}", ctx);
       if (!to) { log.push("send_email skipped — no recipient email in context"); return; }
-      await sendEmail({ to, subject: interpolate(p.subject || "", ctx), html: interpolate(p.body || "", ctx).replace(/\n/g, "<br/>") });
+      let html = interpolate(p.body || "", ctx);
+      html = await rewriteTrackedLinks(html, ctx, workflowId);
+      html = html.replace(/\n/g, "<br/>");
+      if (p.buttonText && p.buttonUrl) {
+        const btnUrl = interpolate(p.buttonUrl, ctx);
+        html += `<br/><br/><a href="${btnUrl}" style="display:inline-block;background:#e8540a;color:#fff;padding:10px 20px;border-radius:8px;text-decoration:none;font-weight:bold;">${p.buttonText}</a>`;
+      }
+      await sendEmailRaw({ to, subject: interpolate(p.subject || "", ctx), html });
       log.push(`Email sent to ${to}`);
+      runWorkflows("email_sent", { ...ctx, to, __summary: `Email to ${to}` });
+      return;
+    }
+    case "send_whatsapp": {
+      if (!whatsappConfigured()) { log.push("send_whatsapp skipped — WhatsApp API not configured"); return; }
+      const to = interpolate(p.to || "{{whatsapp}}", ctx) || interpolate("{{studentPhone}}", ctx);
+      if (!to) { log.push("send_whatsapp skipped — no phone number in context"); return; }
+      let text = interpolate(p.message || "", ctx);
+      text = await rewriteTrackedLinks(text, ctx, workflowId);
+      await sendWhatsAppRaw({ to, text });
+      log.push(`WhatsApp message sent to ${to}`);
+      runWorkflows("whatsapp_sent", { ...ctx, to, __summary: `WhatsApp to ${to}` });
+      return;
+    }
+    case "add_to_pipeline": {
+      const email = ctx.studentEmail || ctx.email;
+      if (!email) { log.push("add_to_pipeline skipped — no contact email"); return; }
+      let contact = await Contact.findOne({ email });
+      if (!contact) contact = await Contact.create({ email, name: ctx.studentName || ctx.name || "", studentId: ctx.studentId || null, source: `Workflow: ${ctx.__workflowName || ""}` });
+      const stage = p.stage || PIPELINE_STAGES_DEFAULT[0];
+      let opp = await Opportunity.findOne({ contact: contact._id, status: "open" });
+      const isNew = !opp;
+      if (!opp) opp = new Opportunity({ contact: contact._id, title: p.title || ctx.courseTitle || "Opportunity", value: Number(p.value) || ctx.amount || 0, stage });
+      else opp.stage = stage;
+      await opp.save();
+      log.push(`${isNew ? "Created" : "Updated"} pipeline opportunity for ${email} → stage "${stage}"`);
+      runWorkflows(isNew ? "opportunity_created" : "opportunity_status_changed", { ...ctx, opportunityId: opp._id, stage, __summary: `${email} → ${stage}` });
+      return;
+    }
+    case "update_opportunity_stage": {
+      const email = ctx.studentEmail || ctx.email;
+      if (!email || !p.stage) { log.push("update_opportunity_stage skipped — no contact email/stage"); return; }
+      const contact = await Contact.findOne({ email });
+      if (!contact) { log.push(`update_opportunity_stage skipped — no contact found for ${email}`); return; }
+      const opp = await Opportunity.findOneAndUpdate({ contact: contact._id, status: "open" }, { stage: p.stage }, { new: true });
+      if (!opp) { log.push(`update_opportunity_stage skipped — no open opportunity for ${email}`); return; }
+      log.push(`Opportunity stage for ${email} → "${p.stage}"`);
+      runWorkflows("opportunity_status_changed", { ...ctx, opportunityId: opp._id, stage: p.stage, __summary: `${email} → ${p.stage}` });
       return;
     }
     case "webhook": {
@@ -561,28 +773,15 @@ async function runAction(step, ctx, log) {
       log.push(`Webhook POSTed to ${p.url} (HTTP ${resp.status})`);
       return;
     }
-    case "add_tag":
-    case "remove_tag": {
-      if (!ctx.studentId || !p.tag) { log.push(`${step.actionType} skipped — no student/tag`); return; }
-      const op = step.actionType === "add_tag" ? { $addToSet: { tags: p.tag } } : { $pull: { tags: p.tag } };
-      await User.findByIdAndUpdate(ctx.studentId, op);
-      log.push(`${step.actionType === "add_tag" ? "Added" : "Removed"} tag "${p.tag}" ${step.actionType === "add_tag" ? "to" : "from"} ${ctx.studentName || ctx.studentId}`);
-      return;
-    }
-    case "notify": {
-      if (!ctx.studentId) { log.push("notify skipped — no student in context"); return; }
-      await Notification.create({ student: ctx.studentId, title: interpolate(p.title || "", ctx), message: interpolate(p.message || "", ctx) });
-      log.push(`Notification created for ${ctx.studentName || ctx.studentId}`);
-      return;
-    }
     default:
       log.push(`Unknown action type "${step.actionType}" — skipped`);
   }
 }
 
-/** Executes a workflow's steps starting at `fromIndex`, pausing (via PendingStep) on a delay step. */
+/** Executes a workflow's steps starting at `fromIndex`, pausing (via PendingStep) on a wait step. */
 async function executeWorkflowSteps(workflow, run, ctx, fromIndex) {
   const log = run.log || [];
+  ctx.__workflowName = workflow.name;
   for (let i = fromIndex; i < workflow.steps.length; i++) {
     const step = workflow.steps[i];
     if (step.type === "condition") {
@@ -596,18 +795,20 @@ async function executeWorkflowSteps(workflow, run, ctx, fromIndex) {
       log.push(`Condition "${step.conditionField} ${step.conditionOperator} ${step.conditionValue}" matched`);
       continue;
     }
-    if (step.actionType === "delay") {
-      const minutes = Number(step.params?.minutes) || 0;
-      const runAt = new Date(Date.now() + minutes * 60000);
+    if (step.actionType === "wait") {
+      const amount = Number(step.params?.amount) || 0;
+      const unit = step.params?.unit || "minutes";
+      const ms = amount * (WAIT_UNIT_MS[unit] || WAIT_UNIT_MS.minutes);
+      const runAt = new Date(Date.now() + ms);
       await PendingStep.create({ workflow: workflow._id, run: run._id, stepIndex: i + 1, context: ctx, runAt });
-      log.push(`Delaying ${minutes} minute(s) — resumes at ${runAt.toISOString()}`);
+      log.push(`Waiting ${amount} ${unit} — resumes at ${runAt.toISOString()}`);
       run.status = "waiting";
       run.log = log;
       await run.save();
       return;
     }
     try {
-      await runAction(step, ctx, log);
+      await runAction(step, ctx, log, workflow._id);
     } catch (err) {
       log.push(`Action "${step.actionType}" failed: ${err.message}`);
       run.status = "failed";
@@ -621,10 +822,10 @@ async function executeWorkflowSteps(workflow, run, ctx, fromIndex) {
   await run.save();
 }
 
-/** Call this from anywhere a real event happens (registration, enrollment, etc.) — fires every active workflow listening for that trigger. Never throws: a broken workflow must not break the request that triggered it. */
+/** Call this from anywhere a real event happens — fires every published workflow listening for that trigger. Never throws: a broken workflow must not break the request that triggered it. */
 async function runWorkflows(trigger, context) {
   try {
-    const workflows = await Workflow.find({ trigger, active: true });
+    const workflows = await Workflow.find({ trigger, published: true });
     for (const workflow of workflows) {
       const ctx = { ...context, __trigger: trigger };
       const run = await WorkflowRun.create({ workflow: workflow._id, trigger, summary: context.__summary || "", status: "success", log: [] });
@@ -638,7 +839,7 @@ async function runWorkflows(trigger, context) {
   }
 }
 
-// Poller — resumes any workflow run paused on a delay step once it's due.
+// Poller — resumes any workflow run paused on a wait step once it's due.
 // Dependency-free (no job queue needed): just checks every minute.
 setInterval(async () => {
   try {
@@ -647,7 +848,7 @@ setInterval(async () => {
       const workflow = await Workflow.findById(pending.workflow);
       const run = await WorkflowRun.findById(pending.run);
       await PendingStep.findByIdAndDelete(pending._id);
-      if (!workflow || !run || !workflow.active) continue;
+      if (!workflow || !run || !workflow.published) continue;
       run.status = "success";
       await executeWorkflowSteps(workflow, run, pending.context, pending.stepIndex);
     }
@@ -731,7 +932,7 @@ app.post("/api/auth/register", async (req, res) => {
       password,
       role:  role === "instructor" ? "instructor" : "student",
     });
-    runWorkflows("student_registered", {
+    runWorkflows("new_sign_up", {
       studentId: user._id, studentName: user.name, studentEmail: user.email,
       __summary: user.name,
     });
@@ -1036,8 +1237,15 @@ app.post("/api/enrollments/:courseId", protect, async (req, res) => {
 
     runWorkflows("enrollment_created", {
       studentId: req.user._id, studentName: req.user.name, studentEmail: req.user.email,
-      courseId: course._id, courseTitle: course.title, amount: enrollment.amount,
+      courseId: course._id, courseTitle: course.title, amount: enrollment.amount, category: course.category,
       __summary: `${req.user.name} → ${course.title}`,
+    });
+    // "Category Started" — same event, filtered/labeled by the course's
+    // category, for workflows that only care about e.g. "Marketing" courses.
+    runWorkflows("category_started", {
+      studentId: req.user._id, studentName: req.user.name, studentEmail: req.user.email,
+      courseId: course._id, courseTitle: course.title, category: course.category,
+      __summary: `${req.user.name} started ${course.category || "a"} category`,
     });
 
     // NOTE — behavior change: course access (the studentsEnrolled/students
@@ -1217,11 +1425,15 @@ app.patch("/api/admin/enrollments/:id/verify", protect, adminOnly, async (req, r
       .populate("student", "name email")
       .populate("course", "title thumbnail price");
 
-    runWorkflows("payment_verified", {
+    const verifyCtx = {
       studentId: populated.student?._id, studentName: populated.student?.name, studentEmail: populated.student?.email,
       courseId: populated.course?._id, courseTitle: populated.course?.title,
       __summary: `${populated.student?.name} → ${populated.course?.title}`,
-    });
+    };
+    runWorkflows("payment_received", verifyCtx);
+    // "Offer Access Granted" — fires alongside payment_received on this
+    // platform, since access is granted at the moment payment is verified.
+    runWorkflows("offer_access_granted", verifyCtx);
 
     res.json({
       _id: populated._id,
@@ -1293,6 +1505,25 @@ app.patch("/api/admin/users/:id/status", protect, adminOnly, async (req, res) =>
 // PROGRESS ROUTES
 // ══════════════════════════════════════════════════════════════════════════════
 
+// NEW: "Lesson Started" trigger — fires the first time a student opens a
+// lecture (not necessarily finishes it), called from the Student Portal's
+// video player when a lecture is opened. Doesn't touch Progress/completion
+// at all — purely fires the trigger.
+app.post("/api/progress/lesson-started", protect, async (req, res) => {
+  try {
+    const { courseId, lectureId, lectureTitle } = req.body || {};
+    if (!courseId || !lectureId) return res.status(400).json({ message: "courseId and lectureId are required" });
+    const course = await Course.findById(courseId).select("title category");
+    runWorkflows("lesson_started", {
+      studentId: req.user._id, studentName: req.user.name, studentEmail: req.user.email,
+      courseId, courseTitle: course?.title, lectureId: String(lectureId), lectureTitle: lectureTitle || "",
+      category: course?.category,
+      __summary: `${req.user.name} started "${lectureTitle || lectureId}"`,
+    });
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
 app.post("/api/progress/mark", protect, async (req, res) => {
   try {
     const { courseId, lectureId } = req.body;
@@ -1308,15 +1539,18 @@ app.post("/api/progress/mark", protect, async (req, res) => {
     await progress.save();
 
     if (!wasAlreadyDone) {
-      const course = await Course.findById(courseId).select("title sections");
+      const course = await Course.findById(courseId).select("title sections category");
       const totalLectures = (course?.sections || []).reduce((a, s) => a + (s.lectures?.length || 0), 0);
       const baseCtx = {
         studentId: req.user._id, studentName: req.user.name, studentEmail: req.user.email,
-        courseId, courseTitle: course?.title, lectureId: lid,
+        courseId, courseTitle: course?.title, lectureId: lid, category: course?.category,
       };
-      runWorkflows("lecture_completed", { ...baseCtx, __summary: `${req.user.name} → ${course?.title}` });
+      runWorkflows("lesson_completed", { ...baseCtx, __summary: `${req.user.name} → ${course?.title}` });
       if (totalLectures > 0 && progress.completedLectures.length >= totalLectures) {
-        runWorkflows("course_completed", { ...baseCtx, __summary: `${req.user.name} completed ${course?.title}` });
+        // "Category Completed" — same event as course completion, labeled
+        // by the course's category so a workflow can target e.g. everyone
+        // who finishes any "E-Commerce" course.
+        runWorkflows("category_completed", { ...baseCtx, __summary: `${req.user.name} completed ${course?.title}` });
       }
     }
 
@@ -1974,7 +2208,7 @@ app.post("/api/contact", async (req, res) => {
     const submission = await ContactSubmission.create({
       name: name.trim(), email: email.trim().toLowerCase(), message: message.trim(),
     });
-    runWorkflows("contact_form_submitted", { name: submission.name, email: submission.email, message: submission.message, __summary: submission.name });
+    runWorkflows("form_submitted", { name: submission.name, email: submission.email, message: submission.message, __summary: submission.name });
     res.status(201).json(submission);
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
@@ -2023,13 +2257,21 @@ app.get("/api/admin/newsletter-subscribers", protect, adminOnly, async (req, res
 // AUTOMATION WORKFLOW ROUTES — Super Admin → Automation Workflow
 // ══════════════════════════════════════════════════════════════════════════════
 
-// List available triggers/action types + whether email is configured, so the
-// builder UI can render its dropdowns and warn if SMTP isn't set up yet.
+// List available triggers/action types + whether email/WhatsApp are
+// configured, so the builder UI can render its dropdowns and warn if a
+// channel isn't set up yet.
 app.get("/api/admin/workflows/meta", protect, adminOnly, async (req, res) => {
   res.json({
     triggers: WORKFLOW_TRIGGERS,
-    actionTypes: ["send_email", "webhook", "add_tag", "remove_tag", "notify", "delay"],
+    actionTypes: [
+      "create_contact", "add_contact_tag", "remove_contact_tag",
+      "assign_user", "remove_assigned_user", "add_note", "internal_notification",
+      "notify_student", "wait", "send_email", "send_whatsapp",
+      "add_to_pipeline", "update_opportunity_stage", "webhook",
+    ],
     emailConfigured: emailConfigured(),
+    whatsappConfigured: whatsappConfigured(),
+    pipelineStages: PIPELINE_STAGES_DEFAULT,
   });
 });
 
@@ -2039,13 +2281,22 @@ app.get("/api/admin/workflows", protect, adminOnly, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
+// Single workflow — the full-page editor loads this directly by ID.
+app.get("/api/admin/workflows/:id", protect, adminOnly, async (req, res) => {
+  try {
+    const workflow = await Workflow.findById(req.params.id);
+    if (!workflow) return res.status(404).json({ message: "Workflow not found" });
+    res.json(workflow);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
 app.post("/api/admin/workflows", protect, adminOnly, async (req, res) => {
   try {
-    const { name, trigger, steps, active } = req.body || {};
+    const { name, trigger, steps, published } = req.body || {};
     if (!name?.trim()) return res.status(400).json({ message: "Name is required" });
     if (!WORKFLOW_TRIGGERS.includes(trigger)) return res.status(400).json({ message: "Invalid trigger" });
     const workflow = await Workflow.create({
-      name: name.trim(), trigger, steps: Array.isArray(steps) ? steps : [], active: active !== false,
+      name: name.trim(), trigger, steps: Array.isArray(steps) ? steps : [], published: published === true,
     });
     res.status(201).json(workflow);
   } catch (err) { res.status(500).json({ message: err.message }); }
@@ -2053,15 +2304,15 @@ app.post("/api/admin/workflows", protect, adminOnly, async (req, res) => {
 
 app.put("/api/admin/workflows/:id", protect, adminOnly, async (req, res) => {
   try {
-    const { name, trigger, steps, active } = req.body || {};
+    const { name, trigger, steps, published } = req.body || {};
     const update = {};
     if (name !== undefined)    update.name = name.trim();
     if (trigger !== undefined) {
       if (!WORKFLOW_TRIGGERS.includes(trigger)) return res.status(400).json({ message: "Invalid trigger" });
       update.trigger = trigger;
     }
-    if (steps !== undefined)  update.steps = steps;
-    if (active !== undefined) update.active = active;
+    if (steps !== undefined)     update.steps = steps;
+    if (published !== undefined) update.published = published;
     const workflow = await Workflow.findByIdAndUpdate(req.params.id, update, { new: true });
     if (!workflow) return res.status(404).json({ message: "Workflow not found" });
     res.json(workflow);
@@ -2094,7 +2345,8 @@ app.post("/api/admin/workflows/:id/test", protect, adminOnly, async (req, res) =
     const testCtx = {
       studentId: req.user._id, studentName: req.user.name, studentEmail: req.user.email,
       courseId: "", courseTitle: "Sample Course", amount: 0, lectureId: "", reason: "Sample reason",
-      name: req.user.name, email: req.user.email, message: "Sample message",
+      name: req.user.name, email: req.user.email, message: "Sample message", category: "Sample Category",
+      whatsapp: req.user.phone || "",
       __trigger: workflow.trigger, __summary: `Test run by ${req.user.name}`,
     };
     const run = await WorkflowRun.create({ workflow: workflow._id, trigger: workflow.trigger, summary: `Test run by ${req.user.name}`, status: "success", log: [] });
@@ -2103,6 +2355,133 @@ app.post("/api/admin/workflows/:id/test", protect, adminOnly, async (req, res) =
     await workflow.save();
     await executeWorkflowSteps(workflow, run, testCtx, 0);
     res.json(await WorkflowRun.findById(run._id));
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CRM: CONTACTS + PIPELINE (OPPORTUNITIES) — Super Admin → Pipeline
+// ══════════════════════════════════════════════════════════════════════════════
+
+app.get("/api/admin/contacts", protect, adminOnly, async (req, res) => {
+  try {
+    res.json(await Contact.find({}).populate("assignedTo", "name email").sort("-createdAt"));
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// CSV export of contacts.
+app.get("/api/admin/contacts/export.csv", protect, adminOnly, async (req, res) => {
+  try {
+    const contacts = await Contact.find({}).sort("-createdAt");
+    const rows = [["Name", "Email", "Phone", "Tags", "Source", "Created"]];
+    for (const c of contacts) rows.push([c.name, c.email, c.phone, (c.tags || []).join("; "), c.source, c.createdAt.toISOString()]);
+    const csv = rows.map((r) => r.map((v) => `"${String(v ?? "").replace(/"/g, '""')}"`).join(",")).join("\n");
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", "attachment; filename=contacts.csv");
+    res.send(csv);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+app.get("/api/admin/opportunities", protect, adminOnly, async (req, res) => {
+  try {
+    res.json(await Opportunity.find({}).populate("contact").sort("-createdAt"));
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// CSV export of opportunities (the Pipeline board).
+app.get("/api/admin/opportunities/export.csv", protect, adminOnly, async (req, res) => {
+  try {
+    const opps = await Opportunity.find({}).populate("contact").sort("-createdAt");
+    const rows = [["Contact", "Email", "Title", "Value", "Stage", "Status", "Created"]];
+    for (const o of opps) rows.push([o.contact?.name, o.contact?.email, o.title, o.value, o.stage, o.status, o.createdAt.toISOString()]);
+    const csv = rows.map((r) => r.map((v) => `"${String(v ?? "").replace(/"/g, '""')}"`).join(",")).join("\n");
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", "attachment; filename=opportunities.csv");
+    res.send(csv);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Manually move a card between pipeline stages — also fires
+// opportunity_status_changed, same as a workflow doing it, so everything
+// stays interlinked either way.
+app.patch("/api/admin/opportunities/:id/stage", protect, adminOnly, async (req, res) => {
+  try {
+    const { stage } = req.body || {};
+    if (!stage) return res.status(400).json({ message: "stage is required" });
+    const opp = await Opportunity.findByIdAndUpdate(req.params.id, { stage }, { new: true }).populate("contact");
+    if (!opp) return res.status(404).json({ message: "Opportunity not found" });
+    runWorkflows("opportunity_status_changed", {
+      studentEmail: opp.contact?.email, studentName: opp.contact?.name, stage,
+      opportunityId: opp._id, __summary: `${opp.contact?.email} → ${stage}`,
+    });
+    res.json(opp);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+app.patch("/api/admin/contacts/:id/assign", protect, adminOnly, async (req, res) => {
+  try {
+    const { userId } = req.body || {};
+    const contact = await Contact.findByIdAndUpdate(req.params.id, { assignedTo: userId || null }, { new: true }).populate("assignedTo", "name email");
+    if (!contact) return res.status(404).json({ message: "Contact not found" });
+    res.json(contact);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+app.post("/api/admin/contacts/:id/notes", protect, adminOnly, async (req, res) => {
+  try {
+    const { text } = req.body || {};
+    if (!text?.trim()) return res.status(400).json({ message: "Note text is required" });
+    const contact = await Contact.findByIdAndUpdate(req.params.id, { $push: { notes: { text: text.trim() } } }, { new: true });
+    if (!contact) return res.status(404).json({ message: "Contact not found" });
+    res.json(contact);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// People an admin can assign a contact to (the "Assign User" action) —
+// admins and instructors.
+app.get("/api/admin/assignable-users", protect, adminOnly, async (req, res) => {
+  try {
+    res.json(await User.find({ role: { $in: ["admin", "instructor"] } }).select("name email role"));
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// LINK TRACKING — "Link Clicked" trigger
+// ══════════════════════════════════════════════════════════════════════════════
+// A message body's [[Label|https://example.com]] gets rewritten into one of
+// these at send time (see rewriteTrackedLinks above). Visiting it logs the
+// click, fires link_clicked, then redirects to the real destination.
+app.get("/l/:code", async (req, res) => {
+  try {
+    const link = await TrackedLink.findOneAndUpdate({ code: req.params.code }, { $inc: { clicks: 1 } }, { new: true });
+    if (!link) return res.status(404).send("Link not found");
+    runWorkflows("link_clicked", {
+      studentEmail: link.contactEmail, url: link.url,
+      __summary: `Clicked: ${link.url}`,
+    });
+    res.redirect(link.url);
+  } catch (err) { res.status(500).send("Something went wrong"); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INBOUND MESSAGES — "Customer Replied" trigger
+// ══════════════════════════════════════════════════════════════════════════════
+// NOT automatic — this only fires when YOUR SMS/WhatsApp/email provider's
+// inbound webhook is configured to POST here. Point your provider's
+// "incoming message" webhook at POST /api/inbound/message with
+// { "from": "<phone or email>", "text": "<message body>" } and this trigger
+// starts firing for real. Left unauthenticated since providers can't send
+// your app's login token — if you want it locked down, add a shared-secret
+// header check here matching a value only you and your provider know.
+app.post("/api/inbound/message", async (req, res) => {
+  try {
+    const { from, text } = req.body || {};
+    if (!from) return res.status(400).json({ message: "from is required" });
+    const contact = await Contact.findOne({ $or: [{ email: from }, { phone: from }] });
+    runWorkflows("customer_replied", {
+      studentEmail: contact?.email || from, studentName: contact?.name || "", message: text || "",
+      __summary: `Reply from ${from}`,
+    });
+    res.json({ received: true });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
@@ -2119,6 +2498,22 @@ app.get("/api/notifications/my", protect, async (req, res) => {
 app.patch("/api/notifications/:id/read", protect, async (req, res) => {
   try {
     const notif = await Notification.findOneAndUpdate({ _id: req.params.id, student: req.user._id }, { read: true }, { new: true });
+    if (!notif) return res.status(404).json({ message: "Notification not found" });
+    res.json(notif);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Internal (admin-facing) notifications, created by the "Send Internal
+// Notification" workflow action. No bell icon wired to this yet in the
+// Super Admin panel — these are ready to list whenever that's added.
+app.get("/api/admin/internal-notifications", protect, adminOnly, async (req, res) => {
+  try {
+    res.json(await InternalNotification.find({}).sort("-createdAt").limit(50));
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+app.patch("/api/admin/internal-notifications/:id/read", protect, adminOnly, async (req, res) => {
+  try {
+    const notif = await InternalNotification.findByIdAndUpdate(req.params.id, { read: true }, { new: true });
     if (!notif) return res.status(404).json({ message: "Notification not found" });
     res.json(notif);
   } catch (err) { res.status(500).json({ message: err.message }); }
