@@ -22,10 +22,12 @@ const crypto      = require("crypto"); // used to hash payment screenshots (frau
 // / getMailer / sendEmailRaw and the "send_email" case in runAction (see
 // git history), and re-list "send_email" in WorkflowStepSchema's actionType
 // enum and the /admin/workflows/meta actionTypes array.
-// NEW: parses/generates CSV and Excel (.xlsx) files for the Review
-// Importer (Super Admin). Requires `npm install xlsx` — not a dependency
-// before now.
-const XLSX = require("xlsx");
+// NOTE: the Review Importer (Super Admin) originally used the `xlsx`
+// package to parse CSV/Excel files, but it wasn't listed in package.json,
+// so Render's `npm install` never fetched it and the server crashed on
+// require — same issue as nodemailer above. It now parses plain CSV by
+// hand instead (see parseCsv() below) — zero dependencies. Excel
+// opens/saves .csv files natively, so nothing is actually lost.
 
 const app = express();
 
@@ -1722,20 +1724,19 @@ const videoMulter = multer({
   },
 });
 
-// Used by the Review Importer (Super Admin) — CSV or Excel (.xlsx/.xls).
+// Used by the Review Importer (Super Admin) — CSV only (see the NOTE up top
+// on why Excel/.xlsx isn't parsed directly anymore: Excel opens/saves .csv
+// files fine, so this loses nothing practical).
 const spreadsheetMulter = multer({
   storage: multer.memoryStorage(),
   limits:  { fileSize: 5 * 1024 * 1024 },            // 5 MB — plenty for a review sheet
   fileFilter: (_, file, cb) => {
-    const ok = [
-      "text/csv", "application/vnd.ms-excel",
-      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    ];
+    const ok = ["text/csv", "application/csv"];
     // Some browsers send CSV as text/plain or octet-stream — fall back to
     // checking the file extension so a real CSV isn't rejected on mimetype
     // alone.
-    const okExt = /\.(csv|xlsx|xls)$/i.test(file.originalname || "");
-    (ok.includes(file.mimetype) || okExt) ? cb(null, true) : cb(new Error("Only CSV or Excel (.xlsx/.xls) files are allowed"));
+    const okExt = /\.csv$/i.test(file.originalname || "");
+    (ok.includes(file.mimetype) || okExt) ? cb(null, true) : cb(new Error("Only CSV files are allowed"));
   },
 });
 
@@ -2251,30 +2252,59 @@ app.get("/api/admin/newsletter-subscribers", protect, adminOnly, async (req, res
 // ══════════════════════════════════════════════════════════════════════════════
 // Bulk-adds reviews to a course's real review list (the same Review
 // collection/format every review on that course's landing page already
-// comes from) via a CSV or Excel upload — columns: Student Name, Date,
-// Stars, Review.
+// comes from) via a CSV upload — columns: Student Name, Date, Stars, Review.
+
+// Parses CSV text into an array of row objects keyed by header, handling
+// quoted fields (so a review containing a comma or a quote doesn't break
+// the columns) — a small hand-written parser instead of a library, so this
+// route has zero npm dependencies.
+function parseCsv(text) {
+  const rows = [];
+  let row = [], field = "", inQuotes = false;
+  const pushField = () => { row.push(field); field = ""; };
+  const pushRow = () => { pushField(); rows.push(row); row = []; };
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i], next = text[i + 1];
+    if (inQuotes) {
+      if (ch === '"' && next === '"') { field += '"'; i++; }
+      else if (ch === '"') { inQuotes = false; }
+      else { field += ch; }
+    } else if (ch === '"') {
+      inQuotes = true;
+    } else if (ch === ",") {
+      pushField();
+    } else if (ch === "\n") {
+      pushRow();
+    } else if (ch === "\r") {
+      // skip — \r\n line endings are handled by the following \n
+    } else {
+      field += ch;
+    }
+  }
+  if (field !== "" || row.length > 0) pushRow();
+
+  const filtered = rows.filter((r) => r.some((c) => String(c).trim() !== ""));
+  if (filtered.length === 0) return [];
+  const headers = filtered[0].map((h) => h.trim());
+  return filtered.slice(1).map((r) => {
+    const obj = {};
+    headers.forEach((h, i) => { obj[h] = r[i] ?? ""; });
+    return obj;
+  });
+}
 
 const REVIEW_IMPORT_HEADERS = ["Student Name", "Date", "Stars", "Review"];
 const REVIEW_IMPORT_SAMPLE_ROW = ["Ayesha Siddiqui", "2026-03-15", "5", "Excellent course, learned so much about running paid ads properly."];
 
-// Sample templates — downloadable from the Review Importer page so the
-// admin knows exactly which columns/format to fill in.
+// Sample template — downloadable from the Review Importer page so the
+// admin knows exactly which columns/format to fill in. Excel opens and
+// saves .csv files natively, so this works as the "Excel sample" too.
 app.get("/api/admin/reviews-template.csv", protect, adminOnly, (req, res) => {
   const rows = [REVIEW_IMPORT_HEADERS, REVIEW_IMPORT_SAMPLE_ROW];
   const csv = rows.map((r) => r.map((v) => `"${String(v).replace(/"/g, '""')}"`).join(",")).join("\n");
   res.setHeader("Content-Type", "text/csv");
   res.setHeader("Content-Disposition", "attachment; filename=review-import-sample.csv");
   res.send(csv);
-});
-
-app.get("/api/admin/reviews-template.xlsx", protect, adminOnly, (req, res) => {
-  const ws = XLSX.utils.aoa_to_sheet([REVIEW_IMPORT_HEADERS, REVIEW_IMPORT_SAMPLE_ROW]);
-  const wb = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(wb, ws, "Reviews");
-  const buffer = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
-  res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-  res.setHeader("Content-Disposition", "attachment; filename=review-import-sample.xlsx");
-  res.send(buffer);
 });
 
 // Existing reviews for one course — shown on the Review Importer page so an
@@ -2301,11 +2331,9 @@ app.post("/api/admin/courses/:id/reviews/import", protect, adminOnly, spreadshee
 
     let rows;
     try {
-      const wb = XLSX.read(req.file.buffer, { type: "buffer" });
-      const sheet = wb.Sheets[wb.SheetNames[0]];
-      rows = XLSX.utils.sheet_to_json(sheet, { defval: "" });
+      rows = parseCsv(req.file.buffer.toString("utf8"));
     } catch (parseErr) {
-      return res.status(400).json({ message: "Couldn't read that file — make sure it's a valid CSV or Excel file." });
+      return res.status(400).json({ message: "Couldn't read that file — make sure it's a valid CSV file." });
     }
 
     // Column names are matched loosely (case/space-insensitive) so "Student
@@ -2337,7 +2365,7 @@ app.post("/api/admin/courses/:id/reviews/import", protect, adminOnly, spreadshee
 
       let createdAt = new Date();
       if (dateRaw) {
-        const parsed = dateRaw instanceof Date ? dateRaw : new Date(dateRaw);
+        const parsed = new Date(dateRaw);
         if (!isNaN(parsed.getTime())) createdAt = parsed;
       }
 
