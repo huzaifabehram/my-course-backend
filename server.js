@@ -14,10 +14,18 @@ const bcrypt   = require("bcryptjs");
 const jwt      = require("jsonwebtoken");
 const cloudinary = require("cloudinary").v2;
 const crypto      = require("crypto"); // used to hash payment screenshots (fraud/dedup check below)
-// NEW: real email sending for Automation Workflow's "send_email" action.
-// Requires `npm install nodemailer` in this project (not a dependency
-// before now) and SMTP_* env vars — see sendEmail()/requireEmail() below.
-const nodemailer = require("nodemailer");
+// NOTE: email sending was removed for now (SMTP isn't set up yet, and the
+// nodemailer dependency isn't installed, which was breaking the server
+// startup). The "send_email" workflow action and "email_sent" trigger have
+// been removed alongside it. To bring email back later: re-add
+// `const nodemailer = require("nodemailer");` here, restore emailConfigured
+// / getMailer / sendEmailRaw and the "send_email" case in runAction (see
+// git history), and re-list "send_email" in WorkflowStepSchema's actionType
+// enum and the /admin/workflows/meta actionTypes array.
+// NEW: parses/generates CSV and Excel (.xlsx) files for the Review
+// Importer (Super Admin). Requires `npm install xlsx` — not a dependency
+// before now.
+const XLSX = require("xlsx");
 
 const app = express();
 
@@ -246,7 +254,7 @@ const WorkflowStepSchema = new mongoose.Schema({
     enum: [
       "create_contact", "add_contact_tag", "remove_contact_tag",
       "assign_user", "remove_assigned_user", "add_note", "internal_notification",
-      "notify_student", "wait", "send_email", "send_whatsapp",
+      "notify_student", "wait", "send_whatsapp",
       "add_to_pipeline", "update_opportunity_stage", "webhook",
     ],
   },
@@ -261,7 +269,7 @@ const WorkflowStepSchema = new mongoose.Schema({
 //   offer_access_granted, payment_rejected, lesson_started, lesson_completed,
 //   category_started, category_completed, newsletter_subscribed,
 //   opportunity_created, opportunity_status_changed, link_clicked,
-//   email_sent, whatsapp_sent
+//   whatsapp_sent
 // Triggers that fire only once YOU wire something external to call them:
 //   customer_replied — needs your SMS/WhatsApp/email provider's inbound
 //     webhook pointed at POST /api/inbound/message (see notes below)
@@ -272,12 +280,14 @@ const WorkflowStepSchema = new mongoose.Schema({
 //   booking/calendar feature anywhere on this platform to trigger from),
 //   funnel_website_page_view (would need a tracking call added to every
 //   page site-wide — a real but separate project)
+// (email_sent was removed along with the send_email action — see the note
+// near the top of this file on re-adding email support.)
 const WORKFLOW_TRIGGERS = [
   "form_submitted", "new_sign_up", "enrollment_created", "payment_received",
   "offer_access_granted", "payment_rejected", "lesson_started", "lesson_completed",
   "category_started", "category_completed", "newsletter_subscribed",
   "opportunity_created", "opportunity_status_changed", "link_clicked",
-  "email_sent", "whatsapp_sent", "customer_replied",
+  "whatsapp_sent", "customer_replied",
 ];
 
 const WorkflowSchema = new mongoose.Schema({
@@ -567,29 +577,9 @@ function requireCloudinary(req, res, next) {
 // ══════════════════════════════════════════════════════════════════════════════
 // AUTOMATION WORKFLOW ENGINE
 // ══════════════════════════════════════════════════════════════════════════════
-
-/** Whether SMTP is configured — same guard pattern as requireCloudinary above. */
-function emailConfigured() {
-  return !!(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS);
-}
-let _mailer = null;
-function getMailer() {
-  if (!emailConfigured()) return null;
-  if (!_mailer) {
-    _mailer = nodemailer.createTransport({
-      host: process.env.SMTP_HOST,
-      port: Number(process.env.SMTP_PORT) || 587,
-      secure: Number(process.env.SMTP_PORT) === 465,
-      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
-    });
-  }
-  return _mailer;
-}
-async function sendEmailRaw({ to, subject, html }) {
-  const mailer = getMailer();
-  if (!mailer) throw new Error("SMTP not configured (SMTP_HOST, SMTP_USER, SMTP_PASS)");
-  await mailer.sendMail({ from: process.env.SMTP_FROM || process.env.SMTP_USER, to, subject, html });
-}
+// (Email sending — emailConfigured/getMailer/sendEmailRaw — was removed here
+// along with the "send_email" action; see the note near the top of this
+// file on bringing it back once SMTP is set up.)
 
 // ── WhatsApp — generic integration against Meta's official WhatsApp Cloud
 // API (the standard most providers, including Meta directly, expose this
@@ -624,7 +614,7 @@ function interpolate(str, ctx) {
 
 // A message body can carry `[[Label|https://example.com]]` — rewritten here
 // into a real tracked link (/l/<code>) so a click can be logged and fire the
-// link_clicked trigger. Used by both send_email and send_whatsapp.
+// link_clicked trigger. Used by send_whatsapp.
 async function rewriteTrackedLinks(text, ctx, workflowId) {
   const linkPattern = /\[\[([^\|\]]+)\|([^\]]+)\]\]/g;
   const matches = [...text.matchAll(linkPattern)];
@@ -710,22 +700,8 @@ async function runAction(step, ctx, log, workflowId) {
       log.push(`Notification created for ${ctx.studentName || ctx.studentId}`);
       return;
     }
-    case "send_email": {
-      if (!emailConfigured()) { log.push("send_email skipped — SMTP not configured"); return; }
-      const to = interpolate(p.to || "{{studentEmail}}", ctx);
-      if (!to) { log.push("send_email skipped — no recipient email in context"); return; }
-      let html = interpolate(p.body || "", ctx);
-      html = await rewriteTrackedLinks(html, ctx, workflowId);
-      html = html.replace(/\n/g, "<br/>");
-      if (p.buttonText && p.buttonUrl) {
-        const btnUrl = interpolate(p.buttonUrl, ctx);
-        html += `<br/><br/><a href="${btnUrl}" style="display:inline-block;background:#e8540a;color:#fff;padding:10px 20px;border-radius:8px;text-decoration:none;font-weight:bold;">${p.buttonText}</a>`;
-      }
-      await sendEmailRaw({ to, subject: interpolate(p.subject || "", ctx), html });
-      log.push(`Email sent to ${to}`);
-      runWorkflows("email_sent", { ...ctx, to, __summary: `Email to ${to}` });
-      return;
-    }
+    // ("send_email" case removed along with email sending — see the note
+    // near the top of this file on bringing it back.)
     case "send_whatsapp": {
       if (!whatsappConfigured()) { log.push("send_whatsapp skipped — WhatsApp API not configured"); return; }
       const to = interpolate(p.to || "{{whatsapp}}", ctx) || interpolate("{{studentPhone}}", ctx);
@@ -1746,6 +1722,23 @@ const videoMulter = multer({
   },
 });
 
+// Used by the Review Importer (Super Admin) — CSV or Excel (.xlsx/.xls).
+const spreadsheetMulter = multer({
+  storage: multer.memoryStorage(),
+  limits:  { fileSize: 5 * 1024 * 1024 },            // 5 MB — plenty for a review sheet
+  fileFilter: (_, file, cb) => {
+    const ok = [
+      "text/csv", "application/vnd.ms-excel",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ];
+    // Some browsers send CSV as text/plain or octet-stream — fall back to
+    // checking the file extension so a real CSV isn't rejected on mimetype
+    // alone.
+    const okExt = /\.(csv|xlsx|xls)$/i.test(file.originalname || "");
+    (ok.includes(file.mimetype) || okExt) ? cb(null, true) : cb(new Error("Only CSV or Excel (.xlsx/.xls) files are allowed"));
+  },
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/upload/image
 // Used by: course thumbnail, image testimonials, project gallery, profile avatar
@@ -2254,6 +2247,110 @@ app.get("/api/admin/newsletter-subscribers", protect, adminOnly, async (req, res
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
+// REVIEW IMPORTER — Super Admin → Review Importer
+// ══════════════════════════════════════════════════════════════════════════════
+// Bulk-adds reviews to a course's real review list (the same Review
+// collection/format every review on that course's landing page already
+// comes from) via a CSV or Excel upload — columns: Student Name, Date,
+// Stars, Review.
+
+const REVIEW_IMPORT_HEADERS = ["Student Name", "Date", "Stars", "Review"];
+const REVIEW_IMPORT_SAMPLE_ROW = ["Ayesha Siddiqui", "2026-03-15", "5", "Excellent course, learned so much about running paid ads properly."];
+
+// Sample templates — downloadable from the Review Importer page so the
+// admin knows exactly which columns/format to fill in.
+app.get("/api/admin/reviews-template.csv", protect, adminOnly, (req, res) => {
+  const rows = [REVIEW_IMPORT_HEADERS, REVIEW_IMPORT_SAMPLE_ROW];
+  const csv = rows.map((r) => r.map((v) => `"${String(v).replace(/"/g, '""')}"`).join(",")).join("\n");
+  res.setHeader("Content-Type", "text/csv");
+  res.setHeader("Content-Disposition", "attachment; filename=review-import-sample.csv");
+  res.send(csv);
+});
+
+app.get("/api/admin/reviews-template.xlsx", protect, adminOnly, (req, res) => {
+  const ws = XLSX.utils.aoa_to_sheet([REVIEW_IMPORT_HEADERS, REVIEW_IMPORT_SAMPLE_ROW]);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Reviews");
+  const buffer = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
+  res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+  res.setHeader("Content-Disposition", "attachment; filename=review-import-sample.xlsx");
+  res.send(buffer);
+});
+
+// Existing reviews for one course — shown on the Review Importer page so an
+// admin can see what's already there (and remove a bad import).
+app.get("/api/admin/courses/:id/reviews", protect, adminOnly, async (req, res) => {
+  try {
+    res.json(await Review.find({ course: req.params.id }).sort("-createdAt"));
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+app.delete("/api/admin/reviews/:id", protect, adminOnly, async (req, res) => {
+  try {
+    const review = await Review.findByIdAndDelete(req.params.id);
+    if (!review) return res.status(404).json({ message: "Review not found" });
+    res.json({ deleted: true });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+app.post("/api/admin/courses/:id/reviews/import", protect, adminOnly, spreadsheetMulter.single("file"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ message: "No file uploaded" });
+    const course = await Course.findById(req.params.id).select("_id");
+    if (!course) return res.status(404).json({ message: "Course not found" });
+
+    let rows;
+    try {
+      const wb = XLSX.read(req.file.buffer, { type: "buffer" });
+      const sheet = wb.Sheets[wb.SheetNames[0]];
+      rows = XLSX.utils.sheet_to_json(sheet, { defval: "" });
+    } catch (parseErr) {
+      return res.status(400).json({ message: "Couldn't read that file — make sure it's a valid CSV or Excel file." });
+    }
+
+    // Column names are matched loosely (case/space-insensitive) so "Student
+    // Name", "student_name", "Name" etc. all work, rather than forcing an
+    // exact header match.
+    const norm = (s) => String(s || "").toLowerCase().replace(/[^a-z]/g, "");
+    const getCell = (row, ...aliases) => {
+      const keys = Object.keys(row);
+      for (const alias of aliases) {
+        const key = keys.find((k) => norm(k) === norm(alias));
+        if (key !== undefined) return row[key];
+      }
+      return "";
+    };
+
+    const toCreate = [];
+    const errors = [];
+    rows.forEach((row, i) => {
+      const lineNo = i + 2; // +1 for header row, +1 for 1-indexing
+      const name = String(getCell(row, "Student Name", "Name", "Author")).trim();
+      const dateRaw = getCell(row, "Date");
+      const starsRaw = getCell(row, "Stars", "Rating", "Star");
+      const text = String(getCell(row, "Review", "Comment", "Text")).trim();
+
+      const stars = Number(starsRaw);
+      if (!name) { errors.push(`Row ${lineNo}: missing Student Name`); return; }
+      if (!stars || stars < 1 || stars > 5) { errors.push(`Row ${lineNo}: Stars must be a number 1–5 (got "${starsRaw}")`); return; }
+      if (!text) { errors.push(`Row ${lineNo}: missing Review text`); return; }
+
+      let createdAt = new Date();
+      if (dateRaw) {
+        const parsed = dateRaw instanceof Date ? dateRaw : new Date(dateRaw);
+        if (!isNaN(parsed.getTime())) createdAt = parsed;
+      }
+
+      toCreate.push({ course: course._id, authorName: name, rating: stars, comment: text, text, createdAt });
+    });
+
+    if (toCreate.length > 0) await Review.insertMany(toCreate);
+
+    res.json({ imported: toCreate.length, skipped: errors.length, errors: errors.slice(0, 20) });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
 // AUTOMATION WORKFLOW ROUTES — Super Admin → Automation Workflow
 // ══════════════════════════════════════════════════════════════════════════════
 
@@ -2266,10 +2363,9 @@ app.get("/api/admin/workflows/meta", protect, adminOnly, async (req, res) => {
     actionTypes: [
       "create_contact", "add_contact_tag", "remove_contact_tag",
       "assign_user", "remove_assigned_user", "add_note", "internal_notification",
-      "notify_student", "wait", "send_email", "send_whatsapp",
+      "notify_student", "wait", "send_whatsapp",
       "add_to_pipeline", "update_opportunity_stage", "webhook",
     ],
-    emailConfigured: emailConfigured(),
     whatsappConfigured: whatsappConfigured(),
     pipelineStages: PIPELINE_STAGES_DEFAULT,
   });
