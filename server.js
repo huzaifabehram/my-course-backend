@@ -40,6 +40,18 @@ cloudinary.config({
 console.log("☁️  Cloudinary:", process.env.CLOUDINARY_CLOUD_NAME ? "✓ configured" : "✗ NOT configured — set env vars");
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
+// NEW: this was a strict allowlist of exact URLs — it had no entry for a
+// Vercel deployment at all, which is almost certainly what broke courses/
+// portals/login: the browser blocks every cross-origin API response before
+// your frontend code ever sees it, so static content (served directly by
+// Vercel, no CORS involved) still renders while everything that needs the
+// backend silently fails. Fixed two ways: (1) any *.vercel.app origin is
+// now allowed automatically — Vercel gives every deployment and every PR
+// preview its own unique subdomain, so a fixed list can never keep up with
+// those; (2) CLIENT_URL/PUBLIC_URL are still supported for your real
+// custom domain once DNS points there. Set CLIENT_URL on Render to your
+// exact production URL (e.g. https://motiviam.com) as the authoritative
+// one either way.
 const allowedOrigins = [
   "http://localhost:3000",
   "http://localhost:5173",
@@ -51,7 +63,7 @@ const allowedOrigins = [
 
 app.use(cors({
   origin: (origin, cb) => {
-    if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
+    if (!origin || allowedOrigins.includes(origin) || /^https:\/\/[a-z0-9-]+\.vercel\.app$/.test(origin)) return cb(null, true);
     cb(new Error(`CORS blocked: ${origin}`));
   },
   credentials: true,
