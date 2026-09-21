@@ -299,6 +299,13 @@ const WorkflowSchema = new mongoose.Schema({
   // boolean underneath) — a published workflow actually runs on its
   // trigger; unpublished sits saved but does nothing.
   published: { type: Boolean, default: false },
+  // NEW: optional scoping for triggers that can fire for many different
+  // real things — right now just lesson_started/lesson_completed, which
+  // otherwise fire for EVERY lesson in EVERY course. When courseId/
+  // lectureId are set here, runWorkflows() below only runs this workflow
+  // if the real event matches that exact lesson; left empty, it still
+  // fires for every lesson, same as before.
+  triggerScope: { type: mongoose.Schema.Types.Mixed, default: {} },
   steps:     { type: [WorkflowStepSchema], default: [] },
   runCount:  { type: Number, default: 0 },
   lastRunAt: Date,
@@ -401,6 +408,7 @@ mongoose.connection.once("open", async () => {
   } catch {
     /* index may not exist */
   }
+  await seedForms();
 });
 
 // ── Site Settings — singleton document (logo, etc.) ────────────────────────────
@@ -468,6 +476,39 @@ const PackageInquirySchema = new mongoose.Schema({
   status:   { type: String, enum: ["new", "contacted"], default: "new" },
 }, { timestamps: true });
 const PackageInquiry = mongoose.model("PackageInquiry", PackageInquirySchema);
+
+// ── Forms registry — Super Admin → Forms ──────────────────────────────────
+// A catalog of the real forms already live on the site, so they can be
+// named, described, and referenced elsewhere (e.g. scoping the Automation
+// Workflow's "Form Submitted" trigger to one specific form via its slug).
+// This does NOT dynamically render these forms — the two seeded below are
+// real hand-built React forms (EnrolledPage's 2-step enrollment form,
+// PackageInquiryPage's Gold/Premium inquiry form); this is a reference
+// entry for each, tagged with the same slug those pages already send.
+const FormSchema = new mongoose.Schema({
+  name:        { type: String, required: true, trim: true },
+  slug:        { type: String, required: true, unique: true, trim: true },
+  description: { type: String, default: "" },
+  fields:      { type: [String], default: [] }, // reference only — the real fields live in the page's own code
+}, { timestamps: true });
+const Form = mongoose.model("Form", FormSchema);
+
+// Seeds the two forms already in use, the first time this runs against a
+// fresh database — safe to call every startup (upsert, never duplicates).
+async function seedForms() {
+  try {
+    await Form.findOneAndUpdate(
+      { slug: "form-1" },
+      { $setOnInsert: { name: "Form 1", slug: "form-1", description: "Course Enrollment — the 2-step form shown when a student enrolls in a course.", fields: ["Name", "Email", "Password", "WhatsApp Number", "Payment Method", "Payment Screenshot"] } },
+      { upsert: true }
+    );
+    await Form.findOneAndUpdate(
+      { slug: "form-2" },
+      { $setOnInsert: { name: "Form 2", slug: "form-2", description: "Package Inquiry — shown on the Services page's Gold/Premium package cards.", fields: ["Name", "WhatsApp Number", "Email", "Package"] } },
+      { upsert: true }
+    );
+  } catch (err) { console.error("[Forms] seed error:", err.message); }
+}
 
 // ── Newsletter subscribers — from the footer newsletter box ────────────────────
 const NewsletterSubscriberSchema = new mongoose.Schema({
@@ -811,10 +852,23 @@ async function executeWorkflowSteps(workflow, run, ctx, fromIndex) {
 }
 
 /** Call this from anywhere a real event happens — fires every published workflow listening for that trigger. Never throws: a broken workflow must not break the request that triggered it. */
+// A workflow with a triggerScope only runs for events that match it — e.g.
+// a lesson_started workflow scoped to one specific lectureId won't fire for
+// every OTHER lesson too. No scope set (the default) means "run for every
+// event of this trigger", same as before this existed.
+function matchesTriggerScope(workflow, context) {
+  const scope = workflow.triggerScope || {};
+  if (scope.lectureId && String(context.lectureId || "") !== String(scope.lectureId)) return false;
+  if (scope.courseId && String(context.courseId || "") !== String(scope.courseId)) return false;
+  if (scope.formSlug && String(context.formSlug || "") !== String(scope.formSlug)) return false;
+  return true;
+}
+
 async function runWorkflows(trigger, context) {
   try {
     const workflows = await Workflow.find({ trigger, published: true });
     for (const workflow of workflows) {
+      if (!matchesTriggerScope(workflow, context)) continue;
       const ctx = { ...context, __trigger: trigger };
       const run = await WorkflowRun.create({ workflow: workflow._id, trigger, summary: context.__summary || "", status: "success", log: [] });
       workflow.runCount = (workflow.runCount || 0) + 1;
@@ -1299,6 +1353,14 @@ app.post("/api/enrollments/:courseId", protect, async (req, res) => {
     runWorkflows("enrollment_created", {
       studentId: req.user._id, studentName: req.user.name, studentEmail: req.user.email,
       courseId: course._id, courseTitle: course.title, amount: enrollment.amount, category: course.category,
+      __summary: `${req.user.name} → ${course.title}`,
+    });
+    // "Form Submitted", tagged formSlug: "form-1" — the 2-step course
+    // enrollment form is registered as "Form 1" in Super Admin → Forms, so
+    // a workflow can be scoped to react to this specific form instead of
+    // every form on the site.
+    runWorkflows("form_submitted", {
+      name: req.user.name, email: req.user.email, message: `Enrolled in ${course.title}`, formSlug: "form-1",
       __summary: `${req.user.name} → ${course.title}`,
     });
     // "Category Started" — same event, filtered/labeled by the course's
@@ -2332,7 +2394,7 @@ app.post("/api/package-inquiries", async (req, res) => {
     const inquiry = await PackageInquiry.create({
       name: name.trim(), whatsapp: whatsapp.trim(), email: email.trim().toLowerCase(), package: pkg,
     });
-    runWorkflows("form_submitted", { name: inquiry.name, email: inquiry.email, message: `${pkg === "gold" ? "Gold" : "Premium"} Package inquiry`, __summary: `${inquiry.name} — ${pkg} package` });
+    runWorkflows("form_submitted", { name: inquiry.name, email: inquiry.email, message: `${pkg === "gold" ? "Gold" : "Premium"} Package inquiry`, formSlug: "form-2", __summary: `${inquiry.name} — ${pkg} package` });
     res.status(201).json(inquiry);
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
@@ -2341,6 +2403,57 @@ app.post("/api/package-inquiries", async (req, res) => {
 app.get("/api/admin/package-inquiries", protect, adminOnly, async (req, res) => {
   try {
     res.json(await PackageInquiry.find({}).sort("-createdAt"));
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// FORMS — Super Admin → Forms
+// ══════════════════════════════════════════════════════════════════════════════
+
+app.get("/api/admin/forms", protect, adminOnly, async (req, res) => {
+  try {
+    res.json(await Form.find({}).sort("slug"));
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+app.post("/api/admin/forms", protect, adminOnly, async (req, res) => {
+  try {
+    const { name, slug, description, fields } = req.body || {};
+    if (!name?.trim() || !slug?.trim()) return res.status(400).json({ message: "Name and slug are required" });
+    const form = await Form.create({
+      name: name.trim(), slug: slug.trim().toLowerCase().replace(/\s+/g, "-"),
+      description: description || "", fields: Array.isArray(fields) ? fields : [],
+    });
+    res.status(201).json(form);
+  } catch (err) {
+    if (err.code === 11000) return res.status(400).json({ message: "A form with that slug already exists" });
+    res.status(500).json({ message: err.message });
+  }
+});
+
+app.put("/api/admin/forms/:id", protect, adminOnly, async (req, res) => {
+  try {
+    const { name, description, fields } = req.body || {};
+    // slug is intentionally not editable here — it's what live pages/
+    // triggers already reference, so changing it would silently break them.
+    const update = {};
+    if (name !== undefined) update.name = name.trim();
+    if (description !== undefined) update.description = description;
+    if (fields !== undefined) update.fields = Array.isArray(fields) ? fields : [];
+    const form = await Form.findByIdAndUpdate(req.params.id, update, { new: true });
+    if (!form) return res.status(404).json({ message: "Form not found" });
+    res.json(form);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+app.delete("/api/admin/forms/:id", protect, adminOnly, async (req, res) => {
+  try {
+    const form = await Form.findById(req.params.id);
+    if (!form) return res.status(404).json({ message: "Form not found" });
+    if (form.slug === "form-1" || form.slug === "form-2")
+      return res.status(400).json({ message: "This form is wired into a live page and can't be deleted from here." });
+    await Form.findByIdAndDelete(req.params.id);
+    res.json({ deleted: true });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
@@ -2546,11 +2659,12 @@ app.get("/api/admin/workflows/:id", protect, adminOnly, async (req, res) => {
 
 app.post("/api/admin/workflows", protect, adminOnly, async (req, res) => {
   try {
-    const { name, trigger, steps, published } = req.body || {};
+    const { name, trigger, steps, published, triggerScope } = req.body || {};
     if (!name?.trim()) return res.status(400).json({ message: "Name is required" });
     if (!WORKFLOW_TRIGGERS.includes(trigger)) return res.status(400).json({ message: "Invalid trigger" });
     const workflow = await Workflow.create({
       name: name.trim(), trigger, steps: Array.isArray(steps) ? steps : [], published: published === true,
+      triggerScope: triggerScope && typeof triggerScope === "object" ? triggerScope : {},
     });
     res.status(201).json(workflow);
   } catch (err) { res.status(500).json({ message: err.message }); }
@@ -2558,7 +2672,7 @@ app.post("/api/admin/workflows", protect, adminOnly, async (req, res) => {
 
 app.put("/api/admin/workflows/:id", protect, adminOnly, async (req, res) => {
   try {
-    const { name, trigger, steps, published } = req.body || {};
+    const { name, trigger, steps, published, triggerScope } = req.body || {};
     const update = {};
     if (name !== undefined)    update.name = name.trim();
     if (trigger !== undefined) {
@@ -2567,6 +2681,7 @@ app.put("/api/admin/workflows/:id", protect, adminOnly, async (req, res) => {
     }
     if (steps !== undefined)     update.steps = steps;
     if (published !== undefined) update.published = published;
+    if (triggerScope !== undefined) update.triggerScope = triggerScope && typeof triggerScope === "object" ? triggerScope : {};
     const workflow = await Workflow.findByIdAndUpdate(req.params.id, update, { new: true });
     if (!workflow) return res.status(404).json({ message: "Workflow not found" });
     res.json(workflow);
