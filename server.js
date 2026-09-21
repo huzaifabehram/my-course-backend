@@ -1044,6 +1044,79 @@ app.get("/api/courses/instructor/mine", protect, instructorOnly, async (req, res
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
+// NEW: real enrolled-student list for one of an instructor's own courses —
+// backs the Instructor Portal's new "Students" tab. Only ever returns data
+// for a course this instructor actually owns.
+app.get("/api/instructor/courses/:id/students", protect, instructorOnly, async (req, res) => {
+  try {
+    const course = await Course.findOne({ _id: req.params.id, instructor: req.user._id }).select("title sections");
+    if (!course) return res.status(404).json({ message: "Course not found" });
+    const totalLectures = (course.sections || []).reduce((a, s) => a + (s.lectures?.length || 0), 0);
+
+    const enrollments = await Enrollment.find({ course: course._id, paymentStatus: "verified" })
+      .populate("student", "name email avatar")
+      .sort("-createdAt");
+
+    const progressDocs = await Progress.find({ courseId: course._id, student: { $in: enrollments.map((e) => e.student?._id) } });
+    const progressByStudent = {};
+    progressDocs.forEach((p) => { progressByStudent[String(p.student)] = p.completedLectures?.length || 0; });
+
+    const students = enrollments.filter((e) => e.student).map((e) => {
+      const done = progressByStudent[String(e.student._id)] || 0;
+      return {
+        studentId: e.student._id,
+        name: e.student.name,
+        email: e.student.email,
+        avatar: e.student.avatar || "",
+        enrolledAt: e.createdAt,
+        completedLectures: done,
+        totalLectures,
+        completionPct: totalLectures > 0 ? Math.round((done / totalLectures) * 100) : 0,
+      };
+    });
+
+    res.json({ courseTitle: course.title, totalLectures, students });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// NEW: real reviews for one of an instructor's own courses — backs the
+// Instructor Portal's new "Reviews" tab. Reads from the exact same Review
+// collection the course's public landing page shows and that the Super
+// Admin's Review Importer (CSV) writes into — so anything imported there,
+// or left by a real student, shows up here identically.
+app.get("/api/instructor/courses/:id/reviews", protect, instructorOnly, async (req, res) => {
+  try {
+    const course = await Course.findOne({ _id: req.params.id, instructor: req.user._id }).select("title");
+    if (!course) return res.status(404).json({ message: "Course not found" });
+    const reviews = await Review.find({ course: course._id }).sort("-createdAt");
+    res.json({ courseTitle: course.title, reviews });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// NEW: real notifications for the Instructor Portal's bell icon — the most
+// recent verified enrollments across all of this instructor's courses.
+app.get("/api/instructor/notifications", protect, instructorOnly, async (req, res) => {
+  try {
+    const myCourses = await Course.find({ instructor: req.user._id }).select("_id title");
+    const courseIds = myCourses.map((c) => c._id);
+    const courseTitleById = {};
+    myCourses.forEach((c) => { courseTitleById[String(c._id)] = c.title; });
+
+    const enrollments = await Enrollment.find({ course: { $in: courseIds }, paymentStatus: "verified" })
+      .populate("student", "name")
+      .sort("-createdAt")
+      .limit(20);
+
+    const notifications = enrollments.filter((e) => e.student).map((e) => ({
+      id: e._id,
+      message: `${e.student.name} enrolled in "${courseTitleById[String(e.course)] || "your course"}"`,
+      createdAt: e.createdAt,
+    }));
+
+    res.json(notifications);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
 app.get("/api/courses", async (req, res) => {
   try {
     const { category, search } = req.query;
