@@ -459,6 +459,16 @@ const ContactSubmissionSchema = new mongoose.Schema({
 }, { timestamps: true });
 const ContactSubmission = mongoose.model("ContactSubmission", ContactSubmissionSchema);
 
+// ── Package inquiries — from the Services page's Gold/Premium package cards ──
+const PackageInquirySchema = new mongoose.Schema({
+  name:     { type: String, required: true, trim: true },
+  whatsapp: { type: String, required: true, trim: true },
+  email:    { type: String, required: true, trim: true, lowercase: true },
+  package:  { type: String, required: true, enum: ["gold", "premium"] },
+  status:   { type: String, enum: ["new", "contacted"], default: "new" },
+}, { timestamps: true });
+const PackageInquiry = mongoose.model("PackageInquiry", PackageInquirySchema);
+
 // ── Newsletter subscribers — from the footer newsletter box ────────────────────
 const NewsletterSubscriberSchema = new mongoose.Schema({
   email: { type: String, required: true, trim: true, lowercase: true, unique: true },
@@ -1546,6 +1556,16 @@ app.get("/api/progress/my", protect, async (req, res) => {
 // NOTES — Student Portal, per-lecture timestamped notes
 // ══════════════════════════════════════════════════════════════════════════════
 
+// Aggregate — every note this student has across every course, for the
+// sidebar-level "Notes" tab (as opposed to /api/notes/:courseId, used
+// inside one course's player).
+app.get("/api/notes/my", protect, async (req, res) => {
+  try {
+    const notes = await Note.find({ student: req.user._id }).sort("-createdAt");
+    res.json(notes);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
 app.get("/api/notes/:courseId", protect, async (req, res) => {
   try {
     const notes = await Note.find({ student: req.user._id, courseId: req.params.courseId }).sort("-createdAt");
@@ -1579,6 +1599,20 @@ app.delete("/api/notes/:id", protect, async (req, res) => {
 // ══════════════════════════════════════════════════════════════════════════════
 // Q&A — Student Portal, per-course questions with embedded answers
 // ══════════════════════════════════════════════════════════════════════════════
+
+// Aggregate — Q&A across every course this student is verified-enrolled in,
+// for the sidebar-level "Q&A" tab.
+app.get("/api/questions/my-courses", protect, async (req, res) => {
+  try {
+    const enrollments = await Enrollment.find({ student: req.user._id, paymentStatus: "verified" }).select("course");
+    const courseIds = enrollments.map((e) => e.course);
+    const questions = await Question.find({ courseId: { $in: courseIds } })
+      .populate("author", "name avatar")
+      .populate("answers.author", "name avatar")
+      .sort("-createdAt");
+    res.json(questions);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
 
 app.get("/api/courses/:courseId/questions", protect, async (req, res) => {
   try {
@@ -2211,6 +2245,29 @@ app.post("/api/contact", async (req, res) => {
 app.get("/api/admin/contact-submissions", protect, adminOnly, async (req, res) => {
   try {
     res.json(await ContactSubmission.find({}).sort("-createdAt"));
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Public — Services page's Gold/Premium package inquiry form.
+app.post("/api/package-inquiries", async (req, res) => {
+  try {
+    const { name, whatsapp, email, package: pkg } = req.body || {};
+    if (!name?.trim() || !whatsapp?.trim() || !email?.trim())
+      return res.status(400).json({ message: "Name, WhatsApp number, and email are required." });
+    if (!["gold", "premium"].includes(pkg))
+      return res.status(400).json({ message: "Please choose a package." });
+    const inquiry = await PackageInquiry.create({
+      name: name.trim(), whatsapp: whatsapp.trim(), email: email.trim().toLowerCase(), package: pkg,
+    });
+    runWorkflows("form_submitted", { name: inquiry.name, email: inquiry.email, message: `${pkg === "gold" ? "Gold" : "Premium"} Package inquiry`, __summary: `${inquiry.name} — ${pkg} package` });
+    res.status(201).json(inquiry);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Super Admin — list package inquiries.
+app.get("/api/admin/package-inquiries", protect, adminOnly, async (req, res) => {
+  try {
+    res.json(await PackageInquiry.find({}).sort("-createdAt"));
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
