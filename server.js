@@ -522,6 +522,17 @@ async function seedForms() {
   } catch (err) { console.error("[Forms] seed error:", err.message); }
 }
 
+// ── Tags registry — Super Admin → Tags ──────────────────────────────────────
+// A simple named-tag catalog (e.g. "New Contact", "VIP", "Interested —
+// Gold Package") so tag names used in Automation Workflow's Add/Remove
+// Contact Tag actions come from a maintained list instead of free-typed
+// text that can drift into typos/inconsistent naming over time.
+const TagSchema = new mongoose.Schema({
+  name: { type: String, required: true, trim: true, unique: true },
+  type: { type: String, default: "" }, // free-text label, e.g. "Contact", "Form" — for grouping only
+}, { timestamps: true });
+const Tag = mongoose.model("Tag", TagSchema);
+
 // ── Newsletter subscribers — from the footer newsletter box ────────────────────
 const NewsletterSubscriberSchema = new mongoose.Schema({
   email: { type: String, required: true, trim: true, lowercase: true, unique: true },
@@ -873,6 +884,7 @@ function matchesTriggerScope(workflow, context) {
   if (scope.lectureId && String(context.lectureId || "") !== String(scope.lectureId)) return false;
   if (scope.courseId && String(context.courseId || "") !== String(scope.courseId)) return false;
   if (scope.formSlug && String(context.formSlug || "") !== String(scope.formSlug)) return false;
+  if (scope.category && String(context.category || "") !== String(scope.category)) return false;
   return true;
 }
 
@@ -1524,6 +1536,34 @@ app.get("/api/admin/enrollments", protect, adminOnly, async (req, res) => {
       createdAt: e.createdAt,
       verifiedAt: e.verifiedAt,
     })));
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// NEW: Super Admin → Forms → Submitted Forms needs to delete a bad/test
+// enrollment submission — this didn't exist before.
+app.delete("/api/admin/enrollments/:id", protect, adminOnly, async (req, res) => {
+  try {
+    const enrollment = await Enrollment.findByIdAndDelete(req.params.id);
+    if (!enrollment) return res.status(404).json({ message: "Enrollment not found" });
+    res.json({ deleted: true });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// CSV export of enrollments (Form 1 submissions) — optional ?ids=a,b,c to
+// export only a selection, otherwise everything matching ?courseId=.
+app.get("/api/admin/enrollments/export.csv", protect, adminOnly, async (req, res) => {
+  try {
+    const { courseId, ids } = req.query;
+    const query = {};
+    if (courseId) query.course = courseId;
+    if (ids) query._id = { $in: String(ids).split(",") };
+    const enrollments = await Enrollment.find(query).sort("-createdAt").populate("student", "name email").populate("course", "title");
+    const rows = [["Student", "Email", "Course", "WhatsApp", "Payment Method", "Amount", "Status", "Submitted"]];
+    for (const e of enrollments) rows.push([e.student?.name, e.student?.email, e.course?.title, e.whatsapp, e.paymentMethod, e.amount, e.paymentStatus, e.createdAt.toISOString()]);
+    const csv = rows.map((r) => r.map((v) => `"${String(v ?? "").replace(/"/g, '""')}"`).join(",")).join("\n");
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", "attachment; filename=form-1-enrollments.csv");
+    res.send(csv);
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
@@ -2418,6 +2458,31 @@ app.get("/api/admin/package-inquiries", protect, adminOnly, async (req, res) => 
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
+// NEW: delete a package inquiry (Form 2 submission).
+app.delete("/api/admin/package-inquiries/:id", protect, adminOnly, async (req, res) => {
+  try {
+    const inquiry = await PackageInquiry.findByIdAndDelete(req.params.id);
+    if (!inquiry) return res.status(404).json({ message: "Submission not found" });
+    res.json({ deleted: true });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// CSV export of package inquiries (Form 2 submissions) — optional
+// ?ids=a,b,c to export only a selection.
+app.get("/api/admin/package-inquiries/export.csv", protect, adminOnly, async (req, res) => {
+  try {
+    const { ids } = req.query;
+    const query = ids ? { _id: { $in: String(ids).split(",") } } : {};
+    const inquiries = await PackageInquiry.find(query).sort("-createdAt");
+    const rows = [["Name", "Email", "WhatsApp", "Package", "Status", "Submitted"]];
+    for (const i of inquiries) rows.push([i.name, i.email, i.whatsapp, i.package, i.status, i.createdAt.toISOString()]);
+    const csv = rows.map((r) => r.map((v) => `"${String(v ?? "").replace(/"/g, '""')}"`).join(",")).join("\n");
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", "attachment; filename=form-2-package-inquiries.csv");
+    res.send(csv);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
 // ══════════════════════════════════════════════════════════════════════════════
 // FORMS — Super Admin → Forms
 // ══════════════════════════════════════════════════════════════════════════════
@@ -2465,6 +2530,36 @@ app.delete("/api/admin/forms/:id", protect, adminOnly, async (req, res) => {
     if (form.slug === "form-1" || form.slug === "form-2")
       return res.status(400).json({ message: "This form is wired into a live page and can't be deleted from here." });
     await Form.findByIdAndDelete(req.params.id);
+    res.json({ deleted: true });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// TAGS — Super Admin → Tags
+// ══════════════════════════════════════════════════════════════════════════════
+
+app.get("/api/admin/tags", protect, adminOnly, async (req, res) => {
+  try {
+    res.json(await Tag.find({}).sort("name"));
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+app.post("/api/admin/tags", protect, adminOnly, async (req, res) => {
+  try {
+    const { name, type } = req.body || {};
+    if (!name?.trim()) return res.status(400).json({ message: "Name is required" });
+    const tag = await Tag.create({ name: name.trim(), type: type || "" });
+    res.status(201).json(tag);
+  } catch (err) {
+    if (err.code === 11000) return res.status(400).json({ message: "A tag with that name already exists" });
+    res.status(500).json({ message: err.message });
+  }
+});
+
+app.delete("/api/admin/tags/:id", protect, adminOnly, async (req, res) => {
+  try {
+    const tag = await Tag.findByIdAndDelete(req.params.id);
+    if (!tag) return res.status(404).json({ message: "Tag not found" });
     res.json({ deleted: true });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
