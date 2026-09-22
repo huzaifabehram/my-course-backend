@@ -442,6 +442,12 @@ const SiteSettingsSchema = new mongoose.Schema({
   paymentLogoAllied:    { type: String, default: "" },
   paymentLogoJazzcash:  { type: String, default: "" },
   paymentLogoEasypaisa: { type: String, default: "" },
+  // NEW: WhatsApp Cloud API credentials, entered from Super Admin →
+  // Settings instead of requiring Render environment variable access.
+  // whatsappAccessToken is a real secret — never returned by the public
+  // GET /api/settings route, only used server-side.
+  whatsappPhoneNumberId: { type: String, default: "" },
+  whatsappAccessToken:   { type: String, default: "" },
 }, { timestamps: true });
 const SiteSettings = mongoose.model("SiteSettings", SiteSettingsSchema);
 
@@ -465,6 +471,7 @@ async function getSiteSettings() {
     { $setOnInsert: {
         logoUrl: "", footerLogoUrl: "",
         paymentLogoUbl: "", paymentLogoAllied: "", paymentLogoJazzcash: "", paymentLogoEasypaisa: "",
+        whatsappPhoneNumberId: "", whatsappAccessToken: "",
       } },
     { new: true, upsert: true, sort: { _id: 1 } }
   );
@@ -659,17 +666,27 @@ function requireCloudinary(req, res, next) {
 
 // ── WhatsApp — generic integration against Meta's official WhatsApp Cloud
 // API (the standard most providers, including Meta directly, expose this
-// exact shape for). Needs WHATSAPP_PHONE_NUMBER_ID + WHATSAPP_ACCESS_TOKEN
-// in .env — see the guide in the chat reply for how to get these.
-function whatsappConfigured() {
-  return !!(process.env.WHATSAPP_PHONE_NUMBER_ID && process.env.WHATSAPP_ACCESS_TOKEN);
+// exact shape for). Credentials come from Super Admin → Settings (saved to
+// the database) — WHATSAPP_PHONE_NUMBER_ID / WHATSAPP_ACCESS_TOKEN env vars
+// still work too, as a fallback, for anyone who'd rather set them at the
+// infra level instead of through the UI. The DB values win if both are set.
+async function getWhatsAppCredentials() {
+  const settings = await getSiteSettings();
+  return {
+    phoneNumberId: settings.whatsappPhoneNumberId || process.env.WHATSAPP_PHONE_NUMBER_ID || "",
+    accessToken:   settings.whatsappAccessToken   || process.env.WHATSAPP_ACCESS_TOKEN   || "",
+  };
+}
+async function whatsappConfigured() {
+  const { phoneNumberId, accessToken } = await getWhatsAppCredentials();
+  return !!(phoneNumberId && accessToken);
 }
 async function sendWhatsAppRaw({ to, text }) {
-  if (!whatsappConfigured()) throw new Error("WhatsApp not configured (WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_ACCESS_TOKEN)");
-  const phoneId = process.env.WHATSAPP_PHONE_NUMBER_ID;
-  const resp = await fetch(`https://graph.facebook.com/v21.0/${phoneId}/messages`, {
+  const { phoneNumberId, accessToken } = await getWhatsAppCredentials();
+  if (!phoneNumberId || !accessToken) throw new Error("WhatsApp not connected — add it in Super Admin → Settings");
+  const resp = await fetch(`https://graph.facebook.com/v21.0/${phoneNumberId}/messages`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}` },
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
     body: JSON.stringify({
       messaging_product: "whatsapp",
       to: String(to).replace(/[^\d+]/g, ""), // WhatsApp Cloud API wants digits (with country code), no spaces/dashes
@@ -779,7 +796,7 @@ async function runAction(step, ctx, log, workflowId) {
     // ("send_email" case removed along with email sending — see the note
     // near the top of this file on bringing it back.)
     case "send_whatsapp": {
-      if (!whatsappConfigured()) { log.push("send_whatsapp skipped — WhatsApp API not configured"); return; }
+      if (!(await whatsappConfigured())) { log.push("send_whatsapp skipped — WhatsApp not connected (Super Admin → Settings)"); return; }
       const to = interpolate(p.to || "{{whatsapp}}", ctx) || interpolate("{{studentPhone}}", ctx);
       if (!to) { log.push("send_whatsapp skipped — no phone number in context"); return; }
       let text = interpolate(p.message || "", ctx);
@@ -2373,6 +2390,41 @@ app.get("/api/settings", async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
+// Super Admin → Settings → WhatsApp. GET never returns the actual access
+// token back — only whether one is currently saved — same convention as any
+// password field: you re-enter it to change it, you don't get to read it
+// back out.
+app.get("/api/admin/settings/whatsapp", protect, adminOnly, async (req, res) => {
+  try {
+    const settings = await getSiteSettings();
+    res.json({
+      whatsappPhoneNumberId: settings.whatsappPhoneNumberId || "",
+      whatsappConnected: !!(settings.whatsappPhoneNumberId && settings.whatsappAccessToken),
+    });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+app.post("/api/admin/settings/whatsapp", protect, adminOnly, async (req, res) => {
+  try {
+    const { whatsappPhoneNumberId, whatsappAccessToken } = req.body || {};
+    if (!whatsappPhoneNumberId?.trim() || !whatsappAccessToken?.trim())
+      return res.status(400).json({ message: "Both the Phone Number ID and Access Token are required" });
+    await SiteSettings.findOneAndUpdate(
+      {},
+      { whatsappPhoneNumberId: whatsappPhoneNumberId.trim(), whatsappAccessToken: whatsappAccessToken.trim() },
+      { upsert: true, sort: { _id: 1 } }
+    );
+    res.json({ connected: true });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+app.delete("/api/admin/settings/whatsapp", protect, adminOnly, async (req, res) => {
+  try {
+    await SiteSettings.findOneAndUpdate({}, { whatsappPhoneNumberId: "", whatsappAccessToken: "" }, { sort: { _id: 1 } });
+    res.json({ disconnected: true });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
 // Super Admin — upload/replace a site logo. Goes to the same Cloudinary
 // account as every other image upload in this file.
 // The form sends a "target" field alongside the image: "header", "footer",
@@ -2744,7 +2796,7 @@ app.get("/api/admin/workflows/meta", protect, adminOnly, async (req, res) => {
       "notify_student", "wait", "send_whatsapp",
       "add_to_pipeline", "update_opportunity_stage", "webhook",
     ],
-    whatsappConfigured: whatsappConfigured(),
+    whatsappConfigured: await whatsappConfigured(),
     pipelineStages: PIPELINE_STAGES_DEFAULT,
   });
 });
