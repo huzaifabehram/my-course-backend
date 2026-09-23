@@ -2637,6 +2637,26 @@ app.post("/api/admin/whatsapp/instances/manual", protect, adminOnly, async (req,
   }
 });
 
+// NEW: re-enabled per WaBulkify support's latest guidance — calls their
+// documented get_qrcode endpoint for an EXISTING instance (never creates a
+// new one). Honest caveat: WaBulkify told you this needs a "WhatsApp Web
+// Service Server" added on their side, which isn't something visible from
+// this code — if this still comes back as their login-page HTML (same
+// failure as create_instance before), that confirms whatever needs
+// enabling on their account isn't active yet, and the fix has to happen
+// with their support team, not here.
+app.post("/api/admin/whatsapp/instances/:id/qrcode", protect, adminOnly, async (req, res) => {
+  try {
+    const instance = await WhatsAppInstance.findById(req.params.id);
+    if (!instance) return res.status(404).json({ message: "Instance not found" });
+    const { data, raw } = await wabulkifyCall("get_qrcode", { instance_id: instance.instanceId });
+    const qrCode = data.qrcode || data.qr_code || data.qrCode || data.qr || data.base64 || data.image
+      || data?.data?.qrcode || data?.data?.qr_code || data?.data?.base64 || data?.data?.image || null;
+    if (!qrCode) console.error("[WaBulkify] get_qrcode — no QR image field found. Raw response:", raw);
+    res.json({ qrCode, raw: raw?.slice(0, 500) });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
 app.post("/api/admin/whatsapp/instances/:id/reboot", protect, adminOnly, async (req, res) => {
   try {
     const instance = await WhatsAppInstance.findById(req.params.id);
