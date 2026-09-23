@@ -448,6 +448,12 @@ const SiteSettingsSchema = new mongoose.Schema({
   // GET /api/settings route, only used server-side.
   whatsappPhoneNumberId: { type: String, default: "" },
   whatsappAccessToken:   { type: String, default: "" },
+  // NEW: WaBulkify (wabulkify.com) — a QR-scan-based WhatsApp Web
+  // automation service, separate from the official Meta Cloud API above.
+  // One account-wide access_token (not per-number) authenticates every
+  // instance (= one connected WhatsApp number) under WhatsAppInstance
+  // below. Same secret-handling convention as whatsappAccessToken.
+  wabulkifyAccessToken: { type: String, default: "" },
 }, { timestamps: true });
 const SiteSettings = mongoose.model("SiteSettings", SiteSettingsSchema);
 
@@ -471,10 +477,53 @@ async function getSiteSettings() {
     { $setOnInsert: {
         logoUrl: "", footerLogoUrl: "",
         paymentLogoUbl: "", paymentLogoAllied: "", paymentLogoJazzcash: "", paymentLogoEasypaisa: "",
-        whatsappPhoneNumberId: "", whatsappAccessToken: "",
+        whatsappPhoneNumberId: "", whatsappAccessToken: "", wabulkifyAccessToken: "",
       } },
     { new: true, upsert: true, sort: { _id: 1 } }
   );
+}
+
+// ── WaBulkify — QR-scan WhatsApp Web automation, multiple numbers ──────────
+// Each document is one "instance" = one WhatsApp number connected by
+// scanning a QR code, matching wabulkify's own model exactly.
+const WhatsAppInstanceSchema = new mongoose.Schema({
+  label:       { type: String, required: true, trim: true }, // your own nickname, e.g. "Sales Number"
+  instanceId:  { type: String, required: true, unique: true }, // wabulkify's instance_id
+  phoneNumber: { type: String, default: "" }, // filled in once the webhook reports it, if it does
+  status:      { type: String, enum: ["pending_scan", "connected", "disconnected"], default: "pending_scan" },
+  lastStatusPayload: { type: mongoose.Schema.Types.Mixed, default: null }, // raw last webhook payload, for troubleshooting
+}, { timestamps: true });
+const WhatsAppInstance = mongoose.model("WhatsAppInstance", WhatsAppInstanceSchema);
+
+const WABULKIFY_BASE = "https://wabulkify.com/api";
+
+async function wabulkifyToken() {
+  const settings = await getSiteSettings();
+  return settings.wabulkifyAccessToken || "";
+}
+
+async function wabulkifyCall(path, params) {
+  const token = await wabulkifyToken();
+  if (!token) throw new Error("WaBulkify isn't connected yet — add your access token in Super Admin → WhatsApp");
+  const query = new URLSearchParams({ ...params, access_token: token }).toString();
+  const resp = await fetch(`${WABULKIFY_BASE}/${path}?${query}`, { method: "POST" });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(data?.message || `WaBulkify returned HTTP ${resp.status}`);
+  return data;
+}
+
+// send/send_group take a JSON body rather than query params, per WaBulkify's docs.
+async function wabulkifySend(path, body) {
+  const token = await wabulkifyToken();
+  if (!token) throw new Error("WaBulkify isn't connected yet — add your access token in Super Admin → WhatsApp");
+  const resp = await fetch(`${WABULKIFY_BASE}/${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...body, access_token: token }),
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(data?.message || `WaBulkify returned HTTP ${resp.status}`);
+  return data;
 }
 
 // ── Contact Us submissions — from the public Contact Us page ───────────────────
@@ -796,11 +845,42 @@ async function runAction(step, ctx, log, workflowId) {
     // ("send_email" case removed along with email sending — see the note
     // near the top of this file on bringing it back.)
     case "send_whatsapp": {
-      if (!(await whatsappConfigured())) { log.push("send_whatsapp skipped — WhatsApp not connected (Super Admin → Settings)"); return; }
-      const to = interpolate(p.to || "{{whatsapp}}", ctx) || interpolate("{{studentPhone}}", ctx);
-      if (!to) { log.push("send_whatsapp skipped — no phone number in context"); return; }
+      // NEW: prefers WaBulkify (multi-number, QR-connected) when a specific
+      // instance is chosen in the step's config — falls back to the single
+      // Meta Cloud API connection (Settings → WhatsApp) when no instance is
+      // selected, so a workflow built before WaBulkify existed keeps working
+      // unchanged.
       let text = interpolate(p.message || "", ctx);
       text = await rewriteTrackedLinks(text, ctx, workflowId);
+      const mediaUrl = p.mediaUrl ? interpolate(p.mediaUrl, ctx) : "";
+
+      if (p.instanceId) {
+        const instance = await WhatsAppInstance.findById(p.instanceId).catch(() => null);
+        if (!instance) { log.push("send_whatsapp skipped — the selected WhatsApp number no longer exists"); return; }
+        if (instance.status !== "connected") { log.push(`send_whatsapp skipped — "${instance.label}" isn't connected (scan its QR code in Super Admin → WhatsApp)`); return; }
+
+        if (p.recipientType === "group") {
+          const groupId = interpolate(p.groupId || "", ctx);
+          if (!groupId) { log.push("send_whatsapp skipped — no group ID in context"); return; }
+          if (mediaUrl) await wabulkifySend("send_group", { group_id: groupId, type: "media", message: text, media_url: mediaUrl, filename: p.filename || undefined, instance_id: instance.instanceId });
+          else await wabulkifySend("send_group", { group_id: groupId, type: "text", message: text, instance_id: instance.instanceId });
+          log.push(`WhatsApp message sent to group ${groupId} via "${instance.label}"`);
+          runWorkflows("whatsapp_sent", { ...ctx, groupId, __summary: `WhatsApp (group) via ${instance.label}` });
+        } else {
+          const to = interpolate(p.to || "{{whatsapp}}", ctx) || interpolate("{{studentPhone}}", ctx);
+          if (!to) { log.push("send_whatsapp skipped — no phone number in context"); return; }
+          if (mediaUrl) await wabulkifySend("send", { number: to, type: "media", message: text, media_url: mediaUrl, filename: p.filename || undefined, instance_id: instance.instanceId });
+          else await wabulkifySend("send", { number: to, type: "text", message: text, instance_id: instance.instanceId });
+          log.push(`WhatsApp message sent to ${to} via "${instance.label}"`);
+          runWorkflows("whatsapp_sent", { ...ctx, to, __summary: `WhatsApp to ${to} via ${instance.label}` });
+        }
+        return;
+      }
+
+      // Fallback: the original single-number Meta Cloud API path.
+      if (!(await whatsappConfigured())) { log.push("send_whatsapp skipped — no WhatsApp number selected, and no Meta Cloud API connected either"); return; }
+      const to = interpolate(p.to || "{{whatsapp}}", ctx) || interpolate("{{studentPhone}}", ctx);
+      if (!to) { log.push("send_whatsapp skipped — no phone number in context"); return; }
       await sendWhatsAppRaw({ to, text });
       log.push(`WhatsApp message sent to ${to}`);
       runWorkflows("whatsapp_sent", { ...ctx, to, __summary: `WhatsApp to ${to}` });
@@ -2423,6 +2503,148 @@ app.delete("/api/admin/settings/whatsapp", protect, adminOnly, async (req, res) 
     await SiteSettings.findOneAndUpdate({}, { whatsappPhoneNumberId: "", whatsappAccessToken: "" }, { sort: { _id: 1 } });
     res.json({ disconnected: true });
   } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// WABULKIFY — Super Admin → WhatsApp (multiple QR-connected numbers)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Account-wide access token (same one used for every instance).
+app.get("/api/admin/settings/wabulkify", protect, adminOnly, async (req, res) => {
+  try {
+    const settings = await getSiteSettings();
+    res.json({ connected: !!settings.wabulkifyAccessToken });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+app.post("/api/admin/settings/wabulkify", protect, adminOnly, async (req, res) => {
+  try {
+    const { accessToken } = req.body || {};
+    if (!accessToken?.trim()) return res.status(400).json({ message: "Access token is required" });
+    await SiteSettings.findOneAndUpdate({}, { wabulkifyAccessToken: accessToken.trim() }, { upsert: true, sort: { _id: 1 } });
+    res.json({ connected: true });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+app.delete("/api/admin/settings/wabulkify", protect, adminOnly, async (req, res) => {
+  try {
+    await SiteSettings.findOneAndUpdate({}, { wabulkifyAccessToken: "" }, { sort: { _id: 1 } });
+    res.json({ disconnected: true });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// List every connected number.
+app.get("/api/admin/whatsapp/instances", protect, adminOnly, async (req, res) => {
+  try {
+    res.json(await WhatsAppInstance.find({}).sort("-createdAt"));
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// "Add a WhatsApp Number" — creates a new instance on WaBulkify's side and
+// saves it here with your nickname for it. The QR code itself is fetched
+// separately (below), since WaBulkify issues it after the instance exists.
+app.post("/api/admin/whatsapp/instances", protect, adminOnly, async (req, res) => {
+  try {
+    const { label } = req.body || {};
+    if (!label?.trim()) return res.status(400).json({ message: "A name for this number is required" });
+    const data = await wabulkifyCall("create_instance", {});
+    const instanceId = data.instance_id || data.instanceId || data.id;
+    if (!instanceId) return res.status(502).json({ message: "WaBulkify didn't return an instance_id — check your access token" });
+    const instance = await WhatsAppInstance.create({ label: label.trim(), instanceId, status: "pending_scan" });
+    // Point WaBulkify's webhook at this server for this instance, so
+    // connection/scan status updates flow back automatically.
+    const webhookUrl = `${process.env.PUBLIC_BASE_URL || ""}/api/whatsapp/webhook`;
+    if (process.env.PUBLIC_BASE_URL) {
+      try { await wabulkifyCall("set_webhook", { webhook_url: webhookUrl, enable: "true", instance_id: instanceId }); }
+      catch (err) { console.error("[WaBulkify] set_webhook failed:", err.message); }
+    }
+    res.status(201).json(instance);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Fetch the QR code to scan for one instance. NOTE: WaBulkify's own docs say
+// the QR result can also arrive via webhook rather than in this response —
+// this route returns whatever WaBulkify's API response actually contains
+// (checking a few likely field names), and the frontend also polls
+// GET /api/admin/whatsapp/instances afterward to notice once the webhook
+// marks it "connected".
+app.post("/api/admin/whatsapp/instances/:id/qrcode", protect, adminOnly, async (req, res) => {
+  try {
+    const instance = await WhatsAppInstance.findById(req.params.id);
+    if (!instance) return res.status(404).json({ message: "Instance not found" });
+    const data = await wabulkifyCall("get_qrcode", { instance_id: instance.instanceId });
+    const qrCode = data.qrcode || data.qr_code || data.qrCode || data.qr || data.base64 || data.image || null;
+    res.json({ qrCode, raw: data });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+app.post("/api/admin/whatsapp/instances/:id/reboot", protect, adminOnly, async (req, res) => {
+  try {
+    const instance = await WhatsAppInstance.findById(req.params.id);
+    if (!instance) return res.status(404).json({ message: "Instance not found" });
+    await wabulkifyCall("reboot", { instance_id: instance.instanceId });
+    instance.status = "pending_scan";
+    await instance.save();
+    res.json(instance);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+app.post("/api/admin/whatsapp/instances/:id/reconnect", protect, adminOnly, async (req, res) => {
+  try {
+    const instance = await WhatsAppInstance.findById(req.params.id);
+    if (!instance) return res.status(404).json({ message: "Instance not found" });
+    await wabulkifyCall("reconnect", { instance_id: instance.instanceId });
+    res.json(instance);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Resets on WaBulkify's side (new instance ID, wipes old session) — mirrors
+// that by replacing our stored instanceId too, so the two stay in sync.
+app.post("/api/admin/whatsapp/instances/:id/reset", protect, adminOnly, async (req, res) => {
+  try {
+    const instance = await WhatsAppInstance.findById(req.params.id);
+    if (!instance) return res.status(404).json({ message: "Instance not found" });
+    const data = await wabulkifyCall("reset_instance", { instance_id: instance.instanceId });
+    const newInstanceId = data.instance_id || data.instanceId || instance.instanceId;
+    instance.instanceId = newInstanceId;
+    instance.status = "pending_scan";
+    instance.phoneNumber = "";
+    await instance.save();
+    res.json(instance);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+app.delete("/api/admin/whatsapp/instances/:id", protect, adminOnly, async (req, res) => {
+  try {
+    const instance = await WhatsAppInstance.findByIdAndDelete(req.params.id);
+    if (!instance) return res.status(404).json({ message: "Instance not found" });
+    res.json({ deleted: true });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Public — WaBulkify calls this from their servers with connection status,
+// incoming/outgoing messages, disconnects, etc. Not behind auth since
+// WaBulkify can't send your login token; the raw payload is stashed on the
+// instance either way so you can see exactly what it sent if something
+// doesn't parse the way this expects.
+app.post("/api/whatsapp/webhook", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const instanceId = body.instance_id || body.instanceId;
+    if (!instanceId) return res.json({ received: true });
+    const instance = await WhatsAppInstance.findOne({ instanceId });
+    if (!instance) return res.json({ received: true });
+
+    instance.lastStatusPayload = body;
+    const statusText = String(body.status || body.event || "").toLowerCase();
+    if (statusText.includes("connect") && !statusText.includes("disconnect")) instance.status = "connected";
+    else if (statusText.includes("disconnect")) instance.status = "disconnected";
+    if (body.phone || body.number || body.phoneNumber) instance.phoneNumber = body.phone || body.number || body.phoneNumber;
+    await instance.save();
+
+    res.json({ received: true });
+  } catch (err) {
+    console.error("[WaBulkify webhook] error:", err.message);
+    res.status(500).json({ message: err.message });
+  }
 });
 
 // Super Admin — upload/replace a site logo. Goes to the same Cloudinary
