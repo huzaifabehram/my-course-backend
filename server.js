@@ -506,15 +506,28 @@ async function wabulkifyCall(path, params) {
   const token = await wabulkifyToken();
   if (!token) throw new Error("WaBulkify isn't connected yet — add your access token in Super Admin → WhatsApp");
   const query = new URLSearchParams({ ...params, access_token: token }).toString();
-  const resp = await fetch(`${WABULKIFY_BASE}/${path}?${query}`, { method: "POST" });
-  // NEW: read the body as text first — if WaBulkify ever returns something
-  // that isn't valid JSON (an HTML error page, plain text, etc.), the old
-  // version silently swallowed that into an empty {}, which is what made
-  // the "didn't return an instance_id" error impossible to actually debug.
-  // Now the raw text survives so a caller can inspect it.
+  // NEW: added Accept + a real browser-style User-Agent. The previous raw
+  // response turned out to be WaBulkify's own login *page* HTML, not a JSON
+  // API error — a classic sign of a request getting redirected by a
+  // server that doesn't recognize it as a genuine API call, which often
+  // comes down to a missing/generic User-Agent (Node's fetch sends none by
+  // default) or the server defaulting to an HTML response when Accept
+  // isn't explicit about wanting JSON.
+  const resp = await fetch(`${WABULKIFY_BASE}/${path}?${query}`, {
+    method: "POST",
+    headers: { "Accept": "application/json", "User-Agent": "Mozilla/5.0 (compatible; LerniServer/1.0)" },
+  });
+  // Read the body as text first — if WaBulkify ever returns something that
+  // isn't valid JSON (an HTML page, plain text, etc.), the raw text
+  // survives so a caller can inspect exactly what came back instead of it
+  // being silently swallowed into an empty {}.
   const raw = await resp.text();
   let data = {};
   try { data = raw ? JSON.parse(raw) : {}; } catch { data = {}; }
+  // NEW: if the response is HTML rather than JSON (starts with "<"), this
+  // is not a normal API error — surface that plainly rather than parsing
+  // it as if it might contain useful fields.
+  if (raw.trim().startsWith("<")) throw new Error("WaBulkify returned an HTML page instead of JSON — this usually means the access token is invalid/expired, or API access isn't enabled on your WaBulkify account. Log into wabulkify.com and confirm the token from your dashboard.");
   if (!resp.ok) throw new Error(data?.message || `WaBulkify returned HTTP ${resp.status}: ${raw.slice(0, 200)}`);
   return { data, raw };
 }
@@ -541,11 +554,14 @@ async function wabulkifySend(path, body) {
   if (!token) throw new Error("WaBulkify isn't connected yet — add your access token in Super Admin → WhatsApp");
   const resp = await fetch(`${WABULKIFY_BASE}/${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "Accept": "application/json", "User-Agent": "Mozilla/5.0 (compatible; LerniServer/1.0)" },
     body: JSON.stringify({ ...body, access_token: token }),
   });
-  const data = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error(data?.message || `WaBulkify returned HTTP ${resp.status}`);
+  const raw = await resp.text();
+  let data = {};
+  try { data = raw ? JSON.parse(raw) : {}; } catch { data = {}; }
+  if (raw.trim().startsWith("<")) throw new Error("WaBulkify returned an HTML page instead of JSON — check your access token is still valid.");
+  if (!resp.ok) throw new Error(data?.message || `WaBulkify returned HTTP ${resp.status}: ${raw.slice(0, 200)}`);
   return data;
 }
 
