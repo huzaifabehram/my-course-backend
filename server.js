@@ -29,6 +29,21 @@ const crypto      = require("crypto"); // used to hash payment screenshots (frau
 // hand instead (see parseCsv() below) — zero dependencies. Excel
 // opens/saves .csv files natively, so nothing is actually lost.
 
+// NEW: self-hosted WhatsApp server (Super Admin → WhatsApp → Self-Hosted
+// Server) — needs `npm install @whiskeysockets/baileys` added to
+// package.json before deploying, or the exact same "Cannot find module"
+// crash that hit nodemailer and xlsx will happen again. Wrapped in try/
+// catch specifically so that if it ISN'T installed yet, the rest of the
+// server still starts normally instead of crashing entirely — only the
+// self-hosted WhatsApp routes are disabled (they return a clear 503) until
+// the dependency is actually installed and the server redeployed.
+let Baileys = null;
+try {
+  Baileys = require("@whiskeysockets/baileys");
+} catch (err) {
+  console.error("⚠️  @whiskeysockets/baileys not installed — self-hosted WhatsApp server disabled. Run: npm install @whiskeysockets/baileys");
+}
+
 const app = express();
 
 // ─── CLOUDINARY CONFIG ────────────────────────────────────────────────────────
@@ -421,6 +436,7 @@ mongoose.connection.once("open", async () => {
     /* index may not exist */
   }
   await seedForms();
+  await startAllSelfHostedSessions();
 });
 
 // ── Site Settings — singleton document (logo, etc.) ────────────────────────────
@@ -457,6 +473,11 @@ const SiteSettingsSchema = new mongoose.Schema({
   // NEW: Anthropic API key — powers the WhatsApp AI Bot's auto-replies.
   // Same secret-handling convention as the other tokens above.
   anthropicApiKey: { type: String, default: "" },
+  // NEW: a generated key so the self-hosted WhatsApp server's send endpoint
+  // can be called externally (by another app/service), not stored via a
+  // typed-in secret the way the others are — see
+  // POST /api/admin/settings/whatsapp-server-key.
+  whatsappServerApiKey: { type: String, default: "" },
 }, { timestamps: true });
 const SiteSettings = mongoose.model("SiteSettings", SiteSettingsSchema);
 
@@ -480,7 +501,7 @@ async function getSiteSettings() {
     { $setOnInsert: {
         logoUrl: "", footerLogoUrl: "",
         paymentLogoUbl: "", paymentLogoAllied: "", paymentLogoJazzcash: "", paymentLogoEasypaisa: "",
-        whatsappPhoneNumberId: "", whatsappAccessToken: "", wabulkifyAccessToken: "", anthropicApiKey: "",
+        whatsappPhoneNumberId: "", whatsappAccessToken: "", wabulkifyAccessToken: "", anthropicApiKey: "", whatsappServerApiKey: "",
       } },
     { new: true, upsert: true, sort: { _id: 1 } }
   );
@@ -539,6 +560,196 @@ async function getBotSettings() {
     { $setOnInsert: { enabled: false, instructions: "", model: "claude-haiku-4-5-20251001", enabledInstanceIds: [] } },
     { new: true, upsert: true, sort: { _id: 1 } }
   );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SELF-HOSTED WHATSAPP SERVER — Super Admin → WhatsApp → Self-Hosted Server
+// ══════════════════════════════════════════════════════════════════════════════
+// A real WhatsApp Web connection built directly into this backend with
+// Baileys, instead of depending on WaBulkify. Session credentials are
+// stored in MongoDB (not local disk) specifically because Render wipes the
+// filesystem on every redeploy — storing them in Mongo means a connected
+// number survives a redeploy without needing to rescan its QR code.
+
+const WhatsAppSelfSessionSchema = new mongoose.Schema({
+  label:       { type: String, required: true, trim: true },
+  sessionId:   { type: String, required: true, unique: true }, // our own generated ID — not a WaBulkify instance_id
+  authState:   { type: String, default: "" }, // JSON-serialized Baileys creds+keys (via Baileys' own BufferJSON codec)
+  status:      { type: String, enum: ["pending_qr", "connected", "disconnected"], default: "pending_qr" },
+  phoneNumber: { type: String, default: "" },
+  lastQr:      { type: String, default: "" }, // raw QR data string — rendered as an image client-side, not here
+}, { timestamps: true });
+const WhatsAppSelfSession = mongoose.model("WhatsAppSelfSession", WhatsAppSelfSessionSchema);
+
+const WhatsAppBulkJobSchema = new mongoose.Schema({
+  sessionId: { type: String, required: true },
+  message:   { type: String, required: true },
+  numbers:   { type: [String], default: [] },
+  status:    { type: String, enum: ["running", "done"], default: "running" },
+  results:   { type: [{ number: String, success: Boolean, error: String }], default: [] },
+}, { timestamps: true });
+const WhatsAppBulkJob = mongoose.model("WhatsAppBulkJob", WhatsAppBulkJobSchema);
+
+// Live socket connections, keyed by our sessionId — this is in-memory, so it
+// starts empty on every server restart; startAllSelfHostedSessions() below
+// reconnects every previously-connected session automatically using its
+// saved Mongo credentials (no QR rescan needed) once the server boots back
+// up and the DB connection opens.
+const activeSelfHostedSockets = new Map();
+
+// Custom Baileys auth-state adapter backed by MongoDB instead of Baileys'
+// default local-file storage (useMultiFileAuthState) — the whole point of
+// this being different from the standard example is Render's ephemeral
+// disk. Stores the entire creds+keys blob as one JSON field, rewritten in
+// full on every change; simpler than a fully granular per-key store, and
+// fine at the message volumes this is actually built for.
+async function useMongoAuthState(sessionDoc) {
+  const { BufferJSON, initAuthCreds } = Baileys;
+  let stored = {};
+  if (sessionDoc.authState) {
+    try { stored = JSON.parse(sessionDoc.authState, BufferJSON.reviver); } catch { stored = {}; }
+  }
+  const creds = stored.creds || initAuthCreds();
+  const keys = stored.keys || {};
+
+  const saveState = async () => {
+    const serialized = JSON.stringify({ creds, keys }, BufferJSON.replacer);
+    await WhatsAppSelfSession.findByIdAndUpdate(sessionDoc._id, { authState: serialized });
+  };
+
+  return {
+    state: {
+      creds,
+      keys: {
+        get: async (type, ids) => {
+          const result = {};
+          for (const id of ids) {
+            const value = keys[type]?.[id];
+            if (value !== undefined) result[id] = value;
+          }
+          return result;
+        },
+        set: async (data) => {
+          for (const type in data) {
+            keys[type] = keys[type] || {};
+            for (const id in data[type]) {
+              if (data[type][id] === null || data[type][id] === undefined) delete keys[type][id];
+              else keys[type][id] = data[type][id];
+            }
+          }
+          await saveState();
+        },
+      },
+    },
+    saveCreds: saveState,
+  };
+}
+
+async function startSelfHostedSession(sessionDoc) {
+  if (!Baileys) throw new Error("Baileys isn't installed on the server yet");
+  const { default: makeWASocket, DisconnectReason, fetchLatestBaileysVersion } = Baileys;
+  const { state, saveCreds } = await useMongoAuthState(sessionDoc);
+  const { version } = await fetchLatestBaileysVersion();
+  const pino = require("pino"); // installed transitively as a Baileys dependency
+  const sock = makeWASocket({ version, auth: state, printQRInTerminal: false, logger: pino({ level: "silent" }) });
+
+  sock.ev.on("creds.update", saveCreds);
+
+  sock.ev.on("connection.update", async (update) => {
+    const { connection, lastDisconnect, qr } = update;
+    if (qr) {
+      await WhatsAppSelfSession.findByIdAndUpdate(sessionDoc._id, { lastQr: qr, status: "pending_qr" });
+    }
+    if (connection === "open") {
+      const phoneNumber = sock.user?.id ? sock.user.id.split(":")[0] : "";
+      await WhatsAppSelfSession.findByIdAndUpdate(sessionDoc._id, { status: "connected", phoneNumber, lastQr: "" });
+    }
+    if (connection === "close") {
+      activeSelfHostedSockets.delete(sessionDoc.sessionId);
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
+      const loggedOut = statusCode === DisconnectReason.loggedOut;
+      await WhatsAppSelfSession.findByIdAndUpdate(sessionDoc._id, { status: "disconnected" });
+      if (!loggedOut) {
+        // Real disconnect (not an explicit logout) — try again shortly using
+        // the same saved credentials.
+        setTimeout(() => {
+          WhatsAppSelfSession.findById(sessionDoc._id).then((fresh) => { if (fresh) startSelfHostedSession(fresh).catch((err) => console.error("[Self-hosted WhatsApp] reconnect failed:", err.message)); });
+        }, 5000);
+      }
+    }
+  });
+
+  sock.ev.on("messages.upsert", async ({ messages, type }) => {
+    if (type !== "notify") return;
+    for (const msg of messages) {
+      try {
+        if (msg.key.fromMe || !msg.message) continue;
+        const text = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
+        const from = msg.key.remoteJid;
+        if (!text || !from || from.endsWith("@g.us")) continue; // skip group messages for the AI bot/logging path here
+        const number = from.replace("@s.whatsapp.net", "");
+        await logWhatsAppMessage({ instanceId: sessionDoc.sessionId, direction: "incoming", number, message: text, status: "received", source: "self_hosted" });
+
+        const botSettings = await getBotSettings();
+        if (botSettings.enabled && botSettings.enabledInstanceIds.includes(sessionDoc.sessionId)) {
+          const history = await buildBotHistory(sessionDoc.sessionId, number, text);
+          const reply = await callClaude({ systemPrompt: botSettings.instructions, history, model: botSettings.model });
+          if (reply) {
+            await sock.sendMessage(from, { text: reply });
+            await logWhatsAppMessage({ instanceId: sessionDoc.sessionId, direction: "outgoing", number, message: reply, status: "sent", source: "ai_bot" });
+          }
+        }
+      } catch (err) { console.error("[Self-hosted WhatsApp] incoming message handling failed:", err.message); }
+    }
+  });
+
+  activeSelfHostedSockets.set(sessionDoc.sessionId, sock);
+  return sock;
+}
+
+// Reconnects every session that was connected (or briefly disconnected)
+// before the last server restart — called once when the DB connection
+// opens. pending_qr sessions are left alone; those need an explicit "Show
+// QR" click since they never finished authenticating in the first place.
+async function startAllSelfHostedSessions() {
+  if (!Baileys) return;
+  try {
+    const sessions = await WhatsAppSelfSession.find({ status: { $in: ["connected", "disconnected"] } });
+    for (const s of sessions) startSelfHostedSession(s).catch((err) => console.error("[Self-hosted WhatsApp] startup reconnect failed for", s.label, ":", err.message));
+  } catch (err) { console.error("[Self-hosted WhatsApp] startup scan failed:", err.message); }
+}
+
+function toWhatsAppJid(number) {
+  const digits = String(number).replace(/[^\d]/g, "");
+  return `${digits}@s.whatsapp.net`;
+}
+
+async function sendSelfHostedMessage(sessionId, number, text) {
+  const sock = activeSelfHostedSockets.get(sessionId);
+  if (!sock) throw new Error("This number isn't connected right now");
+  await sock.sendMessage(toWhatsAppJid(number), { text });
+}
+
+// Runs in the background (not awaited by the route that starts it) — sends
+// with a randomized pause between each message. This isn't just politeness:
+// sending many messages back-to-back is exactly the pattern WhatsApp's spam
+// detection looks for, and pacing genuinely reduces (never eliminates) the
+// chance of the number getting flagged.
+async function runBulkJob(jobId, sessionId, numbers, message) {
+  const results = [];
+  for (const number of numbers) {
+    try {
+      await sendSelfHostedMessage(sessionId, number, message);
+      await logWhatsAppMessage({ instanceId: sessionId, direction: "outgoing", number, message, status: "sent", source: "bulk" });
+      results.push({ number, success: true, error: "" });
+    } catch (err) {
+      await logWhatsAppMessage({ instanceId: sessionId, direction: "outgoing", number, message, status: "failed", source: "bulk" });
+      results.push({ number, success: false, error: err.message });
+    }
+    await WhatsAppBulkJob.findByIdAndUpdate(jobId, { results });
+    await new Promise((r) => setTimeout(r, 2000 + Math.random() * 3000)); // 2–5s pace between sends
+  }
+  await WhatsAppBulkJob.findByIdAndUpdate(jobId, { status: "done", results });
 }
 
 // Real, documented Anthropic Messages API — https://docs.claude.com/en/api/messages.
@@ -968,14 +1179,33 @@ async function runAction(step, ctx, log, workflowId) {
     // ("send_email" case removed along with email sending — see the note
     // near the top of this file on bringing it back.)
     case "send_whatsapp": {
-      // NEW: prefers WaBulkify (multi-number, QR-connected) when a specific
-      // instance is chosen in the step's config — falls back to the single
-      // Meta Cloud API connection (Settings → WhatsApp) when no instance is
-      // selected, so a workflow built before WaBulkify existed keeps working
-      // unchanged.
+      // NEW: three possible providers, in priority order — a self-hosted
+      // session (Baileys, built directly into this server) if selected,
+      // then WaBulkify (multi-number, QR-connected) if an instance is
+      // chosen, then the single Meta Cloud API connection (Settings →
+      // WhatsApp) as the original fallback, so a workflow built before
+      // either of the newer options existed keeps working unchanged.
       let text = interpolate(p.message || "", ctx);
       text = await rewriteTrackedLinks(text, ctx, workflowId);
       const mediaUrl = p.mediaUrl ? interpolate(p.mediaUrl, ctx) : "";
+
+      if (p.selfHostedSessionId) {
+        const session = await WhatsAppSelfSession.findById(p.selfHostedSessionId).catch(() => null);
+        if (!session) { log.push("send_whatsapp skipped — the selected self-hosted number no longer exists"); return; }
+        if (session.status !== "connected") { log.push(`send_whatsapp skipped — "${session.label}" isn't connected (scan its QR in Super Admin → WhatsApp → Self-Hosted Server)`); return; }
+        const to = interpolate(p.to || "{{whatsapp}}", ctx) || interpolate("{{studentPhone}}", ctx);
+        if (!to) { log.push("send_whatsapp skipped — no phone number in context"); return; }
+        try {
+          await sendSelfHostedMessage(session.sessionId, to, text);
+          await logWhatsAppMessage({ instanceId: session.sessionId, direction: "outgoing", number: to, message: text, status: "sent", source: "workflow" });
+        } catch (err) {
+          await logWhatsAppMessage({ instanceId: session.sessionId, direction: "outgoing", number: to, message: text, status: "failed", source: "workflow" });
+          throw err;
+        }
+        log.push(`WhatsApp message sent to ${to} via "${session.label}" (self-hosted)`);
+        runWorkflows("whatsapp_sent", { ...ctx, to, __summary: `WhatsApp to ${to} via ${session.label}` });
+        return;
+      }
 
       if (p.instanceId) {
         const instance = await WhatsAppInstance.findById(p.instanceId).catch(() => null);
@@ -2729,6 +2959,140 @@ app.post("/api/admin/whatsapp/bot-test", protect, adminOnly, async (req, res) =>
     const conversation = [...(Array.isArray(history) ? history : []), { role: "user", content: message.trim() }];
     const reply = await callClaude({ systemPrompt: settings.instructions, history: conversation, model: settings.model });
     res.json({ reply });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SELF-HOSTED WHATSAPP SERVER ROUTES — Super Admin → WhatsApp → Self-Hosted Server
+// ══════════════════════════════════════════════════════════════════════════════
+// Every route here returns a clear 503 instead of crashing if Baileys isn't
+// installed yet — see the require() at the top of this file.
+function requireBaileys(req, res, next) {
+  if (!Baileys) return res.status(503).json({ message: "The self-hosted WhatsApp server isn't installed yet — run `npm install @whiskeysockets/baileys` and redeploy." });
+  next();
+}
+
+app.get("/api/admin/whatsapp-server/sessions", protect, adminOnly, requireBaileys, async (req, res) => {
+  try {
+    res.json(await WhatsAppSelfSession.find({}).select("-authState").sort("-createdAt"));
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+app.post("/api/admin/whatsapp-server/sessions", protect, adminOnly, requireBaileys, async (req, res) => {
+  try {
+    const { label } = req.body || {};
+    if (!label?.trim()) return res.status(400).json({ message: "A name for this number is required" });
+    const sessionId = crypto.randomBytes(8).toString("hex");
+    const session = await WhatsAppSelfSession.create({ label: label.trim(), sessionId, status: "pending_qr" });
+    startSelfHostedSession(session).catch((err) => console.error("[Self-hosted WhatsApp] failed to start session:", err.message));
+    res.status(201).json({ _id: session._id, label: session.label, sessionId: session.sessionId, status: session.status });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Poll this after creating a session (or after Reconnect) until it returns
+// a QR, then again after scanning until status flips to "connected" —
+// Baileys emits the QR as an event, so this is read from whatever the
+// connection.update handler last saved rather than generated on demand.
+app.get("/api/admin/whatsapp-server/sessions/:id/qr", protect, adminOnly, requireBaileys, async (req, res) => {
+  try {
+    const session = await WhatsAppSelfSession.findById(req.params.id).select("-authState");
+    if (!session) return res.status(404).json({ message: "Session not found" });
+    res.json({ qr: session.lastQr, status: session.status, phoneNumber: session.phoneNumber });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+app.post("/api/admin/whatsapp-server/sessions/:id/reconnect", protect, adminOnly, requireBaileys, async (req, res) => {
+  try {
+    const session = await WhatsAppSelfSession.findById(req.params.id);
+    if (!session) return res.status(404).json({ message: "Session not found" });
+    activeSelfHostedSockets.delete(session.sessionId);
+    startSelfHostedSession(session).catch((err) => console.error("[Self-hosted WhatsApp] reconnect failed:", err.message));
+    res.json({ started: true });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+app.delete("/api/admin/whatsapp-server/sessions/:id", protect, adminOnly, requireBaileys, async (req, res) => {
+  try {
+    const session = await WhatsAppSelfSession.findById(req.params.id);
+    if (!session) return res.status(404).json({ message: "Session not found" });
+    const sock = activeSelfHostedSockets.get(session.sessionId);
+    if (sock) { try { await sock.logout(); } catch { /* ignore — removing our record either way */ } }
+    activeSelfHostedSockets.delete(session.sessionId);
+    await WhatsAppSelfSession.findByIdAndDelete(req.params.id);
+    res.json({ deleted: true });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+app.post("/api/admin/whatsapp-server/send", protect, adminOnly, requireBaileys, async (req, res) => {
+  try {
+    const { sessionDocId, to, message } = req.body || {};
+    if (!sessionDocId || !to?.trim() || !message?.trim()) return res.status(400).json({ message: "A number and a message are required" });
+    const session = await WhatsAppSelfSession.findById(sessionDocId);
+    if (!session) return res.status(404).json({ message: "Session not found" });
+    try {
+      await sendSelfHostedMessage(session.sessionId, to.trim(), message.trim());
+      await logWhatsAppMessage({ instanceId: session.sessionId, direction: "outgoing", number: to.trim(), message: message.trim(), status: "sent", source: "manual" });
+    } catch (err) {
+      await logWhatsAppMessage({ instanceId: session.sessionId, direction: "outgoing", number: to.trim(), message: message.trim(), status: "failed", source: "manual" });
+      throw err;
+    }
+    res.json({ sent: true });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Starts a bulk send in the background and returns immediately with a job
+// ID to poll — sending to many numbers one request at a time (with pacing
+// between each) can easily take longer than a normal HTTP request should
+// be left open for.
+app.post("/api/admin/whatsapp-server/send-bulk", protect, adminOnly, requireBaileys, async (req, res) => {
+  try {
+    const { sessionDocId, numbers, message } = req.body || {};
+    if (!sessionDocId || !Array.isArray(numbers) || numbers.length === 0 || !message?.trim())
+      return res.status(400).json({ message: "A number list and a message are required" });
+    const session = await WhatsAppSelfSession.findById(sessionDocId);
+    if (!session) return res.status(404).json({ message: "Session not found" });
+    const job = await WhatsAppBulkJob.create({ sessionId: session.sessionId, message: message.trim(), numbers, status: "running", results: [] });
+    runBulkJob(job._id, session.sessionId, numbers, message.trim()).catch((err) => console.error("[Self-hosted WhatsApp] bulk job crashed:", err.message));
+    res.status(201).json({ jobId: job._id });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+app.get("/api/admin/whatsapp-server/bulk-jobs/:id", protect, adminOnly, requireBaileys, async (req, res) => {
+  try {
+    const job = await WhatsAppBulkJob.findById(req.params.id);
+    if (!job) return res.status(404).json({ message: "Job not found" });
+    res.json(job);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Simple external API key so this can be called by another app/service you
+// build or share with a partner, without needing a Super Admin login —
+// stored the same way as the other secrets (Super Admin → WhatsApp →
+// Self-Hosted Server).
+app.post("/api/whatsapp-server/external/send", requireBaileys, async (req, res) => {
+  try {
+    const { apiKey, sessionId, to, message } = req.body || {};
+    const settings = await getSiteSettings();
+    if (!settings.whatsappServerApiKey || apiKey !== settings.whatsappServerApiKey)
+      return res.status(401).json({ message: "Invalid API key" });
+    if (!sessionId || !to?.trim() || !message?.trim()) return res.status(400).json({ message: "sessionId, to, and message are required" });
+    await sendSelfHostedMessage(sessionId, to.trim(), message.trim());
+    await logWhatsAppMessage({ instanceId: sessionId, direction: "outgoing", number: to.trim(), message: message.trim(), status: "sent", source: "external_api" });
+    res.json({ sent: true });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+app.get("/api/admin/settings/whatsapp-server-key", protect, adminOnly, async (req, res) => {
+  try {
+    const settings = await getSiteSettings();
+    res.json({ apiKey: settings.whatsappServerApiKey || "" });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+app.post("/api/admin/settings/whatsapp-server-key", protect, adminOnly, async (req, res) => {
+  try {
+    const apiKey = crypto.randomBytes(20).toString("hex");
+    await SiteSettings.findOneAndUpdate({}, { whatsappServerApiKey: apiKey }, { upsert: true, sort: { _id: 1 } });
+    res.json({ apiKey });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
