@@ -2577,45 +2577,12 @@ app.get("/api/admin/whatsapp/instances", protect, adminOnly, async (req, res) =>
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// "Add a WhatsApp Number" — creates a new instance on WaBulkify's side and
-// saves it here with your nickname for it. The QR code itself is fetched
-// separately (below), since WaBulkify issues it after the instance exists.
-app.post("/api/admin/whatsapp/instances", protect, adminOnly, async (req, res) => {
-  try {
-    const { label } = req.body || {};
-    if (!label?.trim()) return res.status(400).json({ message: "A name for this number is required" });
-    const { data, raw } = await wabulkifyCall("create_instance", {});
-    const instanceId = extractInstanceId(data);
-    if (!instanceId) {
-      // NEW: surfaces WaBulkify's exact raw response instead of just
-      // "check your access token" — that message was a guess about the
-      // cause, and turned out to be wrong (the token was fine; the
-      // response just didn't use any of the field names first guessed).
-      // With the real response text visible, this can be fixed for real
-      // instead of guessing again.
-      console.error("[WaBulkify] create_instance — couldn't find an instance ID. Raw response:", raw);
-      return res.status(502).json({ message: "WaBulkify's response didn't contain a recognizable instance ID.", wabulkifyRaw: raw?.slice(0, 500) });
-    }
-    const instance = await WhatsAppInstance.create({ label: label.trim(), instanceId, status: "pending_scan" });
-    // Point WaBulkify's webhook at this server for this instance, so
-    // connection/scan status updates flow back automatically.
-    const webhookUrl = `${process.env.PUBLIC_BASE_URL || ""}/api/whatsapp/webhook`;
-    if (process.env.PUBLIC_BASE_URL) {
-      try { await wabulkifyCall("set_webhook", { webhook_url: webhookUrl, enable: "true", instance_id: instanceId }); }
-      catch (err) { console.error("[WaBulkify] set_webhook failed:", err.message); }
-    }
-    res.status(201).json(instance);
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// NEW: registers an instance you already created directly in WaBulkify's
-// own dashboard (their dashboard uses your logged-in browser session,
-// which works independently of whether the access_token API path does) —
-// a practical way to connect a number if POST /instances (which calls
-// WaBulkify's create_instance API) is failing on their end. This never
-// calls WaBulkify's create_instance; it only saves the ID you give it and
-// tries to point their webhook at it, then lets you send from it via the
-// API like any other instance.
+// "+ Add WhatsApp Number" — registers a number you've already connected
+// directly on WaBulkify's own dashboard. WaBulkify's support team confirmed
+// QR scanning only works on their dashboard (their browser session, not a
+// custom one), so this never calls their create_instance/get_qrcode API —
+// it just saves the Instance ID you give it and points their webhook at it,
+// then the number can be used for sending via the API like any other.
 app.post("/api/admin/whatsapp/instances/manual", protect, adminOnly, async (req, res) => {
   try {
     const { label, instanceId } = req.body || {};
@@ -2631,24 +2598,6 @@ app.post("/api/admin/whatsapp/instances/manual", protect, adminOnly, async (req,
     if (err.code === 11000) return res.status(400).json({ message: "An instance with that ID is already registered here" });
     res.status(500).json({ message: err.message });
   }
-});
-
-// Fetch the QR code to scan for one instance. NOTE: WaBulkify's own docs say
-// the QR result can also arrive via webhook rather than in this response —
-// this route returns whatever WaBulkify's API response actually contains
-// (checking a few likely field names), and the frontend also polls
-// GET /api/admin/whatsapp/instances afterward to notice once the webhook
-// marks it "connected".
-app.post("/api/admin/whatsapp/instances/:id/qrcode", protect, adminOnly, async (req, res) => {
-  try {
-    const instance = await WhatsAppInstance.findById(req.params.id);
-    if (!instance) return res.status(404).json({ message: "Instance not found" });
-    const { data, raw } = await wabulkifyCall("get_qrcode", { instance_id: instance.instanceId });
-    const qrCode = data.qrcode || data.qr_code || data.qrCode || data.qr || data.base64 || data.image
-      || data?.data?.qrcode || data?.data?.qr_code || data?.data?.base64 || data?.data?.image || null;
-    if (!qrCode) console.error("[WaBulkify] get_qrcode — no QR image field found. Raw response:", raw);
-    res.json({ qrCode, raw: data });
-  } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
 app.post("/api/admin/whatsapp/instances/:id/reboot", protect, adminOnly, async (req, res) => {
