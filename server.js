@@ -495,6 +495,25 @@ const WhatsAppInstanceSchema = new mongoose.Schema({
 }, { timestamps: true });
 const WhatsAppInstance = mongoose.model("WhatsAppInstance", WhatsAppInstanceSchema);
 
+// Logs every message sent or received through a connected number — powers
+// Super Admin → WhatsApp → Messages (per-account message list and
+// sent/received counts).
+const WhatsAppMessageSchema = new mongoose.Schema({
+  instanceId: { type: String, required: true },
+  direction:  { type: String, enum: ["outgoing", "incoming"], required: true },
+  number:     { type: String, default: "" }, // the other party's number — recipient for outgoing, sender for incoming
+  groupId:    { type: String, default: "" }, // set instead of number for group messages
+  message:    { type: String, default: "" },
+  status:     { type: String, enum: ["sent", "failed", "received"], default: "sent" },
+  source:     { type: String, default: "" }, // "workflow" | "manual" | "webhook"
+}, { timestamps: true });
+const WhatsAppMessage = mongoose.model("WhatsAppMessage", WhatsAppMessageSchema);
+
+async function logWhatsAppMessage(fields) {
+  try { await WhatsAppMessage.create(fields); }
+  catch (err) { console.error("[WhatsApp] failed to log message:", err.message); }
+}
+
 const WABULKIFY_BASE = "https://wabulkify.com/api";
 
 async function wabulkifyToken() {
@@ -901,15 +920,27 @@ async function runAction(step, ctx, log, workflowId) {
         if (p.recipientType === "group") {
           const groupId = interpolate(p.groupId || "", ctx);
           if (!groupId) { log.push("send_whatsapp skipped — no group ID in context"); return; }
-          if (mediaUrl) await wabulkifySend("send_group", { group_id: groupId, type: "media", message: text, media_url: mediaUrl, filename: p.filename || undefined, instance_id: instance.instanceId });
-          else await wabulkifySend("send_group", { group_id: groupId, type: "text", message: text, instance_id: instance.instanceId });
+          try {
+            if (mediaUrl) await wabulkifySend("send_group", { group_id: groupId, type: "media", message: text, media_url: mediaUrl, filename: p.filename || undefined, instance_id: instance.instanceId });
+            else await wabulkifySend("send_group", { group_id: groupId, type: "text", message: text, instance_id: instance.instanceId });
+            await logWhatsAppMessage({ instanceId: instance.instanceId, direction: "outgoing", groupId, message: text, status: "sent", source: "workflow" });
+          } catch (err) {
+            await logWhatsAppMessage({ instanceId: instance.instanceId, direction: "outgoing", groupId, message: text, status: "failed", source: "workflow" });
+            throw err;
+          }
           log.push(`WhatsApp message sent to group ${groupId} via "${instance.label}"`);
           runWorkflows("whatsapp_sent", { ...ctx, groupId, __summary: `WhatsApp (group) via ${instance.label}` });
         } else {
           const to = interpolate(p.to || "{{whatsapp}}", ctx) || interpolate("{{studentPhone}}", ctx);
           if (!to) { log.push("send_whatsapp skipped — no phone number in context"); return; }
-          if (mediaUrl) await wabulkifySend("send", { number: to, type: "media", message: text, media_url: mediaUrl, filename: p.filename || undefined, instance_id: instance.instanceId });
-          else await wabulkifySend("send", { number: to, type: "text", message: text, instance_id: instance.instanceId });
+          try {
+            if (mediaUrl) await wabulkifySend("send", { number: to, type: "media", message: text, media_url: mediaUrl, filename: p.filename || undefined, instance_id: instance.instanceId });
+            else await wabulkifySend("send", { number: to, type: "text", message: text, instance_id: instance.instanceId });
+            await logWhatsAppMessage({ instanceId: instance.instanceId, direction: "outgoing", number: to, message: text, status: "sent", source: "workflow" });
+          } catch (err) {
+            await logWhatsAppMessage({ instanceId: instance.instanceId, direction: "outgoing", number: to, message: text, status: "failed", source: "workflow" });
+            throw err;
+          }
           log.push(`WhatsApp message sent to ${to} via "${instance.label}"`);
           runWorkflows("whatsapp_sent", { ...ctx, to, __summary: `WhatsApp to ${to} via ${instance.label}` });
         }
@@ -1513,21 +1544,27 @@ app.post("/api/enrollments/:courseId", protect, async (req, res) => {
     runWorkflows("enrollment_created", {
       studentId: req.user._id, studentName: req.user.name, studentEmail: req.user.email,
       courseId: course._id, courseTitle: course.title, amount: enrollment.amount, category: course.category,
+      whatsapp: enrollment.whatsapp,
       __summary: `${req.user.name} → ${course.title}`,
     });
     // "Form Submitted", tagged formSlug: "form-1" — the 2-step course
     // enrollment form is registered as "Form 1" in Super Admin → Forms, so
     // a workflow can be scoped to react to this specific form instead of
     // every form on the site.
+    // NEW: whatsapp added to the context — this is what makes the "Send
+    // WhatsApp Message" action's default "To" field ({{whatsapp}}) actually
+    // resolve to the real number this student entered on the enrollment
+    // form, instead of coming up blank.
     runWorkflows("form_submitted", {
       name: req.user.name, email: req.user.email, message: `Enrolled in ${course.title}`, formSlug: "form-1",
+      whatsapp: enrollment.whatsapp,
       __summary: `${req.user.name} → ${course.title}`,
     });
     // "Category Started" — same event, filtered/labeled by the course's
     // category, for workflows that only care about e.g. "Marketing" courses.
     runWorkflows("category_started", {
       studentId: req.user._id, studentName: req.user.name, studentEmail: req.user.email,
-      courseId: course._id, courseTitle: course.title, category: course.category,
+      courseId: course._id, courseTitle: course.title, category: course.category, whatsapp: enrollment.whatsapp,
       __summary: `${req.user.name} started ${course.category || "a"} category`,
     });
 
@@ -2664,11 +2701,73 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
     if (body.phone || body.number || body.phoneNumber) instance.phoneNumber = body.phone || body.number || body.phoneNumber;
     await instance.save();
 
+    // NEW: logs an incoming message when this payload looks like one — the
+    // exact field names WaBulkify uses for message events aren't in their
+    // docs, so this checks the field names most WhatsApp Web wrapper APIs
+    // use; the raw payload above is kept regardless, so a message that
+    // doesn't match still isn't lost from view, just not logged as a
+    // structured message here.
+    const messageText = body.message || body.text || body.body;
+    const fromNumber = body.from || body.sender || body.number || body.phone;
+    if (messageText && (statusText.includes("incoming") || statusText.includes("message") || body.type === "incoming")) {
+      await logWhatsAppMessage({ instanceId, direction: "incoming", number: fromNumber || "", message: String(messageText), status: "received", source: "webhook" });
+    }
+
     res.json({ received: true });
   } catch (err) {
     console.error("[WaBulkify webhook] error:", err.message);
     res.status(500).json({ message: err.message });
   }
+});
+
+// Manual one-off send — pick any connected number and any recipient and
+// send a real message right now. This is also the simplest way to actually
+// test whether a number is genuinely connected: if this succeeds and the
+// message arrives, it's connected for real, regardless of what the status
+// badge says (that badge is only ever as accurate as WaBulkify's webhook
+// actually is).
+app.post("/api/admin/whatsapp/send", protect, adminOnly, async (req, res) => {
+  try {
+    const { instanceId: docId, recipientType, to, groupId, message } = req.body || {};
+    if (!docId || !message?.trim()) return res.status(400).json({ message: "A number and a message are required" });
+    const instance = await WhatsAppInstance.findById(docId);
+    if (!instance) return res.status(404).json({ message: "Instance not found" });
+
+    if (recipientType === "group") {
+      if (!groupId?.trim()) return res.status(400).json({ message: "Group ID is required" });
+      try {
+        await wabulkifySend("send_group", { group_id: groupId.trim(), type: "text", message: message.trim(), instance_id: instance.instanceId });
+        await logWhatsAppMessage({ instanceId: instance.instanceId, direction: "outgoing", groupId: groupId.trim(), message: message.trim(), status: "sent", source: "manual" });
+      } catch (err) {
+        await logWhatsAppMessage({ instanceId: instance.instanceId, direction: "outgoing", groupId: groupId.trim(), message: message.trim(), status: "failed", source: "manual" });
+        throw err;
+      }
+    } else {
+      if (!to?.trim()) return res.status(400).json({ message: "A recipient number is required" });
+      try {
+        await wabulkifySend("send", { number: to.trim(), type: "text", message: message.trim(), instance_id: instance.instanceId });
+        await logWhatsAppMessage({ instanceId: instance.instanceId, direction: "outgoing", number: to.trim(), message: message.trim(), status: "sent", source: "manual" });
+      } catch (err) {
+        await logWhatsAppMessage({ instanceId: instance.instanceId, direction: "outgoing", number: to.trim(), message: message.trim(), status: "failed", source: "manual" });
+        throw err;
+      }
+    }
+    res.json({ sent: true });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Message history for one number — real sent/received counts and the
+// actual message list, for Super Admin → WhatsApp → Messages.
+app.get("/api/admin/whatsapp/messages", protect, adminOnly, async (req, res) => {
+  try {
+    const { instanceId } = req.query;
+    if (!instanceId) return res.status(400).json({ message: "instanceId is required" });
+    const messages = await WhatsAppMessage.find({ instanceId }).sort("-createdAt").limit(200);
+    const sentCount = await WhatsAppMessage.countDocuments({ instanceId, direction: "outgoing", status: "sent" });
+    const receivedCount = await WhatsAppMessage.countDocuments({ instanceId, direction: "incoming" });
+    const failedCount = await WhatsAppMessage.countDocuments({ instanceId, direction: "outgoing", status: "failed" });
+    res.json({ messages, sentCount, receivedCount, failedCount });
+  } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
 // Super Admin — upload/replace a site logo. Goes to the same Cloudinary
@@ -2744,7 +2843,7 @@ app.post("/api/package-inquiries", async (req, res) => {
     const inquiry = await PackageInquiry.create({
       name: name.trim(), whatsapp: whatsapp.trim(), email: email.trim().toLowerCase(), package: pkg,
     });
-    runWorkflows("form_submitted", { name: inquiry.name, email: inquiry.email, message: `${pkg === "gold" ? "Gold" : "Premium"} Package inquiry`, formSlug: "form-2", __summary: `${inquiry.name} — ${pkg} package` });
+    runWorkflows("form_submitted", { name: inquiry.name, email: inquiry.email, message: `${pkg === "gold" ? "Gold" : "Premium"} Package inquiry`, formSlug: "form-2", whatsapp: inquiry.whatsapp, __summary: `${inquiry.name} — ${pkg} package` });
     res.status(201).json(inquiry);
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
