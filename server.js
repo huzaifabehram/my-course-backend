@@ -2608,6 +2608,31 @@ app.post("/api/admin/whatsapp/instances", protect, adminOnly, async (req, res) =
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
+// NEW: registers an instance you already created directly in WaBulkify's
+// own dashboard (their dashboard uses your logged-in browser session,
+// which works independently of whether the access_token API path does) —
+// a practical way to connect a number if POST /instances (which calls
+// WaBulkify's create_instance API) is failing on their end. This never
+// calls WaBulkify's create_instance; it only saves the ID you give it and
+// tries to point their webhook at it, then lets you send from it via the
+// API like any other instance.
+app.post("/api/admin/whatsapp/instances/manual", protect, adminOnly, async (req, res) => {
+  try {
+    const { label, instanceId } = req.body || {};
+    if (!label?.trim() || !instanceId?.trim()) return res.status(400).json({ message: "Both a name and the Instance ID are required" });
+    const instance = await WhatsAppInstance.create({ label: label.trim(), instanceId: instanceId.trim(), status: "connected" });
+    const webhookUrl = `${process.env.PUBLIC_BASE_URL || ""}/api/whatsapp/webhook`;
+    if (process.env.PUBLIC_BASE_URL) {
+      try { await wabulkifyCall("set_webhook", { webhook_url: webhookUrl, enable: "true", instance_id: instance.instanceId }); }
+      catch (err) { console.error("[WaBulkify] set_webhook failed for manually-added instance:", err.message); }
+    }
+    res.status(201).json(instance);
+  } catch (err) {
+    if (err.code === 11000) return res.status(400).json({ message: "An instance with that ID is already registered here" });
+    res.status(500).json({ message: err.message });
+  }
+});
+
 // Fetch the QR code to scan for one instance. NOTE: WaBulkify's own docs say
 // the QR result can also arrive via webhook rather than in this response —
 // this route returns whatever WaBulkify's API response actually contains
