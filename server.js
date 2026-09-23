@@ -507,9 +507,32 @@ async function wabulkifyCall(path, params) {
   if (!token) throw new Error("WaBulkify isn't connected yet — add your access token in Super Admin → WhatsApp");
   const query = new URLSearchParams({ ...params, access_token: token }).toString();
   const resp = await fetch(`${WABULKIFY_BASE}/${path}?${query}`, { method: "POST" });
-  const data = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error(data?.message || `WaBulkify returned HTTP ${resp.status}`);
-  return data;
+  // NEW: read the body as text first — if WaBulkify ever returns something
+  // that isn't valid JSON (an HTML error page, plain text, etc.), the old
+  // version silently swallowed that into an empty {}, which is what made
+  // the "didn't return an instance_id" error impossible to actually debug.
+  // Now the raw text survives so a caller can inspect it.
+  const raw = await resp.text();
+  let data = {};
+  try { data = raw ? JSON.parse(raw) : {}; } catch { data = {}; }
+  if (!resp.ok) throw new Error(data?.message || `WaBulkify returned HTTP ${resp.status}: ${raw.slice(0, 200)}`);
+  return { data, raw };
+}
+
+// Looks for an instance ID under every field name/shape we've seen WhatsApp
+// Web wrapper APIs use, including nested under a "data"/"result" envelope —
+// broadened after the first guess (instance_id/instanceId/id at the top
+// level only) turned out not to match WaBulkify's actual response.
+function extractInstanceId(data) {
+  const candidates = [data, data?.data, data?.result, data?.instance, data?.response];
+  const keys = ["instance_id", "instanceId", "id", "uniqueId", "unique_id", "token", "instance"];
+  for (const obj of candidates) {
+    if (!obj || typeof obj !== "object") continue;
+    for (const key of keys) {
+      if (obj[key] && typeof obj[key] !== "object") return String(obj[key]);
+    }
+  }
+  return null;
 }
 
 // send/send_group take a JSON body rather than query params, per WaBulkify's docs.
@@ -2545,9 +2568,18 @@ app.post("/api/admin/whatsapp/instances", protect, adminOnly, async (req, res) =
   try {
     const { label } = req.body || {};
     if (!label?.trim()) return res.status(400).json({ message: "A name for this number is required" });
-    const data = await wabulkifyCall("create_instance", {});
-    const instanceId = data.instance_id || data.instanceId || data.id;
-    if (!instanceId) return res.status(502).json({ message: "WaBulkify didn't return an instance_id — check your access token" });
+    const { data, raw } = await wabulkifyCall("create_instance", {});
+    const instanceId = extractInstanceId(data);
+    if (!instanceId) {
+      // NEW: surfaces WaBulkify's exact raw response instead of just
+      // "check your access token" — that message was a guess about the
+      // cause, and turned out to be wrong (the token was fine; the
+      // response just didn't use any of the field names first guessed).
+      // With the real response text visible, this can be fixed for real
+      // instead of guessing again.
+      console.error("[WaBulkify] create_instance — couldn't find an instance ID. Raw response:", raw);
+      return res.status(502).json({ message: "WaBulkify's response didn't contain a recognizable instance ID.", wabulkifyRaw: raw?.slice(0, 500) });
+    }
     const instance = await WhatsAppInstance.create({ label: label.trim(), instanceId, status: "pending_scan" });
     // Point WaBulkify's webhook at this server for this instance, so
     // connection/scan status updates flow back automatically.
@@ -2570,8 +2602,10 @@ app.post("/api/admin/whatsapp/instances/:id/qrcode", protect, adminOnly, async (
   try {
     const instance = await WhatsAppInstance.findById(req.params.id);
     if (!instance) return res.status(404).json({ message: "Instance not found" });
-    const data = await wabulkifyCall("get_qrcode", { instance_id: instance.instanceId });
-    const qrCode = data.qrcode || data.qr_code || data.qrCode || data.qr || data.base64 || data.image || null;
+    const { data, raw } = await wabulkifyCall("get_qrcode", { instance_id: instance.instanceId });
+    const qrCode = data.qrcode || data.qr_code || data.qrCode || data.qr || data.base64 || data.image
+      || data?.data?.qrcode || data?.data?.qr_code || data?.data?.base64 || data?.data?.image || null;
+    if (!qrCode) console.error("[WaBulkify] get_qrcode — no QR image field found. Raw response:", raw);
     res.json({ qrCode, raw: data });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
@@ -2602,8 +2636,8 @@ app.post("/api/admin/whatsapp/instances/:id/reset", protect, adminOnly, async (r
   try {
     const instance = await WhatsAppInstance.findById(req.params.id);
     if (!instance) return res.status(404).json({ message: "Instance not found" });
-    const data = await wabulkifyCall("reset_instance", { instance_id: instance.instanceId });
-    const newInstanceId = data.instance_id || data.instanceId || instance.instanceId;
+    const { data } = await wabulkifyCall("reset_instance", { instance_id: instance.instanceId });
+    const newInstanceId = extractInstanceId(data) || instance.instanceId;
     instance.instanceId = newInstanceId;
     instance.status = "pending_scan";
     instance.phoneNumber = "";
