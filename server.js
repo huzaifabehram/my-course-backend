@@ -454,6 +454,9 @@ const SiteSettingsSchema = new mongoose.Schema({
   // instance (= one connected WhatsApp number) under WhatsAppInstance
   // below. Same secret-handling convention as whatsappAccessToken.
   wabulkifyAccessToken: { type: String, default: "" },
+  // NEW: Anthropic API key — powers the WhatsApp AI Bot's auto-replies.
+  // Same secret-handling convention as the other tokens above.
+  anthropicApiKey: { type: String, default: "" },
 }, { timestamps: true });
 const SiteSettings = mongoose.model("SiteSettings", SiteSettingsSchema);
 
@@ -477,7 +480,7 @@ async function getSiteSettings() {
     { $setOnInsert: {
         logoUrl: "", footerLogoUrl: "",
         paymentLogoUbl: "", paymentLogoAllied: "", paymentLogoJazzcash: "", paymentLogoEasypaisa: "",
-        whatsappPhoneNumberId: "", whatsappAccessToken: "", wabulkifyAccessToken: "",
+        whatsappPhoneNumberId: "", whatsappAccessToken: "", wabulkifyAccessToken: "", anthropicApiKey: "",
       } },
     { new: true, upsert: true, sort: { _id: 1 } }
   );
@@ -512,6 +515,68 @@ const WhatsAppMessage = mongoose.model("WhatsAppMessage", WhatsAppMessageSchema)
 async function logWhatsAppMessage(fields) {
   try { await WhatsAppMessage.create(fields); }
   catch (err) { console.error("[WhatsApp] failed to log message:", err.message); }
+}
+
+// ── AI Bot — auto-responds to incoming WhatsApp messages ────────────────────
+// One shared configuration: "instructions" is what Super Admin → WhatsApp →
+// AI Bot calls "training" — a system prompt describing your business, tone,
+// what it should/shouldn't say, and when to hand off to a human instead of
+// answering. enabledInstanceIds is an explicit opt-in list — the bot never
+// auto-replies on a number unless you've turned it on for that number
+// specifically, so connecting a new number never silently starts
+// auto-responding on your behalf.
+const WhatsAppBotSettingsSchema = new mongoose.Schema({
+  enabled:            { type: Boolean, default: false },
+  instructions:        { type: String, default: "" },
+  model:               { type: String, default: "claude-haiku-4-5-20251001" },
+  enabledInstanceIds:  { type: [String], default: [] },
+}, { timestamps: true });
+const WhatsAppBotSettings = mongoose.model("WhatsAppBotSettings", WhatsAppBotSettingsSchema);
+
+async function getBotSettings() {
+  return WhatsAppBotSettings.findOneAndUpdate(
+    {},
+    { $setOnInsert: { enabled: false, instructions: "", model: "claude-haiku-4-5-20251001", enabledInstanceIds: [] } },
+    { new: true, upsert: true, sort: { _id: 1 } }
+  );
+}
+
+// Real, documented Anthropic Messages API — https://docs.claude.com/en/api/messages.
+// Unlike WaBulkify's API, this one is precisely specified, so this
+// integration isn't a best-effort guess the way some of the WaBulkify
+// field-name parsing has had to be.
+async function callClaude({ systemPrompt, history, model }) {
+  const settings = await getSiteSettings();
+  const apiKey = settings.anthropicApiKey;
+  if (!apiKey) throw new Error("No Anthropic API key saved — add one in Super Admin → WhatsApp → AI Bot");
+  const resp = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: model || "claude-haiku-4-5-20251001",
+      max_tokens: 500,
+      system: systemPrompt || "You are a helpful customer support assistant.",
+      messages: history,
+    }),
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(data?.error?.message || `Anthropic API returned HTTP ${resp.status}`);
+  const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("");
+  return text;
+}
+
+// Builds the last ~10 messages between this number and this instance as
+// Anthropic-format conversation history, oldest first, alternating
+// user/assistant — real prior context, not a blank slate every message.
+async function buildBotHistory(instanceId, number, latestIncomingText) {
+  const prior = await WhatsAppMessage.find({ instanceId, number, groupId: "" }).sort("-createdAt").limit(10);
+  const history = prior.reverse().map((m) => ({ role: m.direction === "incoming" ? "user" : "assistant", content: m.message }));
+  history.push({ role: "user", content: latestIncomingText });
+  return history;
 }
 
 const WABULKIFY_BASE = "https://wabulkify.com/api";
@@ -2607,6 +2672,66 @@ app.delete("/api/admin/settings/wabulkify", protect, adminOnly, async (req, res)
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
+// Anthropic API key — powers the WhatsApp AI Bot. Same never-returned-once-
+// saved convention as the WhatsApp/WaBulkify tokens above.
+app.get("/api/admin/settings/anthropic", protect, adminOnly, async (req, res) => {
+  try {
+    const settings = await getSiteSettings();
+    res.json({ connected: !!settings.anthropicApiKey });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+app.post("/api/admin/settings/anthropic", protect, adminOnly, async (req, res) => {
+  try {
+    const { apiKey } = req.body || {};
+    if (!apiKey?.trim()) return res.status(400).json({ message: "API key is required" });
+    await SiteSettings.findOneAndUpdate({}, { anthropicApiKey: apiKey.trim() }, { upsert: true, sort: { _id: 1 } });
+    res.json({ connected: true });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+app.delete("/api/admin/settings/anthropic", protect, adminOnly, async (req, res) => {
+  try {
+    await SiteSettings.findOneAndUpdate({}, { anthropicApiKey: "" }, { sort: { _id: 1 } });
+    res.json({ disconnected: true });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// AI BOT — Super Admin → WhatsApp → AI Bot
+// ══════════════════════════════════════════════════════════════════════════════
+
+app.get("/api/admin/whatsapp/bot-settings", protect, adminOnly, async (req, res) => {
+  try {
+    res.json(await getBotSettings());
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+app.post("/api/admin/whatsapp/bot-settings", protect, adminOnly, async (req, res) => {
+  try {
+    const { enabled, instructions, model, enabledInstanceIds } = req.body || {};
+    const update = {};
+    if (enabled !== undefined) update.enabled = !!enabled;
+    if (instructions !== undefined) update.instructions = instructions;
+    if (model !== undefined) update.model = model;
+    if (enabledInstanceIds !== undefined) update.enabledInstanceIds = Array.isArray(enabledInstanceIds) ? enabledInstanceIds : [];
+    const settings = await WhatsAppBotSettings.findOneAndUpdate({}, update, { new: true, upsert: true, sort: { _id: 1 } });
+    res.json(settings);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Test the bot's current "training" without touching real WhatsApp at
+// all — lets you refine the instructions and see exactly how it'll answer
+// before turning it on for actual customers.
+app.post("/api/admin/whatsapp/bot-test", protect, adminOnly, async (req, res) => {
+  try {
+    const { message, history } = req.body || {};
+    if (!message?.trim()) return res.status(400).json({ message: "A message is required" });
+    const settings = await getBotSettings();
+    const conversation = [...(Array.isArray(history) ? history : []), { role: "user", content: message.trim() }];
+    const reply = await callClaude({ systemPrompt: settings.instructions, history: conversation, model: settings.model });
+    res.json({ reply });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
 // List every connected number.
 app.get("/api/admin/whatsapp/instances", protect, adminOnly, async (req, res) => {
   try {
@@ -2731,6 +2856,28 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
     const fromNumber = body.from || body.sender || body.number || body.phone;
     if (messageText && (statusText.includes("incoming") || statusText.includes("message") || body.type === "incoming")) {
       await logWhatsAppMessage({ instanceId, direction: "incoming", number: fromNumber || "", message: String(messageText), status: "received", source: "webhook" });
+
+      // NEW: AI Bot auto-reply — only for numbers explicitly opted in
+      // (Super Admin → WhatsApp → AI Bot), so connecting a new number never
+      // silently starts auto-responding. Runs after res.json() below isn't
+      // an option since this needs to happen before responding to
+      // WaBulkify — kept fire-and-forget (not awaited) so the webhook
+      // acknowledges quickly either way; failures are logged, not thrown,
+      // so a broken AI call never turns into a webhook error WaBulkify
+      // might retry.
+      (async () => {
+        try {
+          const botSettings = await getBotSettings();
+          if (!botSettings.enabled || !botSettings.enabledInstanceIds.includes(instanceId) || !fromNumber) return;
+          const history = await buildBotHistory(instanceId, fromNumber, String(messageText));
+          const reply = await callClaude({ systemPrompt: botSettings.instructions, history, model: botSettings.model });
+          if (!reply) return;
+          await wabulkifySend("send", { number: fromNumber, type: "text", message: reply, instance_id: instanceId });
+          await logWhatsAppMessage({ instanceId, direction: "outgoing", number: fromNumber, message: reply, status: "sent", source: "ai_bot" });
+        } catch (err) {
+          console.error("[AI Bot] auto-reply failed:", err.message);
+        }
+      })();
     }
 
     res.json({ received: true });
