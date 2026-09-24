@@ -856,6 +856,11 @@ function resolveMessageIdentity(key) {
   if (altJid && altJid.endsWith("@s.whatsapp.net")) {
     return { jid, displayNumber: normalizeWaNumber(altJid.replace("@s.whatsapp.net", "")) };
   }
+  // NEW: logs the full key whenever neither field resolves to a real
+  // phone-number JID — this is the exact data needed to find the right
+  // field for real if remoteJidAlt isn't actually where this Baileys
+  // version puts it, instead of guessing at another field name blind.
+  console.log(`[Self-hosted WhatsApp] could not resolve a real number — raw key: ${JSON.stringify(key)}`);
   const lidDigits = jid ? jid.replace("@lid", "").replace(/[^\d]/g, "") : "";
   return { jid: jid || "", displayNumber: lidDigits ? `lid:${lidDigits}` : "" };
 }
@@ -3030,6 +3035,19 @@ app.delete("/api/admin/whatsapp-server/sessions/:id", protect, adminOnly, requir
     activeSelfHostedSockets.delete(session.sessionId);
     await WhatsAppSelfSession.findByIdAndDelete(req.params.id);
     res.json({ deleted: true });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Wipes stored message history for one number WITHOUT disconnecting it —
+// useful for clearing out old records that were saved before a fix (like
+// the LID-resolution one), so a later history sync repopulates cleanly
+// instead of mixing old, incorrectly-labeled rows with new correct ones.
+app.delete("/api/admin/whatsapp-server/sessions/:id/messages", protect, adminOnly, requireBaileys, async (req, res) => {
+  try {
+    const session = await WhatsAppSelfSession.findById(req.params.id);
+    if (!session) return res.status(404).json({ message: "Session not found" });
+    const result = await WhatsAppMessage.deleteMany({ instanceId: session.sessionId });
+    res.json({ deletedCount: result.deletedCount });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
