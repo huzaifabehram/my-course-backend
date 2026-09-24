@@ -633,14 +633,27 @@ async function useMongoAuthState(sessionDoc) {
 
 async function startSelfHostedSession(sessionDoc) {
   if (!Baileys) throw new Error("Baileys isn't installed on the server yet");
-  const { default: makeWASocket, DisconnectReason, fetchLatestBaileysVersion } = Baileys;
-  const { state, saveCreds } = await useMongoAuthState(sessionDoc);
+  const { default: makeWASocket, DisconnectReason, fetchLatestBaileysVersion, useMultiFileAuthState } = Baileys;
+  // TEMPORARY DIAGNOSTIC CHANGE: three targeted fixes in a row (session
+  // staleness, syncFullHistory) didn't resolve total connection failure,
+  // even on a genuinely fresh QR scan — so instead of guessing at another
+  // specific setting, this eliminates the biggest single source of
+  // uncertainty: the custom Mongo-backed session storage (useMongoAuthState
+  // above), replaced here with Baileys' own official, battle-tested
+  // useMultiFileAuthState. The real tradeoff: this writes to local disk,
+  // which Render wipes on every redeploy — so every number will need a
+  // fresh QR scan after each deploy again, same as before persistence was
+  // added. That's a real downside during active back-and-forth deploys,
+  // but a connection that works and needs rescanning sometimes is far
+  // better than one that never works at all. If this fixes it, the bug was
+  // in the custom Mongo adapter and that can be revisited properly once
+  // everything else is confirmed solid; if it does NOT fix it, that's
+  // equally valuable — it rules out the adapter and points at something
+  // else (Render networking/resources) instead of more guessing.
+  const sessionFolder = `/tmp/wa-sessions/${sessionDoc.sessionId}`;
+  const { state, saveCreds } = await useMultiFileAuthState(sessionFolder);
   const { version } = await fetchLatestBaileysVersion();
   const pino = require("pino"); // installed transitively as a Baileys dependency
-  // Deliberately using Baileys' plain defaults here — no syncFullHistory,
-  // no extra options. Requesting full history sync is known to be slow and
-  // can destabilize the connection during the critical first-connect
-  // window; the plain default is the well-tested, stable path.
   const sock = makeWASocket({ version, auth: state, printQRInTerminal: false, logger: pino({ level: "silent" }) });
 
   sock.ev.on("creds.update", saveCreds);
