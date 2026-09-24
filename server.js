@@ -709,21 +709,19 @@ async function startSelfHostedSession(sessionDoc) {
   const pino = require("pino"); // installed transitively as a Baileys dependency
   // keepAliveIntervalMs tightened from Baileys' default — sends a ping
   // more frequently to help the connection survive longer without an
-  // intervening idle-timeout. Being honest about this: a disconnect every
-  // 30-40 minutes specifically is a longer, more consistent pattern than
-  // a failing keep-alive would usually produce (that tends to fail much
-  // faster), so this alone may not be the whole fix — the disconnect-
-  // reason logging already in place below is what will actually show the
-  // real cause (statusCode/reason) the next time it happens.
+  // intervening idle-timeout.
   //
-  // syncFullHistory: re-enabled — this was removed earlier as a suspected
-  // cause of total connection failure, but the real cause turned out to be
-  // the custom MongoDB session storage (replaced with Baileys' own
-  // useMultiFileAuthState above), not this setting. On that now-stable
-  // foundation, this is what actually pulls in a WhatsApp number's
-  // pre-existing chat history instead of only new messages from here on.
-  // If the connection becomes unstable again after this, that's the signal
-  // to revert it — but the more likely culprit has already been replaced.
+  // syncFullHistory: re-enabled again, paired this time with a real fix to
+  // the likely actual cause of the disconnects — the history-sync handler
+  // below used to write one message at a time with an await'd database
+  // round-trip for each, which for a large history could take long enough
+  // to congest things right when the connection most needs to stay
+  // responsive to WhatsApp's own keep-alive traffic. It's now batched
+  // (one bulk duplicate-check, one bulk insert) instead. I can't promise
+  // this eliminates every possible disconnect — that depends on WhatsApp's
+  // servers and Render's infrastructure too, neither of which I control —
+  // but this addresses the most likely actual mechanism, not just the
+  // setting that happened to correlate with it.
   const sock = makeWASocket({ version, auth: state, printQRInTerminal: false, keepAliveIntervalMs: 15000, syncFullHistory: true, logger: pino({ level: "silent" }) });
 
   sock.ev.on("creds.update", saveCreds);
@@ -833,31 +831,48 @@ async function startSelfHostedSession(sessionDoc) {
   // itself would.
   sock.ev.on("messaging-history.set", async ({ messages, contacts, isLatest }) => {
     console.log(`[Self-hosted WhatsApp] history sync for "${sessionDoc.label}" — ${messages.length} message(s), ${contacts?.length || 0} contact(s), isLatest=${isLatest}`);
-    for (const contact of contacts || []) {
-      const name = contact.name || contact.notify || contact.verifiedName || "";
-      await upsertWhatsAppContact(sessionDoc.sessionId, contact.id, name);
+
+    // NEW: batched instead of one-at-a-time with an awaited DB round-trip
+    // per contact/message — a large history could mean thousands of those,
+    // and doing them sequentially is the most likely reason this was slow
+    // enough to interfere with the connection staying responsive.
+    if (contacts?.length > 0) {
+      const ops = contacts
+        .map((c) => ({ id: c.id, name: c.name || c.notify || c.verifiedName || "" }))
+        .filter((c) => c.id && c.name)
+        .map((c) => ({ updateOne: { filter: { instanceId: sessionDoc.sessionId, jid: c.id }, update: { $set: { name: c.name } }, upsert: true } }));
+      if (ops.length > 0) {
+        try { await WhatsAppContact.bulkWrite(ops, { ordered: false }); }
+        catch (err) { console.error("[Self-hosted WhatsApp] bulk contact save failed:", err.message); }
+      }
     }
+
+    const candidates = [];
     for (const msg of messages) {
-      try {
-        if (!msg.message || !msg.key?.remoteJid) continue;
-        if (msg.key.remoteJid.endsWith("@g.us")) continue; // groups skipped here too, same as the live handler
-        if (msg.key.id) {
-          const already = await WhatsAppMessage.findOne({ waMessageId: msg.key.id });
-          if (already) continue;
-        }
-        const text = extractMessageText(msg);
-        if (!text) continue; // history items with no plain text are skipped rather than filling the thread with placeholders
-        const { jid, displayNumber } = resolveMessageIdentity(msg.key);
-        if (!jid) continue;
-        const direction = msg.key.fromMe ? "outgoing" : "incoming";
-        await WhatsAppMessage.create({
-          instanceId: sessionDoc.sessionId, direction, number: displayNumber, jid, message: text,
-          status: direction === "outgoing" ? "sent" : "received", source: "history_sync",
-          waMessageId: msg.key.id || "",
-          createdAt: msg.messageTimestamp ? new Date(Number(msg.messageTimestamp) * 1000) : new Date(),
-        });
-      } catch (err) { console.error("[Self-hosted WhatsApp] history import error:", err.message); }
+      if (!msg.message || !msg.key?.remoteJid) continue;
+      if (msg.key.remoteJid.endsWith("@g.us")) continue; // groups skipped here too, same as the live handler
+      const text = extractMessageText(msg);
+      if (!text) continue; // history items with no plain text are skipped rather than filling the thread with placeholders
+      const { jid, displayNumber } = resolveMessageIdentity(msg.key);
+      if (!jid) continue;
+      const direction = msg.key.fromMe ? "outgoing" : "incoming";
+      candidates.push({
+        instanceId: sessionDoc.sessionId, direction, number: displayNumber, jid, message: text,
+        status: direction === "outgoing" ? "sent" : "received", source: "history_sync",
+        waMessageId: msg.key.id || "",
+        createdAt: msg.messageTimestamp ? new Date(Number(msg.messageTimestamp) * 1000) : new Date(),
+      });
     }
+    if (candidates.length === 0) return;
+
+    try {
+      const ids = candidates.map((c) => c.waMessageId).filter(Boolean);
+      const existing = ids.length > 0 ? await WhatsAppMessage.find({ waMessageId: { $in: ids } }).select("waMessageId") : [];
+      const existingIds = new Set(existing.map((e) => e.waMessageId));
+      const toInsert = candidates.filter((c) => !c.waMessageId || !existingIds.has(c.waMessageId));
+      if (toInsert.length > 0) await WhatsAppMessage.insertMany(toInsert, { ordered: false });
+      console.log(`[Self-hosted WhatsApp] history sync for "${sessionDoc.label}" — imported ${toInsert.length} new message(s)`);
+    } catch (err) { console.error("[Self-hosted WhatsApp] history import error:", err.message); }
   });
 
   // Ongoing contact-name updates — someone getting newly saved in your
