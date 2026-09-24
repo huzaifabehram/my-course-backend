@@ -464,15 +464,9 @@ const SiteSettingsSchema = new mongoose.Schema({
   // GET /api/settings route, only used server-side.
   whatsappPhoneNumberId: { type: String, default: "" },
   whatsappAccessToken:   { type: String, default: "" },
-  // NEW: WaBulkify (wabulkify.com) — a QR-scan-based WhatsApp Web
-  // automation service, separate from the official Meta Cloud API above.
-  // One account-wide access_token (not per-number) authenticates every
-  // instance (= one connected WhatsApp number) under WhatsAppInstance
-  // below. Same secret-handling convention as whatsappAccessToken.
-  wabulkifyAccessToken: { type: String, default: "" },
   // NEW: Anthropic API key — powers the WhatsApp AI Bot's auto-replies.
   // Same secret-handling convention as the other tokens above.
-  anthropicApiKey: { type: String, default: "" },
+  openaiApiKey: { type: String, default: "" },
   // NEW: a generated key so the self-hosted WhatsApp server's send endpoint
   // can be called externally (by another app/service), not stored via a
   // typed-in secret the way the others are — see
@@ -501,23 +495,11 @@ async function getSiteSettings() {
     { $setOnInsert: {
         logoUrl: "", footerLogoUrl: "",
         paymentLogoUbl: "", paymentLogoAllied: "", paymentLogoJazzcash: "", paymentLogoEasypaisa: "",
-        whatsappPhoneNumberId: "", whatsappAccessToken: "", wabulkifyAccessToken: "", anthropicApiKey: "", whatsappServerApiKey: "",
+        whatsappPhoneNumberId: "", whatsappAccessToken: "", openaiApiKey: "", whatsappServerApiKey: "",
       } },
     { new: true, upsert: true, sort: { _id: 1 } }
   );
 }
-
-// ── WaBulkify — QR-scan WhatsApp Web automation, multiple numbers ──────────
-// Each document is one "instance" = one WhatsApp number connected by
-// scanning a QR code, matching wabulkify's own model exactly.
-const WhatsAppInstanceSchema = new mongoose.Schema({
-  label:       { type: String, required: true, trim: true }, // your own nickname, e.g. "Sales Number"
-  instanceId:  { type: String, required: true, unique: true }, // wabulkify's instance_id
-  phoneNumber: { type: String, default: "" }, // filled in once the webhook reports it, if it does
-  status:      { type: String, enum: ["pending_scan", "connected", "disconnected"], default: "pending_scan" },
-  lastStatusPayload: { type: mongoose.Schema.Types.Mixed, default: null }, // raw last webhook payload, for troubleshooting
-}, { timestamps: true });
-const WhatsAppInstance = mongoose.model("WhatsAppInstance", WhatsAppInstanceSchema);
 
 // Logs every message sent or received through a connected number — powers
 // Super Admin → WhatsApp → Messages (per-account message list and
@@ -549,7 +531,7 @@ async function logWhatsAppMessage(fields) {
 const WhatsAppBotSettingsSchema = new mongoose.Schema({
   enabled:            { type: Boolean, default: false },
   instructions:        { type: String, default: "" },
-  model:               { type: String, default: "claude-haiku-4-5-20251001" },
+  model:               { type: String, default: "gpt-4o-mini" },
   enabledInstanceIds:  { type: [String], default: [] },
 }, { timestamps: true });
 const WhatsAppBotSettings = mongoose.model("WhatsAppBotSettings", WhatsAppBotSettingsSchema);
@@ -557,7 +539,7 @@ const WhatsAppBotSettings = mongoose.model("WhatsAppBotSettings", WhatsAppBotSet
 async function getBotSettings() {
   return WhatsAppBotSettings.findOneAndUpdate(
     {},
-    { $setOnInsert: { enabled: false, instructions: "", model: "claude-haiku-4-5-20251001", enabledInstanceIds: [] } },
+    { $setOnInsert: { enabled: false, instructions: "", model: "gpt-4o-mini", enabledInstanceIds: [] } },
     { new: true, upsert: true, sort: { _id: 1 } }
   );
 }
@@ -693,7 +675,7 @@ async function startSelfHostedSession(sessionDoc) {
         const botSettings = await getBotSettings();
         if (botSettings.enabled && botSettings.enabledInstanceIds.includes(sessionDoc.sessionId)) {
           const history = await buildBotHistory(sessionDoc.sessionId, number, text);
-          const reply = await callClaude({ systemPrompt: botSettings.instructions, history, model: botSettings.model });
+          const reply = await callOpenAI({ systemPrompt: botSettings.instructions, history, model: botSettings.model });
           if (reply) {
             await sock.sendMessage(from, { text: reply });
             await logWhatsAppMessage({ instanceId: sessionDoc.sessionId, direction: "outgoing", number, message: reply, status: "sent", source: "ai_bot" });
@@ -752,32 +734,30 @@ async function runBulkJob(jobId, sessionId, numbers, message) {
   await WhatsAppBulkJob.findByIdAndUpdate(jobId, { status: "done", results });
 }
 
-// Real, documented Anthropic Messages API — https://docs.claude.com/en/api/messages.
-// Unlike WaBulkify's API, this one is precisely specified, so this
-// integration isn't a best-effort guess the way some of the WaBulkify
-// field-name parsing has had to be.
-async function callClaude({ systemPrompt, history, model }) {
+// Real, documented OpenAI Chat Completions API —
+// https://platform.openai.com/docs/api-reference/chat. Same "real,
+// documented API, not a guess" reasoning as the Anthropic integration this
+// replaces — swapped to OpenAI per request, since it's the cheaper option.
+async function callOpenAI({ systemPrompt, history, model }) {
   const settings = await getSiteSettings();
-  const apiKey = settings.anthropicApiKey;
-  if (!apiKey) throw new Error("No Anthropic API key saved — add one in Super Admin → WhatsApp → AI Bot");
-  const resp = await fetch("https://api.anthropic.com/v1/messages", {
+  const apiKey = settings.openaiApiKey;
+  if (!apiKey) throw new Error("No OpenAI API key saved — add one in Super Admin → WhatsApp → AI Bot");
+  const messages = [{ role: "system", content: systemPrompt || "You are a helpful customer support assistant." }, ...history];
+  const resp = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
+      "Authorization": `Bearer ${apiKey}`,
     },
     body: JSON.stringify({
-      model: model || "claude-haiku-4-5-20251001",
+      model: model || "gpt-4o-mini",
       max_tokens: 500,
-      system: systemPrompt || "You are a helpful customer support assistant.",
-      messages: history,
+      messages,
     }),
   });
   const data = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error(data?.error?.message || `Anthropic API returned HTTP ${resp.status}`);
-  const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("");
-  return text;
+  if (!resp.ok) throw new Error(data?.error?.message || `OpenAI API returned HTTP ${resp.status}`);
+  return data.choices?.[0]?.message?.content || "";
 }
 
 // Builds the last ~10 messages between this number and this instance as
@@ -788,76 +768,6 @@ async function buildBotHistory(instanceId, number, latestIncomingText) {
   const history = prior.reverse().map((m) => ({ role: m.direction === "incoming" ? "user" : "assistant", content: m.message }));
   history.push({ role: "user", content: latestIncomingText });
   return history;
-}
-
-const WABULKIFY_BASE = "https://wabulkify.com/api";
-
-async function wabulkifyToken() {
-  const settings = await getSiteSettings();
-  return settings.wabulkifyAccessToken || "";
-}
-
-async function wabulkifyCall(path, params) {
-  const token = await wabulkifyToken();
-  if (!token) throw new Error("WaBulkify isn't connected yet — add your access token in Super Admin → WhatsApp");
-  const query = new URLSearchParams({ ...params, access_token: token }).toString();
-  // NEW: added Accept + a real browser-style User-Agent. The previous raw
-  // response turned out to be WaBulkify's own login *page* HTML, not a JSON
-  // API error — a classic sign of a request getting redirected by a
-  // server that doesn't recognize it as a genuine API call, which often
-  // comes down to a missing/generic User-Agent (Node's fetch sends none by
-  // default) or the server defaulting to an HTML response when Accept
-  // isn't explicit about wanting JSON.
-  const resp = await fetch(`${WABULKIFY_BASE}/${path}?${query}`, {
-    method: "POST",
-    headers: { "Accept": "application/json", "User-Agent": "Mozilla/5.0 (compatible; LerniServer/1.0)" },
-  });
-  // Read the body as text first — if WaBulkify ever returns something that
-  // isn't valid JSON (an HTML page, plain text, etc.), the raw text
-  // survives so a caller can inspect exactly what came back instead of it
-  // being silently swallowed into an empty {}.
-  const raw = await resp.text();
-  let data = {};
-  try { data = raw ? JSON.parse(raw) : {}; } catch { data = {}; }
-  // NEW: if the response is HTML rather than JSON (starts with "<"), this
-  // is not a normal API error — surface that plainly rather than parsing
-  // it as if it might contain useful fields.
-  if (raw.trim().startsWith("<")) throw new Error("WaBulkify returned an HTML page instead of JSON — this usually means the access token is invalid/expired, or API access isn't enabled on your WaBulkify account. Log into wabulkify.com and confirm the token from your dashboard.");
-  if (!resp.ok) throw new Error(data?.message || `WaBulkify returned HTTP ${resp.status}: ${raw.slice(0, 200)}`);
-  return { data, raw };
-}
-
-// Looks for an instance ID under every field name/shape we've seen WhatsApp
-// Web wrapper APIs use, including nested under a "data"/"result" envelope —
-// broadened after the first guess (instance_id/instanceId/id at the top
-// level only) turned out not to match WaBulkify's actual response.
-function extractInstanceId(data) {
-  const candidates = [data, data?.data, data?.result, data?.instance, data?.response];
-  const keys = ["instance_id", "instanceId", "id", "uniqueId", "unique_id", "token", "instance"];
-  for (const obj of candidates) {
-    if (!obj || typeof obj !== "object") continue;
-    for (const key of keys) {
-      if (obj[key] && typeof obj[key] !== "object") return String(obj[key]);
-    }
-  }
-  return null;
-}
-
-// send/send_group take a JSON body rather than query params, per WaBulkify's docs.
-async function wabulkifySend(path, body) {
-  const token = await wabulkifyToken();
-  if (!token) throw new Error("WaBulkify isn't connected yet — add your access token in Super Admin → WhatsApp");
-  const resp = await fetch(`${WABULKIFY_BASE}/${path}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "Accept": "application/json", "User-Agent": "Mozilla/5.0 (compatible; LerniServer/1.0)" },
-    body: JSON.stringify({ ...body, access_token: token }),
-  });
-  const raw = await resp.text();
-  let data = {};
-  try { data = raw ? JSON.parse(raw) : {}; } catch { data = {}; }
-  if (raw.trim().startsWith("<")) throw new Error("WaBulkify returned an HTML page instead of JSON — check your access token is still valid.");
-  if (!resp.ok) throw new Error(data?.message || `WaBulkify returned HTTP ${resp.status}: ${raw.slice(0, 200)}`);
-  return data;
 }
 
 // ── Contact Us submissions — from the public Contact Us page ───────────────────
@@ -1179,15 +1089,12 @@ async function runAction(step, ctx, log, workflowId) {
     // ("send_email" case removed along with email sending — see the note
     // near the top of this file on bringing it back.)
     case "send_whatsapp": {
-      // NEW: three possible providers, in priority order — a self-hosted
-      // session (Baileys, built directly into this server) if selected,
-      // then WaBulkify (multi-number, QR-connected) if an instance is
-      // chosen, then the single Meta Cloud API connection (Settings →
-      // WhatsApp) as the original fallback, so a workflow built before
-      // either of the newer options existed keeps working unchanged.
+      // NEW: prefers a self-hosted session (Baileys, built directly into
+      // this server) if selected — falls back to the single Meta Cloud API
+      // connection (Settings → WhatsApp) if none is chosen, so a workflow
+      // built before self-hosted numbers existed keeps working unchanged.
       let text = interpolate(p.message || "", ctx);
       text = await rewriteTrackedLinks(text, ctx, workflowId);
-      const mediaUrl = p.mediaUrl ? interpolate(p.mediaUrl, ctx) : "";
 
       if (p.selfHostedSessionId) {
         const session = await WhatsAppSelfSession.findById(p.selfHostedSessionId).catch(() => null);
@@ -1204,41 +1111,6 @@ async function runAction(step, ctx, log, workflowId) {
         }
         log.push(`WhatsApp message sent to ${to} via "${session.label}" (self-hosted)`);
         runWorkflows("whatsapp_sent", { ...ctx, to, __summary: `WhatsApp to ${to} via ${session.label}` });
-        return;
-      }
-
-      if (p.instanceId) {
-        const instance = await WhatsAppInstance.findById(p.instanceId).catch(() => null);
-        if (!instance) { log.push("send_whatsapp skipped — the selected WhatsApp number no longer exists"); return; }
-        if (instance.status !== "connected") { log.push(`send_whatsapp skipped — "${instance.label}" isn't connected (scan its QR code in Super Admin → WhatsApp)`); return; }
-
-        if (p.recipientType === "group") {
-          const groupId = interpolate(p.groupId || "", ctx);
-          if (!groupId) { log.push("send_whatsapp skipped — no group ID in context"); return; }
-          try {
-            if (mediaUrl) await wabulkifySend("send_group", { group_id: groupId, type: "media", message: text, media_url: mediaUrl, filename: p.filename || undefined, instance_id: instance.instanceId });
-            else await wabulkifySend("send_group", { group_id: groupId, type: "text", message: text, instance_id: instance.instanceId });
-            await logWhatsAppMessage({ instanceId: instance.instanceId, direction: "outgoing", groupId, message: text, status: "sent", source: "workflow" });
-          } catch (err) {
-            await logWhatsAppMessage({ instanceId: instance.instanceId, direction: "outgoing", groupId, message: text, status: "failed", source: "workflow" });
-            throw err;
-          }
-          log.push(`WhatsApp message sent to group ${groupId} via "${instance.label}"`);
-          runWorkflows("whatsapp_sent", { ...ctx, groupId, __summary: `WhatsApp (group) via ${instance.label}` });
-        } else {
-          const to = interpolate(p.to || "{{whatsapp}}", ctx) || interpolate("{{studentPhone}}", ctx);
-          if (!to) { log.push("send_whatsapp skipped — no phone number in context"); return; }
-          try {
-            if (mediaUrl) await wabulkifySend("send", { number: to, type: "media", message: text, media_url: mediaUrl, filename: p.filename || undefined, instance_id: instance.instanceId });
-            else await wabulkifySend("send", { number: to, type: "text", message: text, instance_id: instance.instanceId });
-            await logWhatsAppMessage({ instanceId: instance.instanceId, direction: "outgoing", number: to, message: text, status: "sent", source: "workflow" });
-          } catch (err) {
-            await logWhatsAppMessage({ instanceId: instance.instanceId, direction: "outgoing", number: to, message: text, status: "failed", source: "workflow" });
-            throw err;
-          }
-          log.push(`WhatsApp message sent to ${to} via "${instance.label}"`);
-          runWorkflows("whatsapp_sent", { ...ctx, to, __summary: `WhatsApp to ${to} via ${instance.label}` });
-        }
         return;
       }
 
@@ -2877,50 +2749,28 @@ app.delete("/api/admin/settings/whatsapp", protect, adminOnly, async (req, res) 
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-// WABULKIFY — Super Admin → WhatsApp (multiple QR-connected numbers)
+// AI PROVIDER SETTINGS — Super Admin → WhatsApp → AI Bot
 // ══════════════════════════════════════════════════════════════════════════════
 
-// Account-wide access token (same one used for every instance).
-app.get("/api/admin/settings/wabulkify", protect, adminOnly, async (req, res) => {
+// OpenAI API key — powers the WhatsApp AI Bot. Same never-returned-once-
+// saved convention as the other tokens above.
+app.get("/api/admin/settings/openai", protect, adminOnly, async (req, res) => {
   try {
     const settings = await getSiteSettings();
-    res.json({ connected: !!settings.wabulkifyAccessToken });
+    res.json({ connected: !!settings.openaiApiKey });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
-app.post("/api/admin/settings/wabulkify", protect, adminOnly, async (req, res) => {
-  try {
-    const { accessToken } = req.body || {};
-    if (!accessToken?.trim()) return res.status(400).json({ message: "Access token is required" });
-    await SiteSettings.findOneAndUpdate({}, { wabulkifyAccessToken: accessToken.trim() }, { upsert: true, sort: { _id: 1 } });
-    res.json({ connected: true });
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-app.delete("/api/admin/settings/wabulkify", protect, adminOnly, async (req, res) => {
-  try {
-    await SiteSettings.findOneAndUpdate({}, { wabulkifyAccessToken: "" }, { sort: { _id: 1 } });
-    res.json({ disconnected: true });
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// Anthropic API key — powers the WhatsApp AI Bot. Same never-returned-once-
-// saved convention as the WhatsApp/WaBulkify tokens above.
-app.get("/api/admin/settings/anthropic", protect, adminOnly, async (req, res) => {
-  try {
-    const settings = await getSiteSettings();
-    res.json({ connected: !!settings.anthropicApiKey });
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-app.post("/api/admin/settings/anthropic", protect, adminOnly, async (req, res) => {
+app.post("/api/admin/settings/openai", protect, adminOnly, async (req, res) => {
   try {
     const { apiKey } = req.body || {};
     if (!apiKey?.trim()) return res.status(400).json({ message: "API key is required" });
-    await SiteSettings.findOneAndUpdate({}, { anthropicApiKey: apiKey.trim() }, { upsert: true, sort: { _id: 1 } });
+    await SiteSettings.findOneAndUpdate({}, { openaiApiKey: apiKey.trim() }, { upsert: true, sort: { _id: 1 } });
     res.json({ connected: true });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
-app.delete("/api/admin/settings/anthropic", protect, adminOnly, async (req, res) => {
+app.delete("/api/admin/settings/openai", protect, adminOnly, async (req, res) => {
   try {
-    await SiteSettings.findOneAndUpdate({}, { anthropicApiKey: "" }, { sort: { _id: 1 } });
+    await SiteSettings.findOneAndUpdate({}, { openaiApiKey: "" }, { sort: { _id: 1 } });
     res.json({ disconnected: true });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
@@ -2957,7 +2807,7 @@ app.post("/api/admin/whatsapp/bot-test", protect, adminOnly, async (req, res) =>
     if (!message?.trim()) return res.status(400).json({ message: "A message is required" });
     const settings = await getBotSettings();
     const conversation = [...(Array.isArray(history) ? history : []), { role: "user", content: message.trim() }];
-    const reply = await callClaude({ systemPrompt: settings.instructions, history: conversation, model: settings.model });
+    const reply = await callOpenAI({ systemPrompt: settings.instructions, history: conversation, model: settings.model });
     res.json({ reply });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
@@ -3096,197 +2946,6 @@ app.post("/api/admin/settings/whatsapp-server-key", protect, adminOnly, async (r
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// List every connected number.
-app.get("/api/admin/whatsapp/instances", protect, adminOnly, async (req, res) => {
-  try {
-    res.json(await WhatsAppInstance.find({}).sort("-createdAt"));
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// "+ Add WhatsApp Number" — registers a number you've already connected
-// directly on WaBulkify's own dashboard. WaBulkify's support team confirmed
-// QR scanning only works on their dashboard (their browser session, not a
-// custom one), so this never calls their create_instance/get_qrcode API —
-// it just saves the Instance ID you give it and points their webhook at it,
-// then the number can be used for sending via the API like any other.
-app.post("/api/admin/whatsapp/instances/manual", protect, adminOnly, async (req, res) => {
-  try {
-    const { label, instanceId } = req.body || {};
-    if (!label?.trim() || !instanceId?.trim()) return res.status(400).json({ message: "Both a name and the Instance ID are required" });
-    const instance = await WhatsAppInstance.create({ label: label.trim(), instanceId: instanceId.trim(), status: "connected" });
-    const webhookUrl = `${process.env.PUBLIC_BASE_URL || ""}/api/whatsapp/webhook`;
-    if (process.env.PUBLIC_BASE_URL) {
-      try { await wabulkifyCall("set_webhook", { webhook_url: webhookUrl, enable: "true", instance_id: instance.instanceId }); }
-      catch (err) { console.error("[WaBulkify] set_webhook failed for manually-added instance:", err.message); }
-    }
-    res.status(201).json(instance);
-  } catch (err) {
-    if (err.code === 11000) return res.status(400).json({ message: "An instance with that ID is already registered here" });
-    res.status(500).json({ message: err.message });
-  }
-});
-
-// NEW: re-enabled per WaBulkify support's latest guidance — calls their
-// documented get_qrcode endpoint for an EXISTING instance (never creates a
-// new one). Honest caveat: WaBulkify told you this needs a "WhatsApp Web
-// Service Server" added on their side, which isn't something visible from
-// this code — if this still comes back as their login-page HTML (same
-// failure as create_instance before), that confirms whatever needs
-// enabling on their account isn't active yet, and the fix has to happen
-// with their support team, not here.
-app.post("/api/admin/whatsapp/instances/:id/qrcode", protect, adminOnly, async (req, res) => {
-  try {
-    const instance = await WhatsAppInstance.findById(req.params.id);
-    if (!instance) return res.status(404).json({ message: "Instance not found" });
-    const { data, raw } = await wabulkifyCall("get_qrcode", { instance_id: instance.instanceId });
-    const qrCode = data.qrcode || data.qr_code || data.qrCode || data.qr || data.base64 || data.image
-      || data?.data?.qrcode || data?.data?.qr_code || data?.data?.base64 || data?.data?.image || null;
-    if (!qrCode) console.error("[WaBulkify] get_qrcode — no QR image field found. Raw response:", raw);
-    res.json({ qrCode, raw: raw?.slice(0, 500) });
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-app.post("/api/admin/whatsapp/instances/:id/reboot", protect, adminOnly, async (req, res) => {
-  try {
-    const instance = await WhatsAppInstance.findById(req.params.id);
-    if (!instance) return res.status(404).json({ message: "Instance not found" });
-    await wabulkifyCall("reboot", { instance_id: instance.instanceId });
-    instance.status = "pending_scan";
-    await instance.save();
-    res.json(instance);
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-app.post("/api/admin/whatsapp/instances/:id/reconnect", protect, adminOnly, async (req, res) => {
-  try {
-    const instance = await WhatsAppInstance.findById(req.params.id);
-    if (!instance) return res.status(404).json({ message: "Instance not found" });
-    await wabulkifyCall("reconnect", { instance_id: instance.instanceId });
-    res.json(instance);
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// Resets on WaBulkify's side (new instance ID, wipes old session) — mirrors
-// that by replacing our stored instanceId too, so the two stay in sync.
-app.post("/api/admin/whatsapp/instances/:id/reset", protect, adminOnly, async (req, res) => {
-  try {
-    const instance = await WhatsAppInstance.findById(req.params.id);
-    if (!instance) return res.status(404).json({ message: "Instance not found" });
-    const { data } = await wabulkifyCall("reset_instance", { instance_id: instance.instanceId });
-    const newInstanceId = extractInstanceId(data) || instance.instanceId;
-    instance.instanceId = newInstanceId;
-    instance.status = "pending_scan";
-    instance.phoneNumber = "";
-    await instance.save();
-    res.json(instance);
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-app.delete("/api/admin/whatsapp/instances/:id", protect, adminOnly, async (req, res) => {
-  try {
-    const instance = await WhatsAppInstance.findByIdAndDelete(req.params.id);
-    if (!instance) return res.status(404).json({ message: "Instance not found" });
-    res.json({ deleted: true });
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// Public — WaBulkify calls this from their servers with connection status,
-// incoming/outgoing messages, disconnects, etc. Not behind auth since
-// WaBulkify can't send your login token; the raw payload is stashed on the
-// instance either way so you can see exactly what it sent if something
-// doesn't parse the way this expects.
-app.post("/api/whatsapp/webhook", async (req, res) => {
-  try {
-    const body = req.body || {};
-    const instanceId = body.instance_id || body.instanceId;
-    if (!instanceId) return res.json({ received: true });
-    const instance = await WhatsAppInstance.findOne({ instanceId });
-    if (!instance) return res.json({ received: true });
-
-    instance.lastStatusPayload = body;
-    const statusText = String(body.status || body.event || "").toLowerCase();
-    if (statusText.includes("connect") && !statusText.includes("disconnect")) instance.status = "connected";
-    else if (statusText.includes("disconnect")) instance.status = "disconnected";
-    if (body.phone || body.number || body.phoneNumber) instance.phoneNumber = body.phone || body.number || body.phoneNumber;
-    await instance.save();
-
-    // NEW: logs an incoming message when this payload looks like one — the
-    // exact field names WaBulkify uses for message events aren't in their
-    // docs, so this checks the field names most WhatsApp Web wrapper APIs
-    // use; the raw payload above is kept regardless, so a message that
-    // doesn't match still isn't lost from view, just not logged as a
-    // structured message here.
-    const messageText = body.message || body.text || body.body;
-    const fromNumber = body.from || body.sender || body.number || body.phone;
-    if (messageText && (statusText.includes("incoming") || statusText.includes("message") || body.type === "incoming")) {
-      await logWhatsAppMessage({ instanceId, direction: "incoming", number: fromNumber || "", message: String(messageText), status: "received", source: "webhook" });
-
-      // NEW: AI Bot auto-reply — only for numbers explicitly opted in
-      // (Super Admin → WhatsApp → AI Bot), so connecting a new number never
-      // silently starts auto-responding. Runs after res.json() below isn't
-      // an option since this needs to happen before responding to
-      // WaBulkify — kept fire-and-forget (not awaited) so the webhook
-      // acknowledges quickly either way; failures are logged, not thrown,
-      // so a broken AI call never turns into a webhook error WaBulkify
-      // might retry.
-      (async () => {
-        try {
-          const botSettings = await getBotSettings();
-          if (!botSettings.enabled || !botSettings.enabledInstanceIds.includes(instanceId) || !fromNumber) return;
-          const history = await buildBotHistory(instanceId, fromNumber, String(messageText));
-          const reply = await callClaude({ systemPrompt: botSettings.instructions, history, model: botSettings.model });
-          if (!reply) return;
-          await wabulkifySend("send", { number: fromNumber, type: "text", message: reply, instance_id: instanceId });
-          await logWhatsAppMessage({ instanceId, direction: "outgoing", number: fromNumber, message: reply, status: "sent", source: "ai_bot" });
-        } catch (err) {
-          console.error("[AI Bot] auto-reply failed:", err.message);
-        }
-      })();
-    }
-
-    res.json({ received: true });
-  } catch (err) {
-    console.error("[WaBulkify webhook] error:", err.message);
-    res.status(500).json({ message: err.message });
-  }
-});
-
-// Manual one-off send — pick any connected number and any recipient and
-// send a real message right now. This is also the simplest way to actually
-// test whether a number is genuinely connected: if this succeeds and the
-// message arrives, it's connected for real, regardless of what the status
-// badge says (that badge is only ever as accurate as WaBulkify's webhook
-// actually is).
-app.post("/api/admin/whatsapp/send", protect, adminOnly, async (req, res) => {
-  try {
-    const { instanceId: docId, recipientType, to, groupId, message } = req.body || {};
-    if (!docId || !message?.trim()) return res.status(400).json({ message: "A number and a message are required" });
-    const instance = await WhatsAppInstance.findById(docId);
-    if (!instance) return res.status(404).json({ message: "Instance not found" });
-
-    if (recipientType === "group") {
-      if (!groupId?.trim()) return res.status(400).json({ message: "Group ID is required" });
-      try {
-        await wabulkifySend("send_group", { group_id: groupId.trim(), type: "text", message: message.trim(), instance_id: instance.instanceId });
-        await logWhatsAppMessage({ instanceId: instance.instanceId, direction: "outgoing", groupId: groupId.trim(), message: message.trim(), status: "sent", source: "manual" });
-      } catch (err) {
-        await logWhatsAppMessage({ instanceId: instance.instanceId, direction: "outgoing", groupId: groupId.trim(), message: message.trim(), status: "failed", source: "manual" });
-        throw err;
-      }
-    } else {
-      if (!to?.trim()) return res.status(400).json({ message: "A recipient number is required" });
-      try {
-        await wabulkifySend("send", { number: to.trim(), type: "text", message: message.trim(), instance_id: instance.instanceId });
-        await logWhatsAppMessage({ instanceId: instance.instanceId, direction: "outgoing", number: to.trim(), message: message.trim(), status: "sent", source: "manual" });
-      } catch (err) {
-        await logWhatsAppMessage({ instanceId: instance.instanceId, direction: "outgoing", number: to.trim(), message: message.trim(), status: "failed", source: "manual" });
-        throw err;
-      }
-    }
-    res.json({ sent: true });
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
 // Message history for one number — real sent/received counts and the
 // actual message list, for Super Admin → WhatsApp → Messages.
 app.get("/api/admin/whatsapp/messages", protect, adminOnly, async (req, res) => {
@@ -3298,6 +2957,38 @@ app.get("/api/admin/whatsapp/messages", protect, adminOnly, async (req, res) => 
     const receivedCount = await WhatsAppMessage.countDocuments({ instanceId, direction: "incoming" });
     const failedCount = await WhatsAppMessage.countDocuments({ instanceId, direction: "outgoing", status: "failed" });
     res.json({ messages, sentCount, receivedCount, failedCount });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CONVERSATIONS — Super Admin → Conversation (proper per-contact chat threads)
+// ══════════════════════════════════════════════════════════════════════════════
+// For now this only covers WhatsApp (via the self-hosted server) — the plan
+// is for this tab to eventually also show email and Messenger threads in
+// the same place, but that's a later step.
+
+// One row per real contact (number) for the chosen number, with their most
+// recent message, newest conversation first.
+app.get("/api/admin/whatsapp/conversations", protect, adminOnly, async (req, res) => {
+  try {
+    const { instanceId } = req.query;
+    if (!instanceId) return res.status(400).json({ message: "instanceId is required" });
+    const threads = await WhatsAppMessage.aggregate([
+      { $match: { instanceId, number: { $ne: "" }, groupId: "" } },
+      { $sort: { createdAt: -1 } },
+      { $group: { _id: "$number", lastMessage: { $first: "$message" }, lastDirection: { $first: "$direction" }, lastAt: { $first: "$createdAt" }, count: { $sum: 1 } } },
+      { $sort: { lastAt: -1 } },
+    ]);
+    res.json(threads.map((t) => ({ number: t._id, lastMessage: t.lastMessage, lastDirection: t.lastDirection, lastAt: t.lastAt, count: t.count })));
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Full back-and-forth with one specific contact, oldest first (natural chat order).
+app.get("/api/admin/whatsapp/conversations/:instanceId/:number", protect, adminOnly, async (req, res) => {
+  try {
+    const { instanceId, number } = req.params;
+    const messages = await WhatsAppMessage.find({ instanceId, number, groupId: "" }).sort("createdAt").limit(500);
+    res.json({ messages });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
