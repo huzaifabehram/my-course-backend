@@ -711,17 +711,15 @@ async function startSelfHostedSession(sessionDoc) {
   // more frequently to help the connection survive longer without an
   // intervening idle-timeout.
   //
-  // syncFullHistory: re-enabled again, paired this time with a real fix to
-  // the likely actual cause of the disconnects — the history-sync handler
-  // below used to write one message at a time with an await'd database
-  // round-trip for each, which for a large history could take long enough
-  // to congest things right when the connection most needs to stay
-  // responsive to WhatsApp's own keep-alive traffic. It's now batched
-  // (one bulk duplicate-check, one bulk insert) instead. I can't promise
-  // this eliminates every possible disconnect — that depends on WhatsApp's
-  // servers and Render's infrastructure too, neither of which I control —
-  // but this addresses the most likely actual mechanism, not just the
-  // setting that happened to correlate with it.
+  // syncFullHistory: back on, one more genuinely different attempt rather
+  // than repeating what already failed twice. New theory: a full history
+  // for an account with a lot of chat history could spike memory usage
+  // high enough that Render's infrastructure kills the whole process
+  // outright — which looks exactly like a sudden disconnect, but is a
+  // different failure than the slow-writes theory the batching fix
+  // targeted last time. The history handler below now processes in small
+  // paced chunks with memory logging around it instead of one giant batch,
+  // which is what actually addresses a memory-spike cause specifically.
   const sock = makeWASocket({ version, auth: state, printQRInTerminal: false, keepAliveIntervalMs: 15000, syncFullHistory: true, logger: pino({ level: "silent" }) });
 
   sock.ev.on("creds.update", saveCreds);
@@ -830,12 +828,9 @@ async function startSelfHostedSession(sessionDoc) {
   // chats can show "Ali Khan" instead of a bare number wherever WhatsApp
   // itself would.
   sock.ev.on("messaging-history.set", async ({ messages, contacts, isLatest }) => {
-    console.log(`[Self-hosted WhatsApp] history sync for "${sessionDoc.label}" — ${messages.length} message(s), ${contacts?.length || 0} contact(s), isLatest=${isLatest}`);
+    const memMB = (process.memoryUsage().rss / 1024 / 1024).toFixed(0);
+    console.log(`[Self-hosted WhatsApp] history sync for "${sessionDoc.label}" — ${messages.length} message(s), ${contacts?.length || 0} contact(s), isLatest=${isLatest}, memory=${memMB}MB`);
 
-    // NEW: batched instead of one-at-a-time with an awaited DB round-trip
-    // per contact/message — a large history could mean thousands of those,
-    // and doing them sequentially is the most likely reason this was slow
-    // enough to interfere with the connection staying responsive.
     if (contacts?.length > 0) {
       const ops = contacts
         .map((c) => ({ id: c.id, name: c.name || c.notify || c.verifiedName || "" }))
@@ -865,14 +860,30 @@ async function startSelfHostedSession(sessionDoc) {
     }
     if (candidates.length === 0) return;
 
-    try {
-      const ids = candidates.map((c) => c.waMessageId).filter(Boolean);
-      const existing = ids.length > 0 ? await WhatsAppMessage.find({ waMessageId: { $in: ids } }).select("waMessageId") : [];
-      const existingIds = new Set(existing.map((e) => e.waMessageId));
-      const toInsert = candidates.filter((c) => !c.waMessageId || !existingIds.has(c.waMessageId));
-      if (toInsert.length > 0) await WhatsAppMessage.insertMany(toInsert, { ordered: false });
-      console.log(`[Self-hosted WhatsApp] history sync for "${sessionDoc.label}" — imported ${toInsert.length} new message(s)`);
-    } catch (err) { console.error("[Self-hosted WhatsApp] history import error:", err.message); }
+    // NEW: processed in small paced chunks instead of one giant batch —
+    // if a memory spike from handling everything at once is what's
+    // actually killing the process (Render's infrastructure force-killing
+    // it looks identical to a sudden disconnect, unlike a normal Baileys-
+    // reported one), spreading the work out over time with pauses between
+    // chunks keeps peak memory far lower than doing it all in one go. The
+    // memory logging here is what will confirm whether this was actually
+    // the mechanism, if this needs to be looked at again.
+    const CHUNK_SIZE = 200;
+    let totalInserted = 0;
+    for (let i = 0; i < candidates.length; i += CHUNK_SIZE) {
+      const chunk = candidates.slice(i, i + CHUNK_SIZE);
+      try {
+        const ids = chunk.map((c) => c.waMessageId).filter(Boolean);
+        const existing = ids.length > 0 ? await WhatsAppMessage.find({ waMessageId: { $in: ids } }).select("waMessageId") : [];
+        const existingIds = new Set(existing.map((e) => e.waMessageId));
+        const toInsert = chunk.filter((c) => !c.waMessageId || !existingIds.has(c.waMessageId));
+        if (toInsert.length > 0) await WhatsAppMessage.insertMany(toInsert, { ordered: false });
+        totalInserted += toInsert.length;
+      } catch (err) { console.error("[Self-hosted WhatsApp] history chunk import error:", err.message); }
+      if (i + CHUNK_SIZE < candidates.length) await new Promise((r) => setTimeout(r, 300)); // brief pause between chunks
+    }
+    const memAfterMB = (process.memoryUsage().rss / 1024 / 1024).toFixed(0);
+    console.log(`[Self-hosted WhatsApp] history sync for "${sessionDoc.label}" — imported ${totalInserted} new message(s), memory now=${memAfterMB}MB`);
   });
 
   // Ongoing contact-name updates — someone getting newly saved in your
