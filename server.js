@@ -631,6 +631,30 @@ async function useMongoAuthState(sessionDoc) {
   };
 }
 
+// Shared by the live incoming-message handler and the history-sync import
+// below, so both always extract text the exact same way — broadened past
+// just plain text/quoted-reply text, since real messages commonly arrive
+// wrapped differently (an image/video caption, a button or list reply,
+// disappearing-message mode, etc.).
+function extractMessageText(msg) {
+  let m = msg.message;
+  if (!m) return "";
+  if (m.ephemeralMessage) m = m.ephemeralMessage.message;
+  if (m.viewOnceMessage) m = m.viewOnceMessage.message;
+  if (m.viewOnceMessageV2) m = m.viewOnceMessageV2.message;
+  return (
+    m.conversation ||
+    m.extendedTextMessage?.text ||
+    m.imageMessage?.caption ||
+    m.videoMessage?.caption ||
+    m.documentMessage?.caption ||
+    m.buttonsResponseMessage?.selectedDisplayText ||
+    m.listResponseMessage?.title ||
+    m.templateButtonReplyMessage?.selectedDisplayText ||
+    ""
+  );
+}
+
 async function startSelfHostedSession(sessionDoc) {
   if (!Baileys) throw new Error("Baileys isn't installed on the server yet");
   const { default: makeWASocket, DisconnectReason, fetchLatestBaileysVersion, useMultiFileAuthState } = Baileys;
@@ -698,52 +722,24 @@ async function startSelfHostedSession(sessionDoc) {
     console.log(`[Self-hosted WhatsApp] messages.upsert fired for "${sessionDoc.label}" — type=${type}, count=${messages.length}`);
     if (type !== "notify") return;
     for (const msg of messages) {
-      // NEW: logs every message BEFORE any filtering — including ones about
-      // to be skipped as fromMe/group/no-content — so if a real incoming
-      // message still isn't showing up after this, the raw shape of
-      // exactly what Baileys handed over is visible in the logs instead of
-      // being a black box. This is deliberately verbose; once incoming
-      // messages are confirmed working, this line can be removed.
-      console.log(`[Self-hosted WhatsApp] raw message — fromMe=${msg.key?.fromMe}, remoteJid=${msg.key?.remoteJid}, messageKeys=${msg.message ? JSON.stringify(Object.keys(msg.message)) : "(no message field)"}`);
       try {
         if (msg.key.fromMe || !msg.message) continue;
         const from = msg.key.remoteJid;
         if (!from || from.endsWith("@g.us")) continue; // skip group messages for the AI bot/logging path here
 
-        // NEW: broadened well past just conversation/extendedTextMessage —
-        // real replies commonly arrive wrapped differently (a reply-to-a-
-        // quoted-message, an image/video with a caption, a button or list
-        // reply, disappearing-message mode, etc.), and the narrower check
-        // silently dropped every one of those, which is almost certainly
-        // why incoming messages weren't showing up at all.
-        let m = msg.message;
-        if (m.ephemeralMessage) m = m.ephemeralMessage.message;
-        if (m.viewOnceMessage) m = m.viewOnceMessage.message;
-        if (m.viewOnceMessageV2) m = m.viewOnceMessageV2.message;
-        const text =
-          m.conversation ||
-          m.extendedTextMessage?.text ||
-          m.imageMessage?.caption ||
-          m.videoMessage?.caption ||
-          m.documentMessage?.caption ||
-          m.buttonsResponseMessage?.selectedDisplayText ||
-          m.listResponseMessage?.title ||
-          m.templateButtonReplyMessage?.selectedDisplayText ||
-          "";
+        const text = extractMessageText(msg);
+        const number = normalizeWaNumber(from.replace("@s.whatsapp.net", ""));
 
         if (!text) {
           // Still log something rather than silently dropping it — an
           // unsupported message type (a sticker, a location pin, a poll
           // vote, etc.) shows up in the thread as this placeholder instead
-          // of just vanishing, and the real type is logged server-side so
-          // it can be added to the list above if it turns out to be common.
-          const messageType = Object.keys(m)[0] || "unknown";
-          console.log(`[Self-hosted WhatsApp] incoming message with no extractable text — type: ${messageType}`);
-          await logWhatsAppMessage({ instanceId: sessionDoc.sessionId, direction: "incoming", number: from.replace("@s.whatsapp.net", ""), message: `[${messageType}]`, status: "received", source: "self_hosted", waMessageId: msg.key.id || "" });
+          // of just vanishing.
+          const messageType = Object.keys(msg.message)[0] || "unknown";
+          await logWhatsAppMessage({ instanceId: sessionDoc.sessionId, direction: "incoming", number, message: `[${messageType}]`, status: "received", source: "self_hosted", waMessageId: msg.key.id || "" });
           continue;
         }
 
-        const number = from.replace("@s.whatsapp.net", "");
         await logWhatsAppMessage({ instanceId: sessionDoc.sessionId, direction: "incoming", number, message: text, status: "received", source: "self_hosted", waMessageId: msg.key.id || "" });
 
         const botSettings = await getBotSettings();
@@ -756,6 +752,39 @@ async function startSelfHostedSession(sessionDoc) {
           }
         }
       } catch (err) { console.error("[Self-hosted WhatsApp] incoming message handling failed:", err.message); }
+    }
+  });
+
+  // NEW: imports WhatsApp's own message history — this is what makes prior
+  // conversations (that existed before this number connected here) show up
+  // instead of the thread starting empty. Baileys fires this on initial
+  // connect with whatever history WhatsApp's servers hand over (how much
+  // is decided by WhatsApp, not configurable here since syncFullHistory
+  // was removed for being a stability risk — this just imports whatever
+  // comes through by default). waMessageId is used to avoid importing the
+  // same message twice across multiple syncs/reconnects.
+  sock.ev.on("messaging-history.set", async ({ messages, isLatest }) => {
+    console.log(`[Self-hosted WhatsApp] history sync for "${sessionDoc.label}" — ${messages.length} message(s), isLatest=${isLatest}`);
+    for (const msg of messages) {
+      try {
+        if (!msg.message || !msg.key?.remoteJid) continue;
+        const from = msg.key.remoteJid;
+        if (from.endsWith("@g.us")) continue; // groups skipped here too, same as the live handler
+        if (msg.key.id) {
+          const already = await WhatsAppMessage.findOne({ waMessageId: msg.key.id });
+          if (already) continue;
+        }
+        const text = extractMessageText(msg);
+        if (!text) continue; // history items with no plain text are skipped rather than filling the thread with placeholders
+        const number = normalizeWaNumber(from.replace("@s.whatsapp.net", ""));
+        const direction = msg.key.fromMe ? "outgoing" : "incoming";
+        await WhatsAppMessage.create({
+          instanceId: sessionDoc.sessionId, direction, number, message: text,
+          status: direction === "outgoing" ? "sent" : "received", source: "history_sync",
+          waMessageId: msg.key.id || "",
+          createdAt: msg.messageTimestamp ? new Date(Number(msg.messageTimestamp) * 1000) : new Date(),
+        });
+      } catch (err) { console.error("[Self-hosted WhatsApp] history import error:", err.message); }
     }
   });
 
@@ -776,9 +805,19 @@ async function startAllSelfHostedSessions() {
   } catch (err) { console.error("[Self-hosted WhatsApp] startup scan failed:", err.message); }
 }
 
+// The one canonical number format used everywhere a number is stored on a
+// WhatsAppMessage — digits only, no "+", no spaces/dashes. This is what
+// fixes conversations splitting into two threads for the same person: an
+// outgoing message used to store exactly whatever was typed (which could
+// include a "+"), while an incoming reply's number came from WhatsApp's own
+// JID (which never has one) — two different strings for the same contact.
+// Every write path below now normalizes through this before storing.
+function normalizeWaNumber(number) {
+  return String(number).replace(/[^\d]/g, "");
+}
+
 function toWhatsAppJid(number) {
-  const digits = String(number).replace(/[^\d]/g, "");
-  return `${digits}@s.whatsapp.net`;
+  return `${normalizeWaNumber(number)}@s.whatsapp.net`;
 }
 
 async function sendSelfHostedMessage(sessionId, number, text) {
@@ -797,10 +836,10 @@ async function runBulkJob(jobId, sessionId, numbers, message) {
   for (const number of numbers) {
     try {
       await sendSelfHostedMessage(sessionId, number, message);
-      await logWhatsAppMessage({ instanceId: sessionId, direction: "outgoing", number, message, status: "sent", source: "bulk" });
+      await logWhatsAppMessage({ instanceId: sessionId, direction: "outgoing", number: normalizeWaNumber(number), message, status: "sent", source: "bulk" });
       results.push({ number, success: true, error: "" });
     } catch (err) {
-      await logWhatsAppMessage({ instanceId: sessionId, direction: "outgoing", number, message, status: "failed", source: "bulk" });
+      await logWhatsAppMessage({ instanceId: sessionId, direction: "outgoing", number: normalizeWaNumber(number), message, status: "failed", source: "bulk" });
       results.push({ number, success: false, error: err.message });
     }
     await WhatsAppBulkJob.findByIdAndUpdate(jobId, { results });
@@ -1179,9 +1218,9 @@ async function runAction(step, ctx, log, workflowId) {
         if (!to) { log.push("send_whatsapp skipped — no phone number in context"); return; }
         try {
           await sendSelfHostedMessage(session.sessionId, to, text);
-          await logWhatsAppMessage({ instanceId: session.sessionId, direction: "outgoing", number: to, message: text, status: "sent", source: "workflow" });
+          await logWhatsAppMessage({ instanceId: session.sessionId, direction: "outgoing", number: normalizeWaNumber(to), message: text, status: "sent", source: "workflow" });
         } catch (err) {
-          await logWhatsAppMessage({ instanceId: session.sessionId, direction: "outgoing", number: to, message: text, status: "failed", source: "workflow" });
+          await logWhatsAppMessage({ instanceId: session.sessionId, direction: "outgoing", number: normalizeWaNumber(to), message: text, status: "failed", source: "workflow" });
           throw err;
         }
         log.push(`WhatsApp message sent to ${to} via "${session.label}" (self-hosted)`);
@@ -2956,9 +2995,9 @@ app.post("/api/admin/whatsapp-server/send", protect, adminOnly, requireBaileys, 
     if (!session) return res.status(404).json({ message: "Session not found" });
     try {
       await sendSelfHostedMessage(session.sessionId, to.trim(), message.trim());
-      await logWhatsAppMessage({ instanceId: session.sessionId, direction: "outgoing", number: to.trim(), message: message.trim(), status: "sent", source: "manual" });
+      await logWhatsAppMessage({ instanceId: session.sessionId, direction: "outgoing", number: normalizeWaNumber(to), message: message.trim(), status: "sent", source: "manual" });
     } catch (err) {
-      await logWhatsAppMessage({ instanceId: session.sessionId, direction: "outgoing", number: to.trim(), message: message.trim(), status: "failed", source: "manual" });
+      await logWhatsAppMessage({ instanceId: session.sessionId, direction: "outgoing", number: normalizeWaNumber(to), message: message.trim(), status: "failed", source: "manual" });
       throw err;
     }
     res.json({ sent: true });
@@ -3002,7 +3041,7 @@ app.post("/api/whatsapp-server/external/send", requireBaileys, async (req, res) 
       return res.status(401).json({ message: "Invalid API key" });
     if (!sessionId || !to?.trim() || !message?.trim()) return res.status(400).json({ message: "sessionId, to, and message are required" });
     await sendSelfHostedMessage(sessionId, to.trim(), message.trim());
-    await logWhatsAppMessage({ instanceId: sessionId, direction: "outgoing", number: to.trim(), message: message.trim(), status: "sent", source: "external_api" });
+    await logWhatsAppMessage({ instanceId: sessionId, direction: "outgoing", number: normalizeWaNumber(to), message: message.trim(), status: "sent", source: "external_api" });
     res.json({ sent: true });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
@@ -3062,7 +3101,7 @@ app.get("/api/admin/whatsapp/conversations", protect, adminOnly, async (req, res
 app.get("/api/admin/whatsapp/conversations/:instanceId/:number", protect, adminOnly, async (req, res) => {
   try {
     const { instanceId, number } = req.params;
-    const messages = await WhatsAppMessage.find({ instanceId, number, groupId: "" }).sort("createdAt").limit(500);
+    const messages = await WhatsAppMessage.find({ instanceId, number: normalizeWaNumber(number), groupId: "" }).sort("createdAt").limit(500);
     res.json({ messages });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
@@ -3112,6 +3151,24 @@ app.get("/api/admin/whatsapp/presence/:instanceId/:number", protect, adminOnly, 
       sock.presenceSubscribe(jid).catch(() => { clearTimeout(timeout); resolve(null); });
     });
     res.json({ presence });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// WhatsApp "About" text — real Baileys method (sock.fetchStatus). Like the
+// profile photo, this can come back empty if the contact hides it in their
+// privacy settings — that's expected, not an error.
+app.get("/api/admin/whatsapp/about/:instanceId/:number", protect, adminOnly, async (req, res) => {
+  try {
+    const { instanceId, number } = req.params;
+    const sock = activeSelfHostedSockets.get(instanceId);
+    if (!sock) return res.status(404).json({ message: "This number isn't connected right now" });
+    const jid = toWhatsAppJid(number);
+    try {
+      const result = await sock.fetchStatus(jid);
+      res.json({ status: result?.status || "", setAt: result?.setAt || null });
+    } catch {
+      res.json({ status: "", setAt: null });
+    }
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
