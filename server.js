@@ -649,23 +649,35 @@ async function startSelfHostedSession(sessionDoc) {
   sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
     if (qr) {
+      console.log(`[Self-hosted WhatsApp] "${sessionDoc.label}" — new QR issued`);
       await WhatsAppSelfSession.findByIdAndUpdate(sessionDoc._id, { lastQr: qr, status: "pending_qr" });
     }
     if (connection === "open") {
       const phoneNumber = sock.user?.id ? sock.user.id.split(":")[0] : "";
+      console.log(`[Self-hosted WhatsApp] "${sessionDoc.label}" — connected (${phoneNumber})`);
       await WhatsAppSelfSession.findByIdAndUpdate(sessionDoc._id, { status: "connected", phoneNumber, lastQr: "" });
     }
     if (connection === "close") {
       activeSelfHostedSockets.delete(sessionDoc.sessionId);
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       const loggedOut = statusCode === DisconnectReason.loggedOut;
+      // NEW: this is the log line that actually explains what's happening
+      // on every redeploy — WHY it disconnected (statusCode 401 = logged
+      // out for real, 428/440 = connection replaced by another session
+      // using the same credentials, 515 = normal restart-required close,
+      // etc.), so a repeated pattern here (rather than one clean
+      // reconnect) is visible instead of silent.
+      console.log(`[Self-hosted WhatsApp] "${sessionDoc.label}" — disconnected. statusCode=${statusCode}, loggedOut=${loggedOut}, reason=${lastDisconnect?.error?.message || "unknown"}`);
       await WhatsAppSelfSession.findByIdAndUpdate(sessionDoc._id, { status: "disconnected" });
       if (!loggedOut) {
         // Real disconnect (not an explicit logout) — try again shortly using
         // the same saved credentials.
+        console.log(`[Self-hosted WhatsApp] "${sessionDoc.label}" — will attempt reconnect in 5s`);
         setTimeout(() => {
           WhatsAppSelfSession.findById(sessionDoc._id).then((fresh) => { if (fresh) startSelfHostedSession(fresh).catch((err) => console.error("[Self-hosted WhatsApp] reconnect failed:", err.message)); });
         }, 5000);
+      } else {
+        console.log(`[Self-hosted WhatsApp] "${sessionDoc.label}" — logged out for real (401); this needs a fresh QR scan, not a reconnect.`);
       }
     }
   });
@@ -744,9 +756,10 @@ async function startSelfHostedSession(sessionDoc) {
 // opens. pending_qr sessions are left alone; those need an explicit "Show
 // QR" click since they never finished authenticating in the first place.
 async function startAllSelfHostedSessions() {
-  if (!Baileys) return;
+  if (!Baileys) { console.log("[Self-hosted WhatsApp] Baileys not installed — skipping startup reconnect"); return; }
   try {
     const sessions = await WhatsAppSelfSession.find({ status: { $in: ["connected", "disconnected"] } });
+    console.log(`[Self-hosted WhatsApp] startup — found ${sessions.length} session(s) to reconnect: ${sessions.map((s) => s.label).join(", ") || "(none)"}`);
     for (const s of sessions) startSelfHostedSession(s).catch((err) => console.error("[Self-hosted WhatsApp] startup reconnect failed for", s.label, ":", err.message));
   } catch (err) { console.error("[Self-hosted WhatsApp] startup scan failed:", err.message); }
 }
