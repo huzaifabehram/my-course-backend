@@ -637,12 +637,11 @@ async function startSelfHostedSession(sessionDoc) {
   const { state, saveCreds } = await useMongoAuthState(sessionDoc);
   const { version } = await fetchLatestBaileysVersion();
   const pino = require("pino"); // installed transitively as a Baileys dependency
-  // NEW: syncFullHistory requests WhatsApp's fuller history sync on
-  // connect (closer to what WhatsApp Web itself shows when you first scan
-  // there) rather than Baileys' more limited default. Real Baileys socket
-  // option, but how much history actually comes back is still ultimately
-  // decided by WhatsApp's servers, not something this can force.
-  const sock = makeWASocket({ version, auth: state, printQRInTerminal: false, syncFullHistory: true, logger: pino({ level: "silent" }) });
+  // Deliberately using Baileys' plain defaults here — no syncFullHistory,
+  // no extra options. Requesting full history sync is known to be slow and
+  // can destabilize the connection during the critical first-connect
+  // window; the plain default is the well-tested, stable path.
+  const sock = makeWASocket({ version, auth: state, printQRInTerminal: false, logger: pino({ level: "silent" }) });
 
   sock.ev.on("creds.update", saveCreds);
 
