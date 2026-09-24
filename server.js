@@ -516,6 +516,15 @@ const WhatsAppMessageSchema = new mongoose.Schema({
   // re-importing a message that's already been logged (live, or from an
   // earlier sync), and matches WhatsApp's own de-duplication.
   waMessageId: { type: String, default: "" },
+  // NEW: the exact WhatsApp identifier this message came from/went to —
+  // either a real phone-number JID (...@s.whatsapp.net) or, for contacts
+  // WhatsApp has moved to its newer privacy-ID system, a "LID"
+  // (...@lid, an internal ID that looks like a random number). Replies
+  // use this exact value rather than reconstructing one from `number`,
+  // so a reply always reaches the same identifier the message came from —
+  // this is what fixes sending failing on chats that started as an
+  // incoming LID-based message.
+  jid: { type: String, default: "" },
 }, { timestamps: true });
 const WhatsAppMessage = mongoose.model("WhatsAppMessage", WhatsAppMessageSchema);
 
@@ -678,7 +687,15 @@ async function startSelfHostedSession(sessionDoc) {
   const { state, saveCreds } = await useMultiFileAuthState(sessionFolder);
   const { version } = await fetchLatestBaileysVersion();
   const pino = require("pino"); // installed transitively as a Baileys dependency
-  const sock = makeWASocket({ version, auth: state, printQRInTerminal: false, logger: pino({ level: "silent" }) });
+  // keepAliveIntervalMs tightened from Baileys' default — sends a ping
+  // more frequently to help the connection survive longer without an
+  // intervening idle-timeout. Being honest about this: a disconnect every
+  // 30-40 minutes specifically is a longer, more consistent pattern than
+  // a failing keep-alive would usually produce (that tends to fail much
+  // faster), so this alone may not be the whole fix — the disconnect-
+  // reason logging already in place below is what will actually show the
+  // real cause (statusCode/reason) the next time it happens.
+  const sock = makeWASocket({ version, auth: state, printQRInTerminal: false, keepAliveIntervalMs: 15000, logger: pino({ level: "silent" }) });
 
   sock.ev.on("creds.update", saveCreds);
 
@@ -724,11 +741,11 @@ async function startSelfHostedSession(sessionDoc) {
     for (const msg of messages) {
       try {
         if (msg.key.fromMe || !msg.message) continue;
-        const from = msg.key.remoteJid;
-        if (!from || from.endsWith("@g.us")) continue; // skip group messages for the AI bot/logging path here
+        if (msg.key.remoteJid?.endsWith("@g.us")) continue; // skip group messages for the AI bot/logging path here
 
+        const { jid, displayNumber } = resolveMessageIdentity(msg.key);
+        if (!jid) continue;
         const text = extractMessageText(msg);
-        const number = normalizeWaNumber(from.replace("@s.whatsapp.net", ""));
 
         if (!text) {
           // Still log something rather than silently dropping it — an
@@ -736,19 +753,19 @@ async function startSelfHostedSession(sessionDoc) {
           // vote, etc.) shows up in the thread as this placeholder instead
           // of just vanishing.
           const messageType = Object.keys(msg.message)[0] || "unknown";
-          await logWhatsAppMessage({ instanceId: sessionDoc.sessionId, direction: "incoming", number, message: `[${messageType}]`, status: "received", source: "self_hosted", waMessageId: msg.key.id || "" });
+          await logWhatsAppMessage({ instanceId: sessionDoc.sessionId, direction: "incoming", number: displayNumber, jid, message: `[${messageType}]`, status: "received", source: "self_hosted", waMessageId: msg.key.id || "" });
           continue;
         }
 
-        await logWhatsAppMessage({ instanceId: sessionDoc.sessionId, direction: "incoming", number, message: text, status: "received", source: "self_hosted", waMessageId: msg.key.id || "" });
+        await logWhatsAppMessage({ instanceId: sessionDoc.sessionId, direction: "incoming", number: displayNumber, jid, message: text, status: "received", source: "self_hosted", waMessageId: msg.key.id || "" });
 
         const botSettings = await getBotSettings();
         if (botSettings.enabled && botSettings.enabledInstanceIds.includes(sessionDoc.sessionId)) {
-          const history = await buildBotHistory(sessionDoc.sessionId, number, text);
+          const history = await buildBotHistory(sessionDoc.sessionId, displayNumber, text);
           const reply = await callOpenAI({ systemPrompt: botSettings.instructions, history, model: botSettings.model });
           if (reply) {
-            await sock.sendMessage(from, { text: reply });
-            await logWhatsAppMessage({ instanceId: sessionDoc.sessionId, direction: "outgoing", number, message: reply, status: "sent", source: "ai_bot" });
+            await sock.sendMessage(jid, { text: reply });
+            await logWhatsAppMessage({ instanceId: sessionDoc.sessionId, direction: "outgoing", number: displayNumber, jid, message: reply, status: "sent", source: "ai_bot" });
           }
         }
       } catch (err) { console.error("[Self-hosted WhatsApp] incoming message handling failed:", err.message); }
@@ -768,18 +785,18 @@ async function startSelfHostedSession(sessionDoc) {
     for (const msg of messages) {
       try {
         if (!msg.message || !msg.key?.remoteJid) continue;
-        const from = msg.key.remoteJid;
-        if (from.endsWith("@g.us")) continue; // groups skipped here too, same as the live handler
+        if (msg.key.remoteJid.endsWith("@g.us")) continue; // groups skipped here too, same as the live handler
         if (msg.key.id) {
           const already = await WhatsAppMessage.findOne({ waMessageId: msg.key.id });
           if (already) continue;
         }
         const text = extractMessageText(msg);
         if (!text) continue; // history items with no plain text are skipped rather than filling the thread with placeholders
-        const number = normalizeWaNumber(from.replace("@s.whatsapp.net", ""));
+        const { jid, displayNumber } = resolveMessageIdentity(msg.key);
+        if (!jid) continue;
         const direction = msg.key.fromMe ? "outgoing" : "incoming";
         await WhatsAppMessage.create({
-          instanceId: sessionDoc.sessionId, direction, number, message: text,
+          instanceId: sessionDoc.sessionId, direction, number: displayNumber, jid, message: text,
           status: direction === "outgoing" ? "sent" : "received", source: "history_sync",
           waMessageId: msg.key.id || "",
           createdAt: msg.messageTimestamp ? new Date(Number(msg.messageTimestamp) * 1000) : new Date(),
@@ -820,10 +837,39 @@ function toWhatsAppJid(number) {
   return `${normalizeWaNumber(number)}@s.whatsapp.net`;
 }
 
-async function sendSelfHostedMessage(sessionId, number, text) {
+// Resolves the real WhatsApp identifier and a human-readable display number
+// from a message key. Some contacts use WhatsApp's newer "LID" privacy-ID
+// system (remoteJid ending in @lid — an internal ID that looks like a
+// random number) instead of their real phone number; Baileys exposes the
+// actual phone-number JID for these via remoteJidAlt when it's available.
+// jid is always the exact identifier to reply to — replying to the LID
+// itself (the identifier the message actually came from) is what actually
+// reaches the contact; displayNumber is the best-effort human-readable
+// number, honestly labeled "lid:..." rather than shown as a fake phone
+// number when a real one genuinely can't be determined.
+function resolveMessageIdentity(key) {
+  const jid = key.remoteJid;
+  const altJid = key.remoteJidAlt;
+  if (jid && jid.endsWith("@s.whatsapp.net")) {
+    return { jid, displayNumber: normalizeWaNumber(jid.replace("@s.whatsapp.net", "")) };
+  }
+  if (altJid && altJid.endsWith("@s.whatsapp.net")) {
+    return { jid, displayNumber: normalizeWaNumber(altJid.replace("@s.whatsapp.net", "")) };
+  }
+  const lidDigits = jid ? jid.replace("@lid", "").replace(/[^\d]/g, "") : "";
+  return { jid: jid || "", displayNumber: lidDigits ? `lid:${lidDigits}` : "" };
+}
+
+async function sendSelfHostedMessage(sessionId, target, text) {
   const sock = activeSelfHostedSockets.get(sessionId);
   if (!sock) throw new Error("This number isn't connected right now");
-  await sock.sendMessage(toWhatsAppJid(number), { text });
+  // target can be a plain number (a phone-number JID gets constructed) or
+  // an already-complete JID (used exactly as given) — replying within an
+  // existing thread passes the exact stored jid, which is what makes
+  // replies reach LID-based contacts correctly instead of assuming every
+  // contact uses a phone-number JID.
+  const jid = String(target).includes("@") ? target : toWhatsAppJid(target);
+  await sock.sendMessage(jid, { text });
 }
 
 // Runs in the background (not awaited by the route that starts it) — sends
@@ -2993,11 +3039,19 @@ app.post("/api/admin/whatsapp-server/send", protect, adminOnly, requireBaileys, 
     if (!sessionDocId || !to?.trim() || !message?.trim()) return res.status(400).json({ message: "A number and a message are required" });
     const session = await WhatsAppSelfSession.findById(sessionDocId);
     if (!session) return res.status(404).json({ message: "Session not found" });
+    const displayNumber = normalizeWaNumber(to);
+    // If this contact has messaged before, reply to the exact identifier
+    // their messages came from rather than reconstructing a phone-number
+    // JID — this is what makes replying work for contacts WhatsApp has
+    // moved to its "LID" privacy-ID system, where a phone-number-based JID
+    // simply doesn't reach them.
+    const priorMessage = await WhatsAppMessage.findOne({ instanceId: session.sessionId, number: displayNumber, jid: { $ne: "" } }).sort("-createdAt");
+    const sendTarget = priorMessage?.jid || to.trim();
     try {
-      await sendSelfHostedMessage(session.sessionId, to.trim(), message.trim());
-      await logWhatsAppMessage({ instanceId: session.sessionId, direction: "outgoing", number: normalizeWaNumber(to), message: message.trim(), status: "sent", source: "manual" });
+      await sendSelfHostedMessage(session.sessionId, sendTarget, message.trim());
+      await logWhatsAppMessage({ instanceId: session.sessionId, direction: "outgoing", number: displayNumber, jid: sendTarget.includes("@") ? sendTarget : toWhatsAppJid(sendTarget), message: message.trim(), status: "sent", source: "manual" });
     } catch (err) {
-      await logWhatsAppMessage({ instanceId: session.sessionId, direction: "outgoing", number: normalizeWaNumber(to), message: message.trim(), status: "failed", source: "manual" });
+      await logWhatsAppMessage({ instanceId: session.sessionId, direction: "outgoing", number: displayNumber, message: message.trim(), status: "failed", source: "manual" });
       throw err;
     }
     res.json({ sent: true });
@@ -3101,7 +3155,12 @@ app.get("/api/admin/whatsapp/conversations", protect, adminOnly, async (req, res
 app.get("/api/admin/whatsapp/conversations/:instanceId/:number", protect, adminOnly, async (req, res) => {
   try {
     const { instanceId, number } = req.params;
-    const messages = await WhatsAppMessage.find({ instanceId, number: normalizeWaNumber(number), groupId: "" }).sort("createdAt").limit(500);
+    // NEW: no longer re-normalizing this — normalizeWaNumber strips
+    // non-digit characters, which corrupts a "lid:12345" identifier
+    // (stripping the "lid:" prefix) so it no longer matches what's
+    // actually stored. The frontend already passes back the exact
+    // `number` value the thread list gave it, which is already canonical.
+    const messages = await WhatsAppMessage.find({ instanceId, number, groupId: "" }).sort("createdAt").limit(500);
     res.json({ messages });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
@@ -3110,12 +3169,22 @@ app.get("/api/admin/whatsapp/conversations/:instanceId/:number", protect, adminO
 // number="me" for the connected business number's own photo. Baileys
 // throws when there's no photo set or the person's privacy settings hide
 // it from you — either way that's "no photo available", not a real error.
+// Looks up the exact jid to use for a displayNumber (which might be a real
+// phone number OR a "lid:xxxxx" label) by checking a prior message from
+// that contact — same lookup the /send route uses. Falls back to
+// constructing a phone-number JID only when there's no prior message to
+// learn the real jid from.
+async function resolveJidForNumber(instanceId, number) {
+  const prior = await WhatsAppMessage.findOne({ instanceId, number, jid: { $ne: "" } }).sort("-createdAt");
+  return prior?.jid || toWhatsAppJid(number);
+}
+
 app.get("/api/admin/whatsapp/profile-photo/:instanceId/:number", protect, adminOnly, async (req, res) => {
   try {
     const { instanceId, number } = req.params;
     const sock = activeSelfHostedSockets.get(instanceId);
     if (!sock) return res.status(404).json({ message: "This number isn't connected right now" });
-    const jid = number === "me" ? sock.user?.id : toWhatsAppJid(number);
+    const jid = number === "me" ? sock.user?.id : await resolveJidForNumber(instanceId, number);
     if (!jid) return res.json({ url: null });
     try {
       const url = await sock.profilePictureUrl(jid, "image");
@@ -3138,7 +3207,7 @@ app.get("/api/admin/whatsapp/presence/:instanceId/:number", protect, adminOnly, 
     const { instanceId, number } = req.params;
     const sock = activeSelfHostedSockets.get(instanceId);
     if (!sock) return res.status(404).json({ message: "This number isn't connected right now" });
-    const jid = toWhatsAppJid(number);
+    const jid = await resolveJidForNumber(instanceId, number);
     const presence = await new Promise((resolve) => {
       const timeout = setTimeout(() => { sock.ev.off("presence.update", handler); resolve(null); }, 4000);
       const handler = (update) => {
@@ -3162,7 +3231,7 @@ app.get("/api/admin/whatsapp/about/:instanceId/:number", protect, adminOnly, asy
     const { instanceId, number } = req.params;
     const sock = activeSelfHostedSockets.get(instanceId);
     if (!sock) return res.status(404).json({ message: "This number isn't connected right now" });
-    const jid = toWhatsAppJid(number);
+    const jid = await resolveJidForNumber(instanceId, number);
     try {
       const result = await sock.fetchStatus(jid);
       res.json({ status: result?.status || "", setAt: result?.setAt || null });
