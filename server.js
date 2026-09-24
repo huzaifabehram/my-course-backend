@@ -511,7 +511,11 @@ const WhatsAppMessageSchema = new mongoose.Schema({
   groupId:    { type: String, default: "" }, // set instead of number for group messages
   message:    { type: String, default: "" },
   status:     { type: String, enum: ["sent", "failed", "received"], default: "sent" },
-  source:     { type: String, default: "" }, // "workflow" | "manual" | "webhook"
+  source:     { type: String, default: "" }, // "workflow" | "manual" | "webhook" | "history_sync"
+  // NEW: Baileys' own message ID (msg.key.id) — lets history-sync avoid
+  // re-importing a message that's already been logged (live, or from an
+  // earlier sync), and matches WhatsApp's own de-duplication.
+  waMessageId: { type: String, default: "" },
 }, { timestamps: true });
 const WhatsAppMessage = mongoose.model("WhatsAppMessage", WhatsAppMessageSchema);
 
@@ -633,7 +637,12 @@ async function startSelfHostedSession(sessionDoc) {
   const { state, saveCreds } = await useMongoAuthState(sessionDoc);
   const { version } = await fetchLatestBaileysVersion();
   const pino = require("pino"); // installed transitively as a Baileys dependency
-  const sock = makeWASocket({ version, auth: state, printQRInTerminal: false, logger: pino({ level: "silent" }) });
+  // NEW: syncFullHistory requests WhatsApp's fuller history sync on
+  // connect (closer to what WhatsApp Web itself shows when you first scan
+  // there) rather than Baileys' more limited default. Real Baileys socket
+  // option, but how much history actually comes back is still ultimately
+  // decided by WhatsApp's servers, not something this can force.
+  const sock = makeWASocket({ version, auth: state, printQRInTerminal: false, syncFullHistory: true, logger: pino({ level: "silent" }) });
 
   sock.ev.on("creds.update", saveCreds);
 
@@ -665,6 +674,13 @@ async function startSelfHostedSession(sessionDoc) {
     console.log(`[Self-hosted WhatsApp] messages.upsert fired for "${sessionDoc.label}" — type=${type}, count=${messages.length}`);
     if (type !== "notify") return;
     for (const msg of messages) {
+      // NEW: logs every message BEFORE any filtering — including ones about
+      // to be skipped as fromMe/group/no-content — so if a real incoming
+      // message still isn't showing up after this, the raw shape of
+      // exactly what Baileys handed over is visible in the logs instead of
+      // being a black box. This is deliberately verbose; once incoming
+      // messages are confirmed working, this line can be removed.
+      console.log(`[Self-hosted WhatsApp] raw message — fromMe=${msg.key?.fromMe}, remoteJid=${msg.key?.remoteJid}, messageKeys=${msg.message ? JSON.stringify(Object.keys(msg.message)) : "(no message field)"}`);
       try {
         if (msg.key.fromMe || !msg.message) continue;
         const from = msg.key.remoteJid;
@@ -699,12 +715,12 @@ async function startSelfHostedSession(sessionDoc) {
           // it can be added to the list above if it turns out to be common.
           const messageType = Object.keys(m)[0] || "unknown";
           console.log(`[Self-hosted WhatsApp] incoming message with no extractable text — type: ${messageType}`);
-          await logWhatsAppMessage({ instanceId: sessionDoc.sessionId, direction: "incoming", number: from.replace("@s.whatsapp.net", ""), message: `[${messageType}]`, status: "received", source: "self_hosted" });
+          await logWhatsAppMessage({ instanceId: sessionDoc.sessionId, direction: "incoming", number: from.replace("@s.whatsapp.net", ""), message: `[${messageType}]`, status: "received", source: "self_hosted", waMessageId: msg.key.id || "" });
           continue;
         }
 
         const number = from.replace("@s.whatsapp.net", "");
-        await logWhatsAppMessage({ instanceId: sessionDoc.sessionId, direction: "incoming", number, message: text, status: "received", source: "self_hosted" });
+        await logWhatsAppMessage({ instanceId: sessionDoc.sessionId, direction: "incoming", number, message: text, status: "received", source: "self_hosted", waMessageId: msg.key.id || "" });
 
         const botSettings = await getBotSettings();
         if (botSettings.enabled && botSettings.enabledInstanceIds.includes(sessionDoc.sessionId)) {
