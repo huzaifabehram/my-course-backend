@@ -662,13 +662,47 @@ async function startSelfHostedSession(sessionDoc) {
   });
 
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
+    console.log(`[Self-hosted WhatsApp] messages.upsert fired for "${sessionDoc.label}" — type=${type}, count=${messages.length}`);
     if (type !== "notify") return;
     for (const msg of messages) {
       try {
         if (msg.key.fromMe || !msg.message) continue;
-        const text = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
         const from = msg.key.remoteJid;
-        if (!text || !from || from.endsWith("@g.us")) continue; // skip group messages for the AI bot/logging path here
+        if (!from || from.endsWith("@g.us")) continue; // skip group messages for the AI bot/logging path here
+
+        // NEW: broadened well past just conversation/extendedTextMessage —
+        // real replies commonly arrive wrapped differently (a reply-to-a-
+        // quoted-message, an image/video with a caption, a button or list
+        // reply, disappearing-message mode, etc.), and the narrower check
+        // silently dropped every one of those, which is almost certainly
+        // why incoming messages weren't showing up at all.
+        let m = msg.message;
+        if (m.ephemeralMessage) m = m.ephemeralMessage.message;
+        if (m.viewOnceMessage) m = m.viewOnceMessage.message;
+        if (m.viewOnceMessageV2) m = m.viewOnceMessageV2.message;
+        const text =
+          m.conversation ||
+          m.extendedTextMessage?.text ||
+          m.imageMessage?.caption ||
+          m.videoMessage?.caption ||
+          m.documentMessage?.caption ||
+          m.buttonsResponseMessage?.selectedDisplayText ||
+          m.listResponseMessage?.title ||
+          m.templateButtonReplyMessage?.selectedDisplayText ||
+          "";
+
+        if (!text) {
+          // Still log something rather than silently dropping it — an
+          // unsupported message type (a sticker, a location pin, a poll
+          // vote, etc.) shows up in the thread as this placeholder instead
+          // of just vanishing, and the real type is logged server-side so
+          // it can be added to the list above if it turns out to be common.
+          const messageType = Object.keys(m)[0] || "unknown";
+          console.log(`[Self-hosted WhatsApp] incoming message with no extractable text — type: ${messageType}`);
+          await logWhatsAppMessage({ instanceId: sessionDoc.sessionId, direction: "incoming", number: from.replace("@s.whatsapp.net", ""), message: `[${messageType}]`, status: "received", source: "self_hosted" });
+          continue;
+        }
+
         const number = from.replace("@s.whatsapp.net", "");
         await logWhatsAppMessage({ instanceId: sessionDoc.sessionId, direction: "incoming", number, message: text, status: "received", source: "self_hosted" });
 
@@ -2989,6 +3023,54 @@ app.get("/api/admin/whatsapp/conversations/:instanceId/:number", protect, adminO
     const { instanceId, number } = req.params;
     const messages = await WhatsAppMessage.find({ instanceId, number, groupId: "" }).sort("createdAt").limit(500);
     res.json({ messages });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Profile photo — real Baileys method (sock.profilePictureUrl). Pass
+// number="me" for the connected business number's own photo. Baileys
+// throws when there's no photo set or the person's privacy settings hide
+// it from you — either way that's "no photo available", not a real error.
+app.get("/api/admin/whatsapp/profile-photo/:instanceId/:number", protect, adminOnly, async (req, res) => {
+  try {
+    const { instanceId, number } = req.params;
+    const sock = activeSelfHostedSockets.get(instanceId);
+    if (!sock) return res.status(404).json({ message: "This number isn't connected right now" });
+    const jid = number === "me" ? sock.user?.id : toWhatsAppJid(number);
+    if (!jid) return res.json({ url: null });
+    try {
+      const url = await sock.profilePictureUrl(jid, "image");
+      res.json({ url });
+    } catch {
+      res.json({ url: null });
+    }
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Last seen / online status — presence in Baileys arrives as a pushed
+// event, not a plain request/response value, so this subscribes and waits
+// briefly for one update. IMPORTANT, honest limitation: most people hide
+// "last seen" in their WhatsApp privacy settings, especially from numbers
+// they haven't saved — when that's the case, WhatsApp simply never sends
+// an update at all, this times out, and the frontend shows "unavailable".
+// That's expected WhatsApp behavior, not a bug to chase.
+app.get("/api/admin/whatsapp/presence/:instanceId/:number", protect, adminOnly, async (req, res) => {
+  try {
+    const { instanceId, number } = req.params;
+    const sock = activeSelfHostedSockets.get(instanceId);
+    if (!sock) return res.status(404).json({ message: "This number isn't connected right now" });
+    const jid = toWhatsAppJid(number);
+    const presence = await new Promise((resolve) => {
+      const timeout = setTimeout(() => { sock.ev.off("presence.update", handler); resolve(null); }, 4000);
+      const handler = (update) => {
+        if (update.id !== jid) return;
+        clearTimeout(timeout);
+        sock.ev.off("presence.update", handler);
+        resolve(update.presences?.[jid] || null);
+      };
+      sock.ev.on("presence.update", handler);
+      sock.presenceSubscribe(jid).catch(() => { clearTimeout(timeout); resolve(null); });
+    });
+    res.json({ presence });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
