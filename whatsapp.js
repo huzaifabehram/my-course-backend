@@ -21,68 +21,36 @@
 //      whatsapp.logWhatsAppMessage(...), whatsapp.normalizeWaNumber(...),
 //      whatsapp.whatsappConfigured(), whatsapp.sendWhatsAppRaw(...)
 //
-// 4. Dependencies — make sure BOTH of these are installed and redeployed:
-//      npm install @whiskeysockets/baileys qrcode
-//    (baileys = the WhatsApp connection itself; qrcode = renders the QR
-//    code as an image locally, see fix #6 below.)
+// 4. Dependencies — make sure these are installed and redeployed:
+//      npm install @whiskeysockets/baileys qrcode pino
 //
 // ── WHAT CHANGED IN THIS VERSION ─────────────────────────────────────────────
-// 1. Incoming replies landing in a separate chat:
-//    WhatsApp sends many replies from a "LID" (xxxx@lid) instead of the phone
-//    number. When the LID couldn't be matched to a number, the message was
-//    stored as "lid:xxxx" → a second thread. Now:
-//      - LID ↔ number mappings are learned from every source Baileys offers
-//        (remoteJidAlt, senderPn, lidMapping store, contacts, history chats,
-//        lidPnMappings, lid-mapping.update, and right after we send a message)
-//      - mappings are saved in Mongo (WhatsAppLidMap) so they survive restarts
-//      - as soon as a mapping is learned, any "lid:xxxx" thread is merged into
-//        the real number's thread automatically.
-// 2. Full chat history:
-//      - Desktop browser identity + syncFullHistory (WhatsApp sends much more
-//        history to "desktop" links than to web links)
-//      - history timestamps were Long objects → Invalid Date → rows silently
-//        failed to insert. Fixed.
-//      - media messages now import as "📷 Photo", "🎤 Voice message" etc.
-//        instead of being skipped
-//      - real messages carrying `messageContextInfo` as their first key were
-//        being thrown away as "system" messages. Fixed.
-//      - messages.upsert "append" type (messages arriving while offline) is no
-//        longer dropped
-//      - chat view now returns the LATEST messages (it returned the oldest 500)
-// 3. Saved name vs number: contact `name` (saved in your phone) is now stored
-//    separately from `notify` (the person's own WhatsApp name). Chats show the
-//    saved name; unsaved numbers show the full number (+ "~their name" hint).
-// 4. Reconnect always shows a fresh QR: the old socket is logged out and closed,
-//    the session folder is wiped, and a new socket starts → new QR. A
-//    generation guard stops old sockets' auto-reconnect timers from hijacking
-//    the new session.
-// 5. Duplicate messages (dashboard send + WhatsApp echo) are prevented with a
-//    unique (instanceId, waMessageId) index + upserts.
-// 6. FIX — QR code not showing up (image rendering): the QR was previously
-//    rendered by asking a third-party image service (api.qrserver.com) to
-//    draw it from the raw QR string. If that external domain is blocked or
-//    unreachable from your server's network, the image silently never
-//    rendered. The QR is now rendered LOCALLY on this server (using the
-//    `qrcode` package) and sent to the browser as a ready-made image — no
-//    external service required. The old method is kept only as an automatic
-//    fallback if `qrcode` isn't installed.
-// 7. FIX — QR code not showing up (the real cause): a "give up after the
-//    first unscanned QR" check was added to connection.update — as soon as
-//    ANY qr event had fired and the socket then closed for ANY reason before
-//    a successful open, it wiped the QR and stopped retrying entirely, with
-//    no further attempt. WhatsApp/Baileys routinely close and reopen the
-//    connection a few times during the normal handshake BEFORE anyone has
-//    had a chance to scan anything — that's expected, not a failure — so
-//    this was giving up almost immediately on session creation, before the
-//    QR had a real chance to be scanned. Removed that check; a close now
-//    only stops retrying on a genuine logout (401) or being replaced by
-//    another connection (440), exactly like the version that was previously
-//    confirmed working — everything else keeps retrying every 5s. The
-//    socket-creation options were also reverted to that same simpler,
-//    confirmed-working set (no Desktop browser override, no
-//    shouldSyncHistoryMessage, no markOnlineOnConnect, no cached key store
-//    wrapper) to remove extra surface area, since none of those are needed
-//    for the connection itself.
+// A. NO MORE AUTO-LOGOUT
+//    The WhatsApp login (creds + encryption keys) used to be saved in
+//    /tmp/wa-sessions. Render wipes /tmp every time the service restarts,
+//    sleeps (free plan sleeps after ~15 min without traffic) or redeploys →
+//    the login was lost → new QR needed ("logged out after 30-40 min").
+//    Now the login is saved in MongoDB (collection: whatsappauthkeys), so it
+//    survives restarts, sleeps and redeploys. The account stays linked until
+//    YOU click Reconnect / Remove Account, or unlink it from the phone.
+//    - On server start, every account that has a saved login reconnects
+//      automatically (no QR).
+//    - Writes from an old/stopped socket are ignored, so a Reconnect can
+//      never be mixed up with stale keys.
+//    - Optional keep-awake ping (see bottom of file): if RENDER_EXTERNAL_URL
+//      (set automatically by Render) or WHATSAPP_KEEPALIVE_URL exists, the
+//      server pings itself every 10 minutes so the free instance doesn't
+//      sleep and miss live messages.
+//
+// B. FULL OLD CHAT HISTORY WITH REAL NUMBERS / SAVED NAMES
+//    - Links as "Desktop" (WhatsApp sends much more history to desktop links
+//      than to web links) + syncFullHistory + shouldSyncHistoryMessage → true
+//      (newer Baileys skips the FULL history chunk by default).
+//    - After deploying this, click Profile → Reconnect ONCE and scan, so the
+//      new "Desktop" link receives the full history.
+//
+// Everything else (sending, receiving, LID merge, bulk, bot, API, routes) is
+// unchanged.
 
 let Baileys = null;
 try {
@@ -256,7 +224,7 @@ async function getBotSettings() {
 const WhatsAppSelfSessionSchema = new mongoose.Schema({
   label:       { type: String, required: true, trim: true },
   sessionId:   { type: String, required: true, unique: true },
-  authState:   { type: String, default: "" },
+  authState:   { type: String, default: "" }, // legacy, unused
   status:      { type: String, enum: ["pending_qr", "connected", "disconnected"], default: "pending_qr" },
   phoneNumber: { type: String, default: "" },
   lastQr:      { type: String, default: "" },
@@ -275,8 +243,6 @@ const WhatsAppBulkJob = mongoose.model("WhatsAppBulkJob", WhatsAppBulkJobSchema)
 // Contacts are keyed by the SAME `number` value messages use, so the name
 // lookup always matches. `name` = saved in your phone's contacts;
 // `notify` = the person's own WhatsApp profile name (shown only as a hint).
-// Stored in a fresh collection (whatsappcontacts_v2) because the old one was
-// keyed differently and mixed the two kinds of names together.
 const WhatsAppContactSchema = new mongoose.Schema({
   instanceId: { type: String, required: true },
   number:     { type: String, required: true },
@@ -295,6 +261,86 @@ const WhatsAppLidMapSchema = new mongoose.Schema({
 }, { timestamps: true });
 WhatsAppLidMapSchema.index({ instanceId: 1, lid: 1 }, { unique: true });
 const WhatsAppLidMap = mongoose.model("WhatsAppLidMap", WhatsAppLidMapSchema);
+
+// ── NEW: WhatsApp login (creds + signal keys) stored in MongoDB ─────────────
+// One document per key → survives restarts, sleeps and redeploys.
+const WhatsAppAuthKeySchema = new mongoose.Schema({
+  sessionId: { type: String, required: true },
+  key:       { type: String, required: true }, // "creds" or "<type>-<id>"
+  value:     { type: String, default: "" },    // JSON (BufferJSON)
+}, { timestamps: true });
+WhatsAppAuthKeySchema.index({ sessionId: 1, key: 1 }, { unique: true });
+const WhatsAppAuthKey = mongoose.model("WhatsAppAuthKey", WhatsAppAuthKeySchema);
+
+// Mongo-backed replacement for useMultiFileAuthState. `canWrite()` is false
+// once this socket has been replaced/stopped, so an old socket can never
+// overwrite the login of a newer one.
+async function useMongoAuthState(sessionId, canWrite = () => true) {
+  const { BufferJSON, initAuthCreds, proto } = Baileys;
+  const encode = (v) => JSON.stringify(v, BufferJSON.replacer);
+  const decode = (s) => { try { return JSON.parse(s, BufferJSON.reviver); } catch { return null; } };
+
+  const credsRow = await WhatsAppAuthKey.findOne({ sessionId, key: "creds" }).lean();
+  const creds = (credsRow?.value && decode(credsRow.value)) || initAuthCreds();
+
+  const runOps = async (ops) => {
+    if (ops.length === 0 || !canWrite()) return;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try { await WhatsAppAuthKey.bulkWrite(ops, { ordered: false }); return; }
+      catch (err) {
+        if (err.code === 11000 && attempt === 0) continue; // concurrent upsert race → retry once
+        console.error("[Self-hosted WhatsApp] auth key save failed:", err.message);
+        return;
+      }
+    }
+  };
+
+  return {
+    state: {
+      creds,
+      keys: {
+        get: async (type, ids) => {
+          const result = {};
+          if (!ids || ids.length === 0) return result;
+          const rows = await WhatsAppAuthKey.find({ sessionId, key: { $in: ids.map((id) => `${type}-${id}`) } }).lean();
+          const byKey = new Map(rows.map((r) => [r.key, r.value]));
+          for (const id of ids) {
+            const raw = byKey.get(`${type}-${id}`);
+            if (!raw) continue;
+            let value = decode(raw);
+            if (value && type === "app-state-sync-key" && proto?.Message?.AppStateSyncKeyData) {
+              value = proto.Message.AppStateSyncKeyData.fromObject(value);
+            }
+            if (value !== null && value !== undefined) result[id] = value;
+          }
+          return result;
+        },
+        set: async (data) => {
+          const ops = [];
+          for (const type in data) {
+            for (const id in data[type]) {
+              const value = data[type][id];
+              const key = `${type}-${id}`;
+              if (value === null || value === undefined) ops.push({ deleteOne: { filter: { sessionId, key } } });
+              else ops.push({ updateOne: { filter: { sessionId, key }, update: { $set: { value: encode(value) } }, upsert: true } });
+            }
+          }
+          await runOps(ops);
+        },
+      },
+    },
+    saveCreds: async () => {
+      await runOps([{ updateOne: { filter: { sessionId, key: "creds" }, update: { $set: { value: encode(creds) } }, upsert: true } }]);
+    },
+  };
+}
+
+// True when this session has a completed (scanned) login saved in Mongo.
+async function hasSavedLogin(sessionId) {
+  const row = await WhatsAppAuthKey.findOne({ sessionId, key: "creds" }).lean();
+  if (!row?.value) return false;
+  try { return !!JSON.parse(row.value)?.me?.id; } catch { return false; }
+}
 
 const lidCache = new Map(); // `${instanceId}|${lidJid}` → phone digits
 
@@ -380,17 +426,23 @@ async function saveContacts(instanceId, sock, contacts) {
 
 // Live socket connections, keyed by sessionId.
 const activeSelfHostedSockets = new Map();
-// Each new socket for a session gets a new generation number. Events and
-// auto-reconnect timers from an OLDER socket are ignored — this is what stops
-// an old socket from restarting itself after you clicked Reconnect.
+// Each new socket for a session gets a new generation number. Events,
+// auth writes and auto-reconnect timers from an OLDER socket are ignored.
 const socketGenerations = new Map();
 
+// Legacy folder (older versions stored the login here) — only cleaned up now.
 function sessionFolderFor(sessionId) {
   return path.join("/tmp/wa-sessions", sessionId);
 }
 function wipeSessionFolder(sessionId) {
   try { fs.rmSync(sessionFolderFor(sessionId), { recursive: true, force: true }); }
   catch (err) { console.error("[Self-hosted WhatsApp] failed to wipe session folder:", err.message); }
+}
+// Deletes the saved WhatsApp login → next start shows a fresh QR.
+async function wipeSessionAuth(sessionId) {
+  wipeSessionFolder(sessionId);
+  try { await WhatsAppAuthKey.deleteMany({ sessionId }); }
+  catch (err) { console.error("[Self-hosted WhatsApp] failed to wipe saved login:", err.message); }
 }
 
 async function stopSelfHostedSocket(sessionId, { logout = false } = {}) {
@@ -402,54 +454,11 @@ async function stopSelfHostedSocket(sessionId, { logout = false } = {}) {
   try { sock.end(undefined); } catch { /* ignore */ }
 }
 
-// Kept for reference — the Mongo-backed auth adapter. Currently unused
-// (useMultiFileAuthState is used instead, see startSelfHostedSession).
-async function useMongoAuthState(sessionDoc) {
-  const { BufferJSON, initAuthCreds } = Baileys;
-  let stored = {};
-  if (sessionDoc.authState) {
-    try { stored = JSON.parse(sessionDoc.authState, BufferJSON.reviver); } catch { stored = {}; }
-  }
-  const creds = stored.creds || initAuthCreds();
-  const keys = stored.keys || {};
-  const saveState = async () => {
-    const serialized = JSON.stringify({ creds, keys }, BufferJSON.replacer);
-    await WhatsAppSelfSession.findByIdAndUpdate(sessionDoc._id, { authState: serialized });
-  };
-  return {
-    state: {
-      creds,
-      keys: {
-        get: async (type, ids) => {
-          const result = {};
-          for (const id of ids) {
-            const value = keys[type]?.[id];
-            if (value !== undefined) result[id] = value;
-          }
-          return result;
-        },
-        set: async (data) => {
-          for (const type in data) {
-            keys[type] = keys[type] || {};
-            for (const id in data[type]) {
-              if (data[type][id] === null || data[type][id] === undefined) delete keys[type][id];
-              else keys[type][id] = data[type][id];
-            }
-          }
-          await saveState();
-        },
-      },
-    },
-    saveCreds: saveState,
-  };
-}
-void useMongoAuthState;
-
 async function startSelfHostedSession(sessionDoc) {
   if (!Baileys) throw new Error("Baileys isn't installed on the server yet");
   const {
     default: makeWASocket, DisconnectReason, fetchLatestBaileysVersion,
-    useMultiFileAuthState,
+    makeCacheableSignalKeyStore, Browsers,
   } = Baileys;
   const instanceId = sessionDoc.sessionId;
 
@@ -460,9 +469,8 @@ async function startSelfHostedSession(sessionDoc) {
   socketGenerations.set(instanceId, generation);
   const isCurrent = () => socketGenerations.get(instanceId) === generation;
 
-  // NOTE: /tmp is wiped by Render on every redeploy → a new QR scan is needed
-  // after each deploy (same as before). Use a persistent disk path to avoid it.
-  const { state, saveCreds } = await useMultiFileAuthState(sessionFolderFor(instanceId));
+  // Login is stored in MongoDB → no QR needed after restarts / sleeps / redeploys.
+  const { state, saveCreds } = await useMongoAuthState(instanceId, isCurrent);
   let version;
   try { ({ version } = await fetchLatestBaileysVersion()); } catch { /* use Baileys' default */ }
   if (!isCurrent()) return null; // superseded while we were awaiting
@@ -471,10 +479,17 @@ async function startSelfHostedSession(sessionDoc) {
   const logger = pino({ level: "silent" });
   const sock = makeWASocket({
     ...(version ? { version } : {}),
-    auth: state,
+    auth: {
+      creds: state.creds,
+      keys: makeCacheableSignalKeyStore ? makeCacheableSignalKeyStore(state.keys, logger) : state.keys,
+    },
     logger,
     printQRInTerminal: false,
+    // "Desktop" links receive the FULL chat history (web links only get a little)
+    browser: Browsers?.macOS ? Browsers.macOS("Desktop") : ["Mac OS", "Desktop", "14.4.1"],
     syncFullHistory: true,
+    // Newer Baileys skips the FULL history chunk by default — accept everything
+    shouldSyncHistoryMessage: () => true,
     keepAliveIntervalMs: 15000,
   });
   activeSelfHostedSockets.set(instanceId, sock);
@@ -499,11 +514,12 @@ async function startSelfHostedSession(sessionDoc) {
       console.log(`[Self-hosted WhatsApp] "${sessionDoc.label}" — disconnected. statusCode=${statusCode}, reason=${lastDisconnect?.error?.message || "unknown"}`);
 
       if (statusCode === DisconnectReason.loggedOut) {
-        // Unlinked from the phone (or logged out) — wipe creds so the next
-        // Reconnect shows a fresh QR instead of trying dead credentials.
-        wipeSessionFolder(instanceId);
+        // Genuinely unlinked from the phone — wipe the saved login so the
+        // next Reconnect shows a fresh QR instead of trying dead credentials.
+        await stopSelfHostedSocket(instanceId); // blocks any late writes from this socket
+        await wipeSessionAuth(instanceId);
         await WhatsAppSelfSession.findByIdAndUpdate(sessionDoc._id, { status: "disconnected", lastQr: "" });
-        console.log(`[Self-hosted WhatsApp] "${sessionDoc.label}" — logged out; click Reconnect to scan a new QR.`);
+        console.log(`[Self-hosted WhatsApp] "${sessionDoc.label}" — logged out from the phone; click Reconnect to scan a new QR.`);
         return;
       }
       if (statusCode === DisconnectReason.connectionReplaced) {
@@ -511,15 +527,8 @@ async function startSelfHostedSession(sessionDoc) {
         console.log(`[Self-hosted WhatsApp] "${sessionDoc.label}" — replaced by another connection using the same session; not auto-reconnecting.`);
         return;
       }
-      // Any other close — including the normal close/reopen cycles WhatsApp
-      // does while a QR code is sitting there waiting to be scanned, which
-      // is completely normal and NOT a failure — keeps retrying. Only a
-      // genuine logout (401, above) or being replaced by another connection
-      // (440, above) stops the retry loop. This matches the original,
-      // confirmed-working behavior (see fix #7 in the header comment).
-      //
-      // 515 (restartRequired) happens right after a successful QR scan — don't
-      // flip the status to "disconnected" for that, the new socket opens in a moment.
+      // Any other close keeps retrying with the SAME saved login (no QR).
+      // 515 (restartRequired) happens right after a successful QR scan.
       if (statusCode !== DisconnectReason.restartRequired) {
         await WhatsAppSelfSession.findByIdAndUpdate(sessionDoc._id, { status: "disconnected" });
       }
@@ -662,12 +671,20 @@ async function startSelfHostedSession(sessionDoc) {
   return sock;
 }
 
+// On server start: every account with a saved login reconnects silently
+// (no QR). Accounts that were never scanned are marked "disconnected" so
+// the dashboard offers Reconnect instead of looping QR codes in the background.
 async function startAllSelfHostedSessions() {
   if (!Baileys) { console.log("[Self-hosted WhatsApp] Baileys not installed — skipping startup reconnect"); return; }
   try {
-    const sessions = await WhatsAppSelfSession.find({ status: { $in: ["connected", "disconnected"] } });
-    console.log(`[Self-hosted WhatsApp] startup — found ${sessions.length} session(s) to reconnect: ${sessions.map((s) => s.label).join(", ") || "(none)"}`);
-    for (const s of sessions) startSelfHostedSession(s).catch((err) => console.error("[Self-hosted WhatsApp] startup reconnect failed for", s.label, ":", err.message));
+    const sessions = await WhatsAppSelfSession.find({});
+    const toStart = [];
+    for (const s of sessions) {
+      if (await hasSavedLogin(s.sessionId)) toStart.push(s);
+      else if (s.status !== "disconnected") await WhatsAppSelfSession.findByIdAndUpdate(s._id, { status: "disconnected", lastQr: "" });
+    }
+    console.log(`[Self-hosted WhatsApp] startup — reconnecting ${toStart.length} saved session(s): ${toStart.map((s) => s.label).join(", ") || "(none)"}`);
+    for (const s of toStart) startSelfHostedSession(s).catch((err) => console.error("[Self-hosted WhatsApp] startup reconnect failed for", s.label, ":", err.message));
   } catch (err) { console.error("[Self-hosted WhatsApp] startup scan failed:", err.message); }
 }
 
@@ -910,11 +927,6 @@ app.post("/api/admin/whatsapp-server/sessions", protect, adminOnly, requireBaile
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// FIX: the QR is now rendered LOCALLY (via the `qrcode` package) and sent as
-// a ready-to-use data: URL (`qrImage`), so the browser never depends on a
-// third-party image service being reachable. The raw `qr` string is still
-// included so the frontend can fall back to the old external-image method if
-// `qrcode` isn't installed on this server.
 app.get("/api/admin/whatsapp-server/sessions/:id/qr", protect, adminOnly, requireBaileys, async (req, res) => {
   try {
     const session = await WhatsAppSelfSession.findById(req.params.id).select("-authState");
@@ -924,14 +936,14 @@ app.get("/api/admin/whatsapp-server/sessions/:id/qr", protect, adminOnly, requir
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// Reconnect = full fresh link: log out the old link, wipe its credentials,
+// Reconnect = full fresh link: log out the old link, wipe its saved login,
 // start a new socket → a NEW QR code. Scanning it also re-imports history.
 app.post("/api/admin/whatsapp-server/sessions/:id/reconnect", protect, adminOnly, requireBaileys, async (req, res) => {
   try {
     const session = await WhatsAppSelfSession.findById(req.params.id);
     if (!session) return res.status(404).json({ message: "Session not found" });
     await stopSelfHostedSocket(session.sessionId, { logout: true });
-    wipeSessionFolder(session.sessionId);
+    await wipeSessionAuth(session.sessionId);
     const fresh = await WhatsAppSelfSession.findByIdAndUpdate(session._id, { status: "pending_qr", lastQr: "" }, { new: true });
     startSelfHostedSession(fresh).catch((err) => console.error("[Self-hosted WhatsApp] reconnect failed:", err.message));
     res.json({ _id: fresh._id, label: fresh.label, sessionId: fresh.sessionId, status: fresh.status });
@@ -943,7 +955,7 @@ app.delete("/api/admin/whatsapp-server/sessions/:id", protect, adminOnly, requir
     const session = await WhatsAppSelfSession.findById(req.params.id);
     if (!session) return res.status(404).json({ message: "Session not found" });
     await stopSelfHostedSocket(session.sessionId, { logout: true });
-    wipeSessionFolder(session.sessionId);
+    await wipeSessionAuth(session.sessionId);
     await WhatsAppSelfSession.findByIdAndDelete(req.params.id);
     res.json({ deleted: true });
   } catch (err) { res.status(500).json({ message: err.message }); }
@@ -1144,6 +1156,18 @@ app.get("/api/admin/whatsapp/about/:instanceId/:number", protect, adminOnly, asy
     }
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
+
+// ── Keep-awake ping (stops Render's free plan from sleeping) ────────────────
+// Render sets RENDER_EXTERNAL_URL automatically. Set WHATSAPP_KEEPALIVE_URL
+// yourself (e.g. https://your-backend.onrender.com) if you host elsewhere.
+app.get("/api/whatsapp-server/ping", (req, res) => res.json({ ok: true, at: Date.now() }));
+const keepAliveBase = (process.env.WHATSAPP_KEEPALIVE_URL || process.env.RENDER_EXTERNAL_URL || "").replace(/\/+$/, "");
+if (keepAliveBase) {
+  setInterval(() => {
+    fetch(`${keepAliveBase}/api/whatsapp-server/ping`).catch(() => {});
+  }, 10 * 60 * 1000);
+  console.log(`[Self-hosted WhatsApp] keep-awake ping enabled → ${keepAliveBase}/api/whatsapp-server/ping every 10 min`);
+}
 
   return {
     WhatsAppMessage,
