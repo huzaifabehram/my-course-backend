@@ -21,6 +21,11 @@
 //      whatsapp.logWhatsAppMessage(...), whatsapp.normalizeWaNumber(...),
 //      whatsapp.whatsappConfigured(), whatsapp.sendWhatsAppRaw(...)
 //
+// 4. Dependencies — make sure BOTH of these are installed and redeployed:
+//      npm install @whiskeysockets/baileys qrcode
+//    (baileys = the WhatsApp connection itself; qrcode = renders the QR
+//    code as an image locally, see fix #6 below.)
+//
 // ── WHAT CHANGED IN THIS VERSION ─────────────────────────────────────────────
 // 1. Incoming replies landing in a separate chat:
 //    WhatsApp sends many replies from a "LID" (xxxx@lid) instead of the phone
@@ -53,6 +58,15 @@
 //    the new session.
 // 5. Duplicate messages (dashboard send + WhatsApp echo) are prevented with a
 //    unique (instanceId, waMessageId) index + upserts.
+// 6. FIX — QR code not showing up: the QR was previously rendered by asking a
+//    third-party image service (api.qrserver.com) to draw it from the raw QR
+//    string. If that external domain is blocked or unreachable from your
+//    server's network (common on many hosts/firewalls), the image silently
+//    never rendered and the account could never connect. The QR is now
+//    rendered LOCALLY on this server (using the `qrcode` package) and sent to
+//    the browser as a ready-made image — no external service required. The
+//    old method is kept only as an automatic fallback if `qrcode` isn't
+//    installed.
 
 let Baileys = null;
 try {
@@ -60,6 +74,25 @@ try {
 } catch (err) {
   console.error("⚠️  @whiskeysockets/baileys not installed — self-hosted WhatsApp server disabled. Run: npm install @whiskeysockets/baileys");
 }
+
+// Renders the QR code locally as a data: URL image — removes the dependency
+// on a reachable third-party image service to actually SEE the QR code.
+let QRCode = null;
+try {
+  QRCode = require("qrcode");
+} catch (err) {
+  console.error("⚠️  qrcode package not installed — QR codes will fall back to an external image service (api.qrserver.com), which may not render on all networks. Run: npm install qrcode");
+}
+async function renderQrDataUrl(qrString) {
+  if (!qrString || !QRCode) return "";
+  try {
+    return await QRCode.toDataURL(qrString, { width: 256, margin: 1 });
+  } catch (err) {
+    console.error("[Self-hosted WhatsApp] local QR render failed, will fall back to external service:", err.message);
+    return "";
+  }
+}
+
 const fs = require("fs");
 const path = require("path");
 
@@ -871,11 +904,17 @@ app.post("/api/admin/whatsapp-server/sessions", protect, adminOnly, requireBaile
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
+// FIX: the QR is now rendered LOCALLY (via the `qrcode` package) and sent as
+// a ready-to-use data: URL (`qrImage`), so the browser never depends on a
+// third-party image service being reachable. The raw `qr` string is still
+// included so the frontend can fall back to the old external-image method if
+// `qrcode` isn't installed on this server.
 app.get("/api/admin/whatsapp-server/sessions/:id/qr", protect, adminOnly, requireBaileys, async (req, res) => {
   try {
     const session = await WhatsAppSelfSession.findById(req.params.id).select("-authState");
     if (!session) return res.status(404).json({ message: "Session not found" });
-    res.json({ qr: session.lastQr, status: session.status, phoneNumber: session.phoneNumber });
+    const qrImage = await renderQrDataUrl(session.lastQr);
+    res.json({ qr: session.lastQr, qrImage, status: session.status, phoneNumber: session.phoneNumber });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
