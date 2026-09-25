@@ -3,70 +3,138 @@
 // SELF-HOSTED WHATSAPP SERVER + META CLOUD API FALLBACK
 // ══════════════════════════════════════════════════════════════════════════════
 // All WhatsApp-related backend code for Super Admin → WhatsApp, pulled out of
-// server.js into its own file — server.js and SuperAdminsDashboard.jsx had
-// grown large enough to be unreliable to keep editing directly.
+// server.js into its own file.
 //
-// HOW TO WIRE THIS INTO server.js:
+// HOW TO WIRE THIS INTO server.js (unchanged from before):
 //
-// 1. Near the top of server.js, after `const app = express();` and after
-//    `mongoose`, `SiteSettings`, and `getSiteSettings` are defined, add:
+// 1. After `const app = express();` and after `mongoose`, `SiteSettings`,
+//    `getSiteSettings`, `protect`, `adminOnly` exist:
 //
 //      const setupWhatsApp = require("./whatsapp");
 //      const whatsapp = setupWhatsApp(app, { mongoose, protect, adminOnly, getSiteSettings, SiteSettings, crypto });
 //
-//    This one call registers every WhatsApp route directly on `app` — no
-//    further app.use() needed. `crypto` is Node's built-in module
-//    (`const crypto = require("crypto");` — server.js almost certainly
-//    already requires this; add it near the top if it doesn't yet).
-//
-//    NOTE: `protect` and `adminOnly` (the auth middleware) and
-//    `getSiteSettings`/`SiteSettings` (site settings) must be defined
-//    BEFORE this call — place the setupWhatsApp() call after all of those
-//    exist, not at the very top of the file.
-//
-// 2. In the `mongoose.connection.once("open", ...)` startup block, replace
-//
-//      await startAllSelfHostedSessions();
-//
-//    with:
-//
+// 2. In the `mongoose.connection.once("open", ...)` block:
 //      await whatsapp.startAllSelfHostedSessions();
 //
-// 3. In the Automation Workflow engine's `runAction` function, the
-//    `case "send_whatsapp":` block references several things that now live
-//    in this module. Replace these identifiers in that one case block:
-//      WhatsAppSelfSession        → whatsapp.WhatsAppSelfSession
-//      sendSelfHostedMessage(...) → whatsapp.sendSelfHostedMessage(...)
-//      logWhatsAppMessage(...)    → whatsapp.logWhatsAppMessage(...)
-//      normalizeWaNumber(...)     → whatsapp.normalizeWaNumber(...)
-//      whatsappConfigured()       → whatsapp.whatsappConfigured()
-//      sendWhatsAppRaw(...)       → whatsapp.sendWhatsAppRaw(...)
+// 3. Automation Workflow `case "send_whatsapp":` uses
+//      whatsapp.WhatsAppSelfSession, whatsapp.sendSelfHostedMessage(...),
+//      whatsapp.logWhatsAppMessage(...), whatsapp.normalizeWaNumber(...),
+//      whatsapp.whatsappConfigured(), whatsapp.sendWhatsAppRaw(...)
 //
-// 4. Remove from server.js (now living here instead):
-//      - `let Baileys = null; try { ... } catch { ... }` near the top
-//      - Everything from `const WhatsAppMessageSchema = ...` through the
-//        end of `buildBotHistory(...)` (the self-hosted server + AI bot core)
-//      - `getWhatsAppCredentials`, `whatsappConfigured`, `sendWhatsAppRaw`
-//        (the Meta Cloud API fallback functions)
-//      - Every `app.get/post/delete("/api/admin/whatsapp...")`,
-//        `/api/admin/settings/whatsapp...`, `/api/admin/settings/openai...`,
-//        and `/api/whatsapp-server/external/send` route
-//      - The standalone `startAllSelfHostedSessions` function and
-//        `function requireBaileys(...)` (both now internal to this file)
-//    Leave everything else untouched — ContactSubmission, PackageInquiry,
-//    Form, Tag, NewsletterSubscriber, PaymentScreenshotHash, and the auth
-//    middleware (protect/adminOnly/etc.) all stay in server.js exactly
-//    where they are; this file does not touch them.
-//
-// Needs `@whiskeysockets/baileys` installed (npm install @whiskeysockets/baileys)
-// — if it isn't, every self-hosted route returns a clear 503 instead of
-// crashing the server, same safety net as before.
+// ── WHAT CHANGED IN THIS VERSION ─────────────────────────────────────────────
+// 1. Incoming replies landing in a separate chat:
+//    WhatsApp sends many replies from a "LID" (xxxx@lid) instead of the phone
+//    number. When the LID couldn't be matched to a number, the message was
+//    stored as "lid:xxxx" → a second thread. Now:
+//      - LID ↔ number mappings are learned from every source Baileys offers
+//        (remoteJidAlt, senderPn, lidMapping store, contacts, history chats,
+//        lidPnMappings, lid-mapping.update, and right after we send a message)
+//      - mappings are saved in Mongo (WhatsAppLidMap) so they survive restarts
+//      - as soon as a mapping is learned, any "lid:xxxx" thread is merged into
+//        the real number's thread automatically.
+// 2. Full chat history:
+//      - Desktop browser identity + syncFullHistory (WhatsApp sends much more
+//        history to "desktop" links than to web links)
+//      - history timestamps were Long objects → Invalid Date → rows silently
+//        failed to insert. Fixed.
+//      - media messages now import as "📷 Photo", "🎤 Voice message" etc.
+//        instead of being skipped
+//      - real messages carrying `messageContextInfo` as their first key were
+//        being thrown away as "system" messages. Fixed.
+//      - messages.upsert "append" type (messages arriving while offline) is no
+//        longer dropped
+//      - chat view now returns the LATEST messages (it returned the oldest 500)
+// 3. Saved name vs number: contact `name` (saved in your phone) is now stored
+//    separately from `notify` (the person's own WhatsApp name). Chats show the
+//    saved name; unsaved numbers show the full number (+ "~their name" hint).
+// 4. Reconnect always shows a fresh QR: the old socket is logged out and closed,
+//    the session folder is wiped, and a new socket starts → new QR. A
+//    generation guard stops old sockets' auto-reconnect timers from hijacking
+//    the new session.
+// 5. Duplicate messages (dashboard send + WhatsApp echo) are prevented with a
+//    unique (instanceId, waMessageId) index + upserts.
 
 let Baileys = null;
 try {
   Baileys = require("@whiskeysockets/baileys");
 } catch (err) {
   console.error("⚠️  @whiskeysockets/baileys not installed — self-hosted WhatsApp server disabled. Run: npm install @whiskeysockets/baileys");
+}
+const fs = require("fs");
+const path = require("path");
+
+// ── Small JID helpers (no dependencies) ─────────────────────────────────────
+// "923001234567:12@s.whatsapp.net" → "923001234567@s.whatsapp.net"
+function jidNorm(jid) {
+  if (!jid || typeof jid !== "string" || !jid.includes("@")) return "";
+  const [userPart, serverPart] = jid.split("@");
+  const user = userPart.split(":")[0];
+  const server = serverPart === "c.us" ? "s.whatsapp.net" : serverPart;
+  return `${user}@${server}`;
+}
+const isPnJid = (j) => typeof j === "string" && j.endsWith("@s.whatsapp.net");
+const isLidJid = (j) => typeof j === "string" && j.endsWith("@lid");
+const digitsOf = (j) => String(j || "").split("@")[0].replace(/[^\d]/g, "");
+const lidLabel = (lidJid) => `lid:${digitsOf(lidJid)}`;
+
+// Baileys timestamps can be numbers or protobuf Long objects
+function toDate(ts) {
+  let n = 0;
+  if (typeof ts === "number") n = ts;
+  else if (ts && typeof ts.toNumber === "function") n = ts.toNumber();
+  else if (ts && typeof ts.low === "number") n = ts.low;
+  else n = Number(ts) || 0;
+  return n > 0 ? new Date(n * 1000) : new Date();
+}
+
+const SYSTEM_TYPES = [
+  "protocolMessage", "senderKeyDistributionMessage", "messageContextInfo",
+  "reactionMessage", "pollUpdateMessage", "keepInChatMessage", "encReactionMessage",
+];
+
+// Returns { text, hasText } for a real message, or null for protocol/system
+// traffic that should never show up in a chat.
+function getMessageContent(msg) {
+  let m = msg?.message;
+  if (!m) return null;
+  for (let i = 0; i < 5; i++) {
+    const inner = m.ephemeralMessage?.message || m.viewOnceMessage?.message ||
+      m.viewOnceMessageV2?.message || m.viewOnceMessageV2Extension?.message ||
+      m.documentWithCaptionMessage?.message || m.editedMessage?.message;
+    if (!inner) break;
+    m = inner;
+  }
+  const type = (Baileys?.getContentType && Baileys.getContentType(m)) ||
+    Object.keys(m).find((k) => !["senderKeyDistributionMessage", "messageContextInfo"].includes(k));
+  if (!type || SYSTEM_TYPES.includes(type)) return null;
+
+  const text =
+    m.conversation ||
+    m.extendedTextMessage?.text ||
+    m.imageMessage?.caption ||
+    m.videoMessage?.caption ||
+    m.documentMessage?.caption ||
+    m.buttonsResponseMessage?.selectedDisplayText ||
+    m.listResponseMessage?.title ||
+    m.templateButtonReplyMessage?.selectedDisplayText ||
+    "";
+  if (text) return { text, hasText: true };
+
+  const placeholders = {
+    imageMessage: "📷 Photo",
+    videoMessage: "🎥 Video",
+    audioMessage: "🎤 Voice message",
+    stickerMessage: "Sticker",
+    contactMessage: `👤 ${m.contactMessage?.displayName || "Contact"}`,
+    contactsArrayMessage: "👤 Contacts",
+    locationMessage: "📍 Location",
+    liveLocationMessage: "📍 Live location",
+    pollCreationMessage: "📊 Poll",
+    pollCreationMessageV2: "📊 Poll",
+    pollCreationMessageV3: "📊 Poll",
+    documentMessage: `📄 ${m.documentMessage?.fileName || "Document"}`,
+  };
+  return { text: placeholders[type] || `[${type}]`, hasText: false };
 }
 
 module.exports = function setupWhatsApp(app, deps) {
@@ -75,40 +143,47 @@ module.exports = function setupWhatsApp(app, deps) {
 const WhatsAppMessageSchema = new mongoose.Schema({
   instanceId: { type: String, required: true },
   direction:  { type: String, enum: ["outgoing", "incoming"], required: true },
-  number:     { type: String, default: "" }, // the other party's number — recipient for outgoing, sender for incoming
-  groupId:    { type: String, default: "" }, // set instead of number for group messages
+  // The other party — ALWAYS the real phone number (digits only) when it can
+  // be resolved; "lid:xxxx" only while WhatsApp hasn't revealed the number
+  // yet (merged into the real number automatically once it does).
+  number:     { type: String, default: "" },
+  groupId:    { type: String, default: "" },
   message:    { type: String, default: "" },
   status:     { type: String, enum: ["sent", "failed", "received"], default: "sent" },
-  source:     { type: String, default: "" }, // "workflow" | "manual" | "webhook" | "history_sync"
-  // NEW: Baileys' own message ID (msg.key.id) — lets history-sync avoid
-  // re-importing a message that's already been logged (live, or from an
-  // earlier sync), and matches WhatsApp's own de-duplication.
+  source:     { type: String, default: "" }, // "workflow" | "manual" | "mobile_app" | "self_hosted" | "history_sync" | "bulk" | "ai_bot" | "external_api"
   waMessageId: { type: String, default: "" },
-  // NEW: the exact WhatsApp identifier this message came from/went to —
-  // either a real phone-number JID (...@s.whatsapp.net) or, for contacts
-  // WhatsApp has moved to its newer privacy-ID system, a "LID"
-  // (...@lid, an internal ID that looks like a random number). Replies
-  // use this exact value rather than reconstructing one from `number`,
-  // so a reply always reaches the same identifier the message came from —
-  // this is what fixes sending failing on chats that started as an
-  // incoming LID-based message.
+  // Exact WhatsApp identifier the message came from / went to (phone JID or
+  // LID) — replies are sent to this.
   jid: { type: String, default: "" },
 }, { timestamps: true });
+WhatsAppMessageSchema.index({ instanceId: 1, createdAt: -1 });
+WhatsAppMessageSchema.index({ instanceId: 1, number: 1, createdAt: -1 });
+WhatsAppMessageSchema.index(
+  { instanceId: 1, waMessageId: 1 },
+  { unique: true, partialFilterExpression: { waMessageId: { $gt: "" } } }
+);
 const WhatsAppMessage = mongoose.model("WhatsAppMessage", WhatsAppMessageSchema);
 
+// Messages with a WhatsApp ID are upserted — so the dashboard's own log and
+// WhatsApp's echo of the same message can never create two rows.
 async function logWhatsAppMessage(fields) {
-  try { await WhatsAppMessage.create(fields); }
-  catch (err) { console.error("[WhatsApp] failed to log message:", err.message); }
+  try {
+    if (fields.waMessageId) {
+      const now = new Date();
+      await WhatsAppMessage.updateOne(
+        { instanceId: fields.instanceId, waMessageId: fields.waMessageId },
+        { $setOnInsert: { groupId: "", jid: "", ...fields, createdAt: fields.createdAt || now, updatedAt: now } },
+        { upsert: true, timestamps: false }
+      );
+    } else {
+      await WhatsAppMessage.create(fields);
+    }
+  } catch (err) {
+    if (err.code !== 11000) console.error("[WhatsApp] failed to log message:", err.message);
+  }
 }
 
 // ── AI Bot — auto-responds to incoming WhatsApp messages ────────────────────
-// One shared configuration: "instructions" is what Super Admin → WhatsApp →
-// AI Bot calls "training" — a system prompt describing your business, tone,
-// what it should/shouldn't say, and when to hand off to a human instead of
-// answering. enabledInstanceIds is an explicit opt-in list — the bot never
-// auto-replies on a number unless you've turned it on for that number
-// specifically, so connecting a new number never silently starts
-// auto-responding on your behalf.
 const WhatsAppBotSettingsSchema = new mongoose.Schema({
   enabled:            { type: Boolean, default: false },
   instructions:        { type: String, default: "" },
@@ -126,21 +201,16 @@ async function getBotSettings() {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// SELF-HOSTED WHATSAPP SERVER — Super Admin → WhatsApp → Self-Hosted Server
+// SELF-HOSTED WHATSAPP SERVER
 // ══════════════════════════════════════════════════════════════════════════════
-// A real WhatsApp Web connection built directly into this backend with
-// Baileys, instead of depending on WaBulkify. Session credentials are
-// stored in MongoDB (not local disk) specifically because Render wipes the
-// filesystem on every redeploy — storing them in Mongo means a connected
-// number survives a redeploy without needing to rescan its QR code.
 
 const WhatsAppSelfSessionSchema = new mongoose.Schema({
   label:       { type: String, required: true, trim: true },
-  sessionId:   { type: String, required: true, unique: true }, // our own generated ID — not a WaBulkify instance_id
-  authState:   { type: String, default: "" }, // JSON-serialized Baileys creds+keys (via Baileys' own BufferJSON codec)
+  sessionId:   { type: String, required: true, unique: true },
+  authState:   { type: String, default: "" },
   status:      { type: String, enum: ["pending_qr", "connected", "disconnected"], default: "pending_qr" },
   phoneNumber: { type: String, default: "" },
-  lastQr:      { type: String, default: "" }, // raw QR data string — rendered as an image client-side, not here
+  lastQr:      { type: String, default: "" },
 }, { timestamps: true });
 const WhatsAppSelfSession = mongoose.model("WhatsAppSelfSession", WhatsAppSelfSessionSchema);
 
@@ -153,39 +223,138 @@ const WhatsAppBulkJobSchema = new mongoose.Schema({
 }, { timestamps: true });
 const WhatsAppBulkJob = mongoose.model("WhatsAppBulkJob", WhatsAppBulkJobSchema);
 
-// A contact's saved name, synced from WhatsApp's own contacts.upsert/
-// contacts.update events — this is what lets a chat show "Ali Khan"
-// instead of a bare number, matching WhatsApp's own behavior: a name
-// shows when that number is saved (in your phone's contacts, synced onto
-// the account), and just the number shows when it isn't.
+// Contacts are keyed by the SAME `number` value messages use, so the name
+// lookup always matches. `name` = saved in your phone's contacts;
+// `notify` = the person's own WhatsApp profile name (shown only as a hint).
+// Stored in a fresh collection (whatsappcontacts_v2) because the old one was
+// keyed differently and mixed the two kinds of names together.
 const WhatsAppContactSchema = new mongoose.Schema({
   instanceId: { type: String, required: true },
-  jid:        { type: String, required: true },
+  number:     { type: String, required: true },
+  jid:        { type: String, default: "" },
   name:       { type: String, default: "" },
+  notify:     { type: String, default: "" },
 }, { timestamps: true });
-WhatsAppContactSchema.index({ instanceId: 1, jid: 1 }, { unique: true });
-const WhatsAppContact = mongoose.model("WhatsAppContact", WhatsAppContactSchema);
+WhatsAppContactSchema.index({ instanceId: 1, number: 1 }, { unique: true });
+const WhatsAppContact = mongoose.model("WhatsAppContact", WhatsAppContactSchema, "whatsappcontacts_v2");
 
-async function upsertWhatsAppContact(instanceId, jid, name) {
-  if (!jid || !name) return;
+// LID ↔ phone number mapping, persisted so it survives restarts/redeploys.
+const WhatsAppLidMapSchema = new mongoose.Schema({
+  instanceId: { type: String, required: true },
+  lid:        { type: String, required: true }, // "12345@lid"
+  pn:         { type: String, required: true }, // "923001234567"
+}, { timestamps: true });
+WhatsAppLidMapSchema.index({ instanceId: 1, lid: 1 }, { unique: true });
+const WhatsAppLidMap = mongoose.model("WhatsAppLidMap", WhatsAppLidMapSchema);
+
+const lidCache = new Map(); // `${instanceId}|${lidJid}` → phone digits
+
+// Records a LID ↔ number mapping and merges any "lid:xxxx" thread (messages
+// + contact name) into the real number's thread.
+async function rememberLid(instanceId, lidJid, pnJid) {
+  const lid = jidNorm(lidJid);
+  const pn = jidNorm(pnJid);
+  if (!isLidJid(lid) || !isPnJid(pn)) return;
+  const pnNumber = digitsOf(pn);
+  const cacheKey = `${instanceId}|${lid}`;
+  if (lidCache.get(cacheKey) === pnNumber) return;
+  lidCache.set(cacheKey, pnNumber);
   try {
-    await WhatsAppContact.findOneAndUpdate({ instanceId, jid }, { name }, { upsert: true });
-  } catch (err) { console.error("[Self-hosted WhatsApp] contact save failed:", err.message); }
+    await WhatsAppLidMap.updateOne({ instanceId, lid }, { $set: { pn: pnNumber } }, { upsert: true });
+    const label = lidLabel(lid);
+    const moved = await WhatsAppMessage.updateMany({ instanceId, number: label }, { $set: { number: pnNumber } });
+    const lidContact = await WhatsAppContact.findOne({ instanceId, number: label });
+    if (lidContact) {
+      const pnContact = await WhatsAppContact.findOne({ instanceId, number: pnNumber });
+      const set = { jid: pnContact?.jid || pn };
+      if (!pnContact?.name && lidContact.name) set.name = lidContact.name;
+      if (!pnContact?.notify && lidContact.notify) set.notify = lidContact.notify;
+      await WhatsAppContact.deleteOne({ _id: lidContact._id });
+      await WhatsAppContact.updateOne({ instanceId, number: pnNumber }, { $set: set }, { upsert: true });
+    }
+    if (moved.modifiedCount > 0) {
+      console.log(`[Self-hosted WhatsApp] merged ${moved.modifiedCount} message(s) from ${label} into +${pnNumber}`);
+    }
+  } catch (err) {
+    if (err.code !== 11000) console.error("[Self-hosted WhatsApp] LID mapping save failed:", err.message);
+  }
 }
 
-// Live socket connections, keyed by our sessionId — this is in-memory, so it
-// starts empty on every server restart; startAllSelfHostedSessions() below
-// reconnects every previously-connected session automatically using its
-// saved Mongo credentials (no QR rescan needed) once the server boots back
-// up and the DB connection opens.
-const activeSelfHostedSockets = new Map();
+async function lookupLid(instanceId, lidJid) {
+  const lid = jidNorm(lidJid);
+  const cacheKey = `${instanceId}|${lid}`;
+  if (lidCache.has(cacheKey)) return lidCache.get(cacheKey);
+  const row = await WhatsAppLidMap.findOne({ instanceId, lid }).lean();
+  if (row?.pn) { lidCache.set(cacheKey, row.pn); return row.pn; }
+  return "";
+}
 
-// Custom Baileys auth-state adapter backed by MongoDB instead of Baileys'
-// default local-file storage (useMultiFileAuthState) — the whole point of
-// this being different from the standard example is Render's ephemeral
-// disk. Stores the entire creds+keys blob as one JSON field, rewritten in
-// full on every change; simpler than a fully granular per-key store, and
-// fine at the message volumes this is actually built for.
+// After sending to a phone number, ask Baileys which LID belongs to it — so
+// when the reply comes back from that LID, it lands in the SAME thread.
+async function learnLidForPn(instanceId, sock, pnJid) {
+  const pn = jidNorm(pnJid);
+  if (!isPnJid(pn) || !sock) return;
+  try {
+    const lid = await sock.signalRepository?.lidMapping?.getLIDForPN?.(pn);
+    if (lid) { await rememberLid(instanceId, lid, pn); return; }
+  } catch { /* not available in this Baileys version */ }
+  try {
+    const results = await sock.onWhatsApp(pn);
+    const hit = Array.isArray(results) ? results.find((r) => r?.lid) : null;
+    if (hit?.lid) await rememberLid(instanceId, hit.lid, pn);
+  } catch { /* ignore */ }
+}
+
+async function saveContacts(instanceId, sock, contacts) {
+  const ops = [];
+  for (const c of contacts || []) {
+    const ids = [c.id, c.jid, c.lid, c.phoneNumber].map(jidNorm).filter(Boolean);
+    const pnJid = ids.find(isPnJid);
+    const lidJid = ids.find(isLidJid);
+    if (pnJid && lidJid) await rememberLid(instanceId, lidJid, pnJid);
+
+    let number = pnJid ? digitsOf(pnJid) : "";
+    if (!number && lidJid) number = (await resolveMessageIdentity({ remoteJid: lidJid }, sock, instanceId)).displayNumber;
+    if (!number) continue;
+
+    const set = {};
+    if (c.name) set.name = c.name;
+    if (c.notify) set.notify = c.notify;
+    if (Object.keys(set).length === 0) continue;
+    ops.push({ updateOne: { filter: { instanceId, number }, update: { $set: set, $setOnInsert: { jid: pnJid || lidJid || "" } }, upsert: true } });
+  }
+  if (ops.length > 0) {
+    try { await WhatsAppContact.bulkWrite(ops, { ordered: false }); }
+    catch (err) { if (err.code !== 11000) console.error("[Self-hosted WhatsApp] contact save failed:", err.message); }
+  }
+}
+
+// Live socket connections, keyed by sessionId.
+const activeSelfHostedSockets = new Map();
+// Each new socket for a session gets a new generation number. Events and
+// auto-reconnect timers from an OLDER socket are ignored — this is what stops
+// an old socket from restarting itself after you clicked Reconnect.
+const socketGenerations = new Map();
+
+function sessionFolderFor(sessionId) {
+  return path.join("/tmp/wa-sessions", sessionId);
+}
+function wipeSessionFolder(sessionId) {
+  try { fs.rmSync(sessionFolderFor(sessionId), { recursive: true, force: true }); }
+  catch (err) { console.error("[Self-hosted WhatsApp] failed to wipe session folder:", err.message); }
+}
+
+async function stopSelfHostedSocket(sessionId, { logout = false } = {}) {
+  socketGenerations.set(sessionId, (socketGenerations.get(sessionId) || 0) + 1);
+  const sock = activeSelfHostedSockets.get(sessionId);
+  activeSelfHostedSockets.delete(sessionId);
+  if (!sock) return;
+  if (logout) { try { await sock.logout(); } catch { /* already closed */ } }
+  try { sock.end(undefined); } catch { /* ignore */ }
+}
+
+// Kept for reference — the Mongo-backed auth adapter. Currently unused
+// (useMultiFileAuthState is used instead, see startSelfHostedSession).
 async function useMongoAuthState(sessionDoc) {
   const { BufferJSON, initAuthCreds } = Baileys;
   let stored = {};
@@ -194,12 +363,10 @@ async function useMongoAuthState(sessionDoc) {
   }
   const creds = stored.creds || initAuthCreds();
   const keys = stored.keys || {};
-
   const saveState = async () => {
     const serialized = JSON.stringify({ creds, keys }, BufferJSON.replacer);
     await WhatsAppSelfSession.findByIdAndUpdate(sessionDoc._id, { authState: serialized });
   };
-
   return {
     state: {
       creds,
@@ -227,283 +394,235 @@ async function useMongoAuthState(sessionDoc) {
     saveCreds: saveState,
   };
 }
-
-// Shared by the live incoming-message handler and the history-sync import
-// below, so both always extract text the exact same way — broadened past
-// just plain text/quoted-reply text, since real messages commonly arrive
-// wrapped differently (an image/video caption, a button or list reply,
-// disappearing-message mode, etc.).
-function extractMessageText(msg) {
-  let m = msg.message;
-  if (!m) return "";
-  if (m.ephemeralMessage) m = m.ephemeralMessage.message;
-  if (m.viewOnceMessage) m = m.viewOnceMessage.message;
-  if (m.viewOnceMessageV2) m = m.viewOnceMessageV2.message;
-  return (
-    m.conversation ||
-    m.extendedTextMessage?.text ||
-    m.imageMessage?.caption ||
-    m.videoMessage?.caption ||
-    m.documentMessage?.caption ||
-    m.buttonsResponseMessage?.selectedDisplayText ||
-    m.listResponseMessage?.title ||
-    m.templateButtonReplyMessage?.selectedDisplayText ||
-    ""
-  );
-}
-
-// NEW: WhatsApp/Baileys' internal protocol traffic — message deletions,
-// ephemeral-timer changes, app-state sync keys, and similar — rides on the
-// exact same event stream as real messages, but isn't a real message at
-// all. This was showing up as literal "[protocolMessage]" bubbles in the
-// chat view, which is genuinely confusing since it isn't something anyone
-// actually sent. These are filtered out entirely now — not logged, not
-// shown as a placeholder — in both the live handler and history import.
-function isSystemMessageType(msg) {
-  const type = Object.keys(msg.message || {})[0] || "";
-  return ["protocolMessage", "senderKeyDistributionMessage", "messageContextInfo", "reactionMessage", "pollUpdateMessage"].includes(type);
-}
+void useMongoAuthState;
 
 async function startSelfHostedSession(sessionDoc) {
   if (!Baileys) throw new Error("Baileys isn't installed on the server yet");
-  const { default: makeWASocket, DisconnectReason, fetchLatestBaileysVersion, useMultiFileAuthState } = Baileys;
-  // TEMPORARY DIAGNOSTIC CHANGE: three targeted fixes in a row (session
-  // staleness, syncFullHistory) didn't resolve total connection failure,
-  // even on a genuinely fresh QR scan — so instead of guessing at another
-  // specific setting, this eliminates the biggest single source of
-  // uncertainty: the custom Mongo-backed session storage (useMongoAuthState
-  // above), replaced here with Baileys' own official, battle-tested
-  // useMultiFileAuthState. The real tradeoff: this writes to local disk,
-  // which Render wipes on every redeploy — so every number will need a
-  // fresh QR scan after each deploy again, same as before persistence was
-  // added. That's a real downside during active back-and-forth deploys,
-  // but a connection that works and needs rescanning sometimes is far
-  // better than one that never works at all. If this fixes it, the bug was
-  // in the custom Mongo adapter and that can be revisited properly once
-  // everything else is confirmed solid; if it does NOT fix it, that's
-  // equally valuable — it rules out the adapter and points at something
-  // else (Render networking/resources) instead of more guessing.
-  const sessionFolder = `/tmp/wa-sessions/${sessionDoc.sessionId}`;
-  const { state, saveCreds } = await useMultiFileAuthState(sessionFolder);
-  const { version } = await fetchLatestBaileysVersion();
-  const pino = require("pino"); // installed transitively as a Baileys dependency
-  // keepAliveIntervalMs tightened from Baileys' default — sends a ping
-  // more frequently to help the connection survive longer without an
-  // intervening idle-timeout.
-  //
-  // syncFullHistory: back on, one more genuinely different attempt rather
-  // than repeating what already failed twice. New theory: a full history
-  // for an account with a lot of chat history could spike memory usage
-  // high enough that Render's infrastructure kills the whole process
-  // outright — which looks exactly like a sudden disconnect, but is a
-  // different failure than the slow-writes theory the batching fix
-  // targeted last time. The history handler below now processes in small
-  // paced chunks with memory logging around it instead of one giant batch,
-  // which is what actually addresses a memory-spike cause specifically.
-  const sock = makeWASocket({ version, auth: state, printQRInTerminal: false, keepAliveIntervalMs: 15000, syncFullHistory: true, logger: pino({ level: "silent" }) });
+  const {
+    default: makeWASocket, DisconnectReason, fetchLatestBaileysVersion,
+    useMultiFileAuthState, makeCacheableSignalKeyStore, Browsers,
+  } = Baileys;
+  const instanceId = sessionDoc.sessionId;
+
+  // Never let two sockets run for the same session (that causes 440
+  // "connection replaced" loops and missing messages).
+  await stopSelfHostedSocket(instanceId);
+  const generation = (socketGenerations.get(instanceId) || 0) + 1;
+  socketGenerations.set(instanceId, generation);
+  const isCurrent = () => socketGenerations.get(instanceId) === generation;
+
+  // NOTE: /tmp is wiped by Render on every redeploy → a new QR scan is needed
+  // after each deploy (same as before). Use a persistent disk path to avoid it.
+  const { state, saveCreds } = await useMultiFileAuthState(sessionFolderFor(instanceId));
+  let version;
+  try { ({ version } = await fetchLatestBaileysVersion()); } catch { /* use Baileys' default */ }
+  if (!isCurrent()) return null; // superseded while we were awaiting
+
+  const pino = require("pino");
+  const logger = pino({ level: "silent" });
+  const sock = makeWASocket({
+    ...(version ? { version } : {}),
+    auth: makeCacheableSignalKeyStore
+      ? { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) }
+      : state,
+    logger,
+    printQRInTerminal: false,
+    // A "desktop" link gets far more history from WhatsApp than a web link.
+    browser: Browsers ? Browsers.macOS("Desktop") : ["Mac OS", "Desktop", "10.15.7"],
+    syncFullHistory: true,
+    shouldSyncHistoryMessage: () => true,
+    markOnlineOnConnect: false,
+    keepAliveIntervalMs: 15000,
+  });
+  activeSelfHostedSockets.set(instanceId, sock);
+
+  let everOpened = false;
+  let qrIssued = false;
 
   sock.ev.on("creds.update", saveCreds);
 
   sock.ev.on("connection.update", async (update) => {
+    if (!isCurrent()) return;
     const { connection, lastDisconnect, qr } = update;
     if (qr) {
+      qrIssued = true;
       console.log(`[Self-hosted WhatsApp] "${sessionDoc.label}" — new QR issued`);
       await WhatsAppSelfSession.findByIdAndUpdate(sessionDoc._id, { lastQr: qr, status: "pending_qr" });
     }
     if (connection === "open") {
+      everOpened = true;
       const phoneNumber = sock.user?.id ? sock.user.id.split(":")[0] : "";
       console.log(`[Self-hosted WhatsApp] "${sessionDoc.label}" — connected (${phoneNumber})`);
       await WhatsAppSelfSession.findByIdAndUpdate(sessionDoc._id, { status: "connected", phoneNumber, lastQr: "" });
     }
     if (connection === "close") {
-      activeSelfHostedSockets.delete(sessionDoc.sessionId);
+      if (activeSelfHostedSockets.get(instanceId) === sock) activeSelfHostedSockets.delete(instanceId);
       const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const loggedOut = statusCode === DisconnectReason.loggedOut;
-      // NEW: this is the log line that actually explains what's happening
-      // on every redeploy — WHY it disconnected (statusCode 401 = logged
-      // out for real, 428/440 = connection replaced by another session
-      // using the same credentials, 515 = normal restart-required close,
-      // etc.), so a repeated pattern here (rather than one clean
-      // reconnect) is visible instead of silent.
-      console.log(`[Self-hosted WhatsApp] "${sessionDoc.label}" — disconnected. statusCode=${statusCode}, loggedOut=${loggedOut}, reason=${lastDisconnect?.error?.message || "unknown"}`);
-      await WhatsAppSelfSession.findByIdAndUpdate(sessionDoc._id, { status: "disconnected" });
-      if (!loggedOut) {
-        // Real disconnect (not an explicit logout) — try again shortly using
-        // the same saved credentials.
-        console.log(`[Self-hosted WhatsApp] "${sessionDoc.label}" — will attempt reconnect in 5s`);
-        setTimeout(() => {
-          WhatsAppSelfSession.findById(sessionDoc._id).then((fresh) => { if (fresh) startSelfHostedSession(fresh).catch((err) => console.error("[Self-hosted WhatsApp] reconnect failed:", err.message)); });
-        }, 5000);
-      } else {
-        console.log(`[Self-hosted WhatsApp] "${sessionDoc.label}" — logged out for real (401); this needs a fresh QR scan, not a reconnect.`);
+      console.log(`[Self-hosted WhatsApp] "${sessionDoc.label}" — disconnected. statusCode=${statusCode}, reason=${lastDisconnect?.error?.message || "unknown"}`);
+
+      if (statusCode === DisconnectReason.loggedOut) {
+        // Unlinked from the phone (or logged out) — wipe creds so the next
+        // Reconnect shows a fresh QR instead of trying dead credentials.
+        wipeSessionFolder(instanceId);
+        await WhatsAppSelfSession.findByIdAndUpdate(sessionDoc._id, { status: "disconnected", lastQr: "" });
+        console.log(`[Self-hosted WhatsApp] "${sessionDoc.label}" — logged out; click Reconnect to scan a new QR.`);
+        return;
       }
+      if (statusCode === DisconnectReason.connectionReplaced) {
+        await WhatsAppSelfSession.findByIdAndUpdate(sessionDoc._id, { status: "disconnected" });
+        console.log(`[Self-hosted WhatsApp] "${sessionDoc.label}" — replaced by another connection using the same session; not auto-reconnecting.`);
+        return;
+      }
+      if (qrIssued && !everOpened && statusCode !== DisconnectReason.restartRequired) {
+        // QR was shown but never scanned — stop instead of generating QRs forever.
+        await WhatsAppSelfSession.findByIdAndUpdate(sessionDoc._id, { status: "disconnected", lastQr: "" });
+        console.log(`[Self-hosted WhatsApp] "${sessionDoc.label}" — QR expired without being scanned.`);
+        return;
+      }
+      // 515 (restartRequired) happens right after a successful QR scan — don't
+      // flip the status to "disconnected" for that, the new socket opens in a moment.
+      if (statusCode !== DisconnectReason.restartRequired) {
+        await WhatsAppSelfSession.findByIdAndUpdate(sessionDoc._id, { status: "disconnected" });
+      }
+      setTimeout(async () => {
+        if (!isCurrent()) return; // user clicked Reconnect/Remove meanwhile
+        const fresh = await WhatsAppSelfSession.findById(sessionDoc._id);
+        if (fresh) startSelfHostedSession(fresh).catch((err) => console.error("[Self-hosted WhatsApp] reconnect failed:", err.message));
+      }, statusCode === DisconnectReason.restartRequired ? 500 : 5000);
     }
   });
 
+  // ── Live messages (incoming + anything sent from the phone/other devices) ──
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
-    console.log(`[Self-hosted WhatsApp] messages.upsert fired for "${sessionDoc.label}" — type=${type}, count=${messages.length}`);
-    if (type !== "notify") return;
+    if (!isCurrent()) return;
+    if (type !== "notify" && type !== "append") return;
     for (const msg of messages) {
       try {
-        if (!msg.message) continue;
-        if (msg.key.remoteJid?.endsWith("@g.us")) continue; // skip group messages for the AI bot/logging path here
-        if (isSystemMessageType(msg)) continue; // protocol traffic, not a real message — see isSystemMessageType above
+        const remote = msg.key?.remoteJid || "";
+        if (!msg.message || !remote) continue;
+        if (remote.endsWith("@g.us") || remote.endsWith("@broadcast") || remote.endsWith("@newsletter")) continue;
+        const content = getMessageContent(msg);
+        if (!content) continue; // protocol/system traffic
 
-        const { jid, displayNumber } = await resolveMessageIdentity(msg.key, sock);
-        if (!jid) continue;
-        const text = extractMessageText(msg);
-        const messageType = Object.keys(msg.message)[0] || "unknown";
-        const messageBody = text || `[${messageType}]`;
+        const { jid, displayNumber } = await resolveMessageIdentity(msg.key, sock, instanceId);
+        if (!displayNumber) continue;
 
-        if (msg.key.fromMe) {
-          // NEW: this used to be unconditionally skipped, on the assumption
-          // that every outgoing message was one the dashboard itself just
-          // sent and already logged directly. That's wrong for anything
-          // sent from the connected PHONE (or any other linked device) —
-          // WhatsApp's multi-device sync reports those here too, and they
-          // were being silently dropped entirely, which is why messages
-          // sent from the phone never showed up in the dashboard. The
-          // waMessageId check below is what avoids double-logging a
-          // message the dashboard really did send (it's already saved by
-          // the /send route itself, with the same ID, by the time this
-          // event usually arrives).
-          if (msg.key.id) {
-            const already = await WhatsAppMessage.findOne({ waMessageId: msg.key.id });
-            if (already) continue;
-          }
-          await logWhatsAppMessage({ instanceId: sessionDoc.sessionId, direction: "outgoing", number: displayNumber, jid, message: messageBody, status: "sent", source: "mobile_app", waMessageId: msg.key.id || "" });
-          continue;
+        if (!msg.key.fromMe && msg.pushName) {
+          WhatsAppContact.updateOne(
+            { instanceId, number: displayNumber },
+            { $set: { notify: msg.pushName }, $setOnInsert: { jid } },
+            { upsert: true }
+          ).catch(() => {});
         }
 
-        if (!text) {
-          // Still log something rather than silently dropping it — an
-          // unsupported message type (a sticker, a location pin, a poll
-          // vote, etc.) shows up in the thread as this placeholder instead
-          // of just vanishing.
-          await logWhatsAppMessage({ instanceId: sessionDoc.sessionId, direction: "incoming", number: displayNumber, jid, message: messageBody, status: "received", source: "self_hosted", waMessageId: msg.key.id || "" });
-          continue;
-        }
+        if (msg.key.id && await WhatsAppMessage.exists({ instanceId, waMessageId: msg.key.id })) continue;
 
-        await logWhatsAppMessage({ instanceId: sessionDoc.sessionId, direction: "incoming", number: displayNumber, jid, message: text, status: "received", source: "self_hosted", waMessageId: msg.key.id || "" });
+        const fromMe = !!msg.key.fromMe;
+        await logWhatsAppMessage({
+          instanceId,
+          direction: fromMe ? "outgoing" : "incoming",
+          number: displayNumber,
+          jid,
+          message: content.text,
+          status: fromMe ? "sent" : "received",
+          source: fromMe ? "mobile_app" : "self_hosted",
+          waMessageId: msg.key.id || "",
+          createdAt: toDate(msg.messageTimestamp),
+        });
 
-        const botSettings = await getBotSettings();
-        if (botSettings.enabled && botSettings.enabledInstanceIds.includes(sessionDoc.sessionId)) {
-          const history = await buildBotHistory(sessionDoc.sessionId, displayNumber, text);
-          const reply = await callOpenAI({ systemPrompt: botSettings.instructions, history, model: botSettings.model });
-          if (reply) {
-            const replyId = await sock.sendMessage(jid, { text: reply });
-            await logWhatsAppMessage({ instanceId: sessionDoc.sessionId, direction: "outgoing", number: displayNumber, jid, message: reply, status: "sent", source: "ai_bot", waMessageId: replyId?.key?.id || "" });
+        // AI bot: only for genuinely new incoming text messages
+        if (!fromMe && type === "notify" && content.hasText) {
+          const botSettings = await getBotSettings();
+          if (botSettings.enabled && botSettings.enabledInstanceIds.includes(instanceId)) {
+            const history = await buildBotHistory(instanceId, displayNumber, content.text);
+            const reply = await callOpenAI({ systemPrompt: botSettings.instructions, history, model: botSettings.model });
+            if (reply) {
+              const sent = await sock.sendMessage(jid, { text: reply });
+              await logWhatsAppMessage({ instanceId, direction: "outgoing", number: displayNumber, jid, message: reply, status: "sent", source: "ai_bot", waMessageId: sent?.key?.id || "" });
+            }
           }
         }
       } catch (err) { console.error("[Self-hosted WhatsApp] incoming message handling failed:", err.message); }
     }
   });
 
-  // NEW: imports WhatsApp's own message history — this is what makes prior
-  // conversations (that existed before this number connected here) show up
-  // instead of the thread starting empty. Baileys fires this on initial
-  // connect with whatever history WhatsApp's servers hand over now that
-  // syncFullHistory is enabled again. waMessageId is used to avoid
-  // importing the same message twice across multiple syncs/reconnects.
-  // contacts arrives in this same event too — saved contact names, so
-  // chats can show "Ali Khan" instead of a bare number wherever WhatsApp
-  // itself would.
-  sock.ev.on("messaging-history.set", async ({ messages, contacts, isLatest }) => {
+  // ── Full history import (runs after a fresh QR scan) ─────────────────────
+  sock.ev.on("messaging-history.set", async ({ chats, contacts, messages, isLatest, lidPnMappings, progress }) => {
+    if (!isCurrent()) return;
     const memMB = (process.memoryUsage().rss / 1024 / 1024).toFixed(0);
-    console.log(`[Self-hosted WhatsApp] history sync for "${sessionDoc.label}" — ${messages.length} message(s), ${contacts?.length || 0} contact(s), isLatest=${isLatest}, memory=${memMB}MB`);
+    console.log(`[Self-hosted WhatsApp] history sync for "${sessionDoc.label}" — ${messages?.length || 0} message(s), ${contacts?.length || 0} contact(s), ${chats?.length || 0} chat(s), isLatest=${isLatest}, progress=${progress ?? "?"}, memory=${memMB}MB`);
 
-    if (contacts?.length > 0) {
-      const ops = [];
-      for (const c of contacts) {
-        const name = c.name || c.notify || c.verifiedName || "";
-        if (!c.id || !name) continue;
-        // NEW: resolves the contact's id through the same LID-mapping logic
-        // as messages — a contact synced under a LID needs to end up keyed
-        // by the same resolved identifier a message from that same person
-        // gets stored under, or the name lookup silently never matches.
-        const { jid: resolvedJid } = await resolveMessageIdentity({ remoteJid: c.id }, sock);
-        if (!resolvedJid) continue;
-        ops.push({ updateOne: { filter: { instanceId: sessionDoc.sessionId, jid: resolvedJid }, update: { $set: { name } }, upsert: true } });
-      }
-      if (ops.length > 0) {
-        try { await WhatsAppContact.bulkWrite(ops, { ordered: false }); }
-        catch (err) { console.error("[Self-hosted WhatsApp] bulk contact save failed:", err.message); }
-      }
+    // 1) learn LID ↔ number mappings first, so messages below resolve to numbers
+    for (const m of lidPnMappings || []) await rememberLid(instanceId, m?.lid, m?.pn);
+    for (const c of chats || []) {
+      const ids = [c.id, c.pnJid, c.lidJid].map(jidNorm).filter(Boolean);
+      const pn = ids.find(isPnJid);
+      const lid = ids.find(isLidJid);
+      if (pn && lid) await rememberLid(instanceId, lid, pn);
     }
+    // 2) contact names
+    await saveContacts(instanceId, sock, contacts);
 
-    const candidates = [];
-    for (const msg of messages) {
-      if (!msg.message || !msg.key?.remoteJid) continue;
-      if (msg.key.remoteJid.endsWith("@g.us")) continue; // groups skipped here too, same as the live handler
-      if (isSystemMessageType(msg)) continue; // protocol traffic, not a real message
-      const text = extractMessageText(msg);
-      if (!text) continue; // history items with no plain text are skipped rather than filling the thread with placeholders
-      const { jid, displayNumber } = await resolveMessageIdentity(msg.key, sock);
-      if (!jid) continue;
-      const direction = msg.key.fromMe ? "outgoing" : "incoming";
-      candidates.push({
-        instanceId: sessionDoc.sessionId, direction, number: displayNumber, jid, message: text,
-        status: direction === "outgoing" ? "sent" : "received", source: "history_sync",
-        waMessageId: msg.key.id || "",
-        createdAt: msg.messageTimestamp ? new Date(Number(msg.messageTimestamp) * 1000) : new Date(),
+    // 3) messages
+    const ops = [];
+    const now = new Date();
+    for (const msg of messages || []) {
+      const remote = msg.key?.remoteJid || "";
+      if (!msg.message || !remote) continue;
+      if (remote.endsWith("@g.us") || remote.endsWith("@broadcast") || remote.endsWith("@newsletter")) continue;
+      const content = getMessageContent(msg);
+      if (!content) continue;
+      const { jid, displayNumber } = await resolveMessageIdentity(msg.key, sock, instanceId);
+      if (!displayNumber || !msg.key.id) continue;
+      const fromMe = !!msg.key.fromMe;
+      ops.push({
+        updateOne: {
+          filter: { instanceId, waMessageId: msg.key.id },
+          update: {
+            $setOnInsert: {
+              instanceId, direction: fromMe ? "outgoing" : "incoming", number: displayNumber, groupId: "",
+              jid, message: content.text, status: fromMe ? "sent" : "received", source: "history_sync",
+              waMessageId: msg.key.id, createdAt: toDate(msg.messageTimestamp), updatedAt: now,
+            },
+          },
+          upsert: true,
+          timestamps: false,
+        },
       });
     }
-    if (candidates.length === 0) return;
+    if (ops.length === 0) return;
 
-    // NEW: processed in small paced chunks instead of one giant batch —
-    // if a memory spike from handling everything at once is what's
-    // actually killing the process (Render's infrastructure force-killing
-    // it looks identical to a sudden disconnect, unlike a normal Baileys-
-    // reported one), spreading the work out over time with pauses between
-    // chunks keeps peak memory far lower than doing it all in one go. The
-    // memory logging here is what will confirm whether this was actually
-    // the mechanism, if this needs to be looked at again.
+    // Small paced chunks keep memory low on Render.
     const CHUNK_SIZE = 200;
-    let totalInserted = 0;
-    for (let i = 0; i < candidates.length; i += CHUNK_SIZE) {
-      const chunk = candidates.slice(i, i + CHUNK_SIZE);
+    let imported = 0;
+    for (let i = 0; i < ops.length; i += CHUNK_SIZE) {
+      if (!isCurrent()) return;
       try {
-        const ids = chunk.map((c) => c.waMessageId).filter(Boolean);
-        const existing = ids.length > 0 ? await WhatsAppMessage.find({ waMessageId: { $in: ids } }).select("waMessageId") : [];
-        const existingIds = new Set(existing.map((e) => e.waMessageId));
-        const toInsert = chunk.filter((c) => !c.waMessageId || !existingIds.has(c.waMessageId));
-        if (toInsert.length > 0) await WhatsAppMessage.insertMany(toInsert, { ordered: false });
-        totalInserted += toInsert.length;
-      } catch (err) { console.error("[Self-hosted WhatsApp] history chunk import error:", err.message); }
-      if (i + CHUNK_SIZE < candidates.length) await new Promise((r) => setTimeout(r, 300)); // brief pause between chunks
+        const result = await WhatsAppMessage.bulkWrite(ops.slice(i, i + CHUNK_SIZE), { ordered: false });
+        imported += result.upsertedCount || 0;
+      } catch (err) {
+        imported += err.result?.upsertedCount || err.result?.nUpserted || 0;
+        if (err.code !== 11000) console.error("[Self-hosted WhatsApp] history chunk import error:", err.message);
+      }
+      if (i + CHUNK_SIZE < ops.length) await new Promise((r) => setTimeout(r, 300));
     }
     const memAfterMB = (process.memoryUsage().rss / 1024 / 1024).toFixed(0);
-    console.log(`[Self-hosted WhatsApp] history sync for "${sessionDoc.label}" — imported ${totalInserted} new message(s), memory now=${memAfterMB}MB`);
+    console.log(`[Self-hosted WhatsApp] history sync for "${sessionDoc.label}" — imported ${imported} new message(s), memory now=${memAfterMB}MB`);
   });
 
-  // Ongoing contact-name updates — someone getting newly saved in your
-  // phone's contacts, or changing their WhatsApp display name, after the
-  // initial history sync already ran.
-  sock.ev.on("contacts.upsert", async (contacts) => {
-    for (const contact of contacts || []) {
-      const name = contact.name || contact.notify || contact.verifiedName || "";
-      if (!contact.id || !name) continue;
-      const { jid: resolvedJid } = await resolveMessageIdentity({ remoteJid: contact.id }, sock);
-      if (resolvedJid) await upsertWhatsAppContact(sessionDoc.sessionId, resolvedJid, name);
-    }
-  });
-  sock.ev.on("contacts.update", async (contacts) => {
-    for (const contact of contacts || []) {
-      const name = contact.name || contact.notify || contact.verifiedName || "";
-      if (!contact.id || !name) continue;
-      const { jid: resolvedJid } = await resolveMessageIdentity({ remoteJid: contact.id }, sock);
-      if (resolvedJid) await upsertWhatsAppContact(sessionDoc.sessionId, resolvedJid, name);
-    }
+  // Newer Baileys versions announce LID ↔ number mappings directly
+  sock.ev.on("lid-mapping.update", async (update) => {
+    if (!isCurrent()) return;
+    for (const m of Array.isArray(update) ? update : [update]) await rememberLid(instanceId, m?.lid, m?.pn);
   });
 
-  activeSelfHostedSockets.set(sessionDoc.sessionId, sock);
+  // Saved-name changes after the initial sync
+  sock.ev.on("contacts.upsert", async (contacts) => { if (isCurrent()) await saveContacts(instanceId, sock, contacts); });
+  sock.ev.on("contacts.update", async (contacts) => { if (isCurrent()) await saveContacts(instanceId, sock, contacts); });
+
   return sock;
 }
 
-// Reconnects every session that was connected (or briefly disconnected)
-// before the last server restart — called once when the DB connection
-// opens. pending_qr sessions are left alone; those need an explicit "Show
-// QR" click since they never finished authenticating in the first place.
 async function startAllSelfHostedSessions() {
   if (!Baileys) { console.log("[Self-hosted WhatsApp] Baileys not installed — skipping startup reconnect"); return; }
   try {
@@ -513,13 +632,7 @@ async function startAllSelfHostedSessions() {
   } catch (err) { console.error("[Self-hosted WhatsApp] startup scan failed:", err.message); }
 }
 
-// The one canonical number format used everywhere a number is stored on a
-// WhatsAppMessage — digits only, no "+", no spaces/dashes. This is what
-// fixes conversations splitting into two threads for the same person: an
-// outgoing message used to store exactly whatever was typed (which could
-// include a "+"), while an incoming reply's number came from WhatsApp's own
-// JID (which never has one) — two different strings for the same contact.
-// Every write path below now normalizes through this before storing.
+// Digits only — the one canonical number format stored everywhere.
 function normalizeWaNumber(number) {
   return String(number).replace(/[^\d]/g, "");
 }
@@ -528,76 +641,54 @@ function toWhatsAppJid(number) {
   return `${normalizeWaNumber(number)}@s.whatsapp.net`;
 }
 
-// Resolves the real WhatsApp identifier and a human-readable display number
-// from a message key. Some contacts use WhatsApp's newer "LID" privacy-ID
-// system (remoteJid ending in @lid — an internal ID that looks like a
-// random number) instead of their real phone number; Baileys exposes the
-// actual phone-number JID for these via remoteJidAlt when it's available.
-// jid is always the exact identifier to reply to — replying to the LID
-// itself (the identifier the message actually came from) is what actually
-// reaches the contact; displayNumber is the best-effort human-readable
-// number, honestly labeled "lid:..." rather than shown as a fake phone
-// number when a real one genuinely can't be determined.
-async function resolveMessageIdentity(key, sock) {
-  const jid = key.remoteJid;
-  const altJid = key.remoteJidAlt;
-  if (jid && jid.endsWith("@s.whatsapp.net")) {
-    return { jid, displayNumber: normalizeWaNumber(jid.replace("@s.whatsapp.net", "")) };
+// Returns { jid, displayNumber }:
+//   jid           — exact identifier to reply to (phone JID or LID)
+//   displayNumber — the real phone number (digits) whenever it can be found;
+//                   "lid:xxxx" only as a temporary fallback; "" for things
+//                   that aren't 1-to-1 chats.
+async function resolveMessageIdentity(key, sock, instanceId) {
+  const jid = jidNorm(key?.remoteJid);
+  if (!jid) return { jid: "", displayNumber: "" };
+  if (isPnJid(jid)) return { jid, displayNumber: digitsOf(jid) };
+  if (!isLidJid(jid)) return { jid, displayNumber: "" };
+
+  const alt = [key.remoteJidAlt, key.senderPn].map(jidNorm).find(isPnJid);
+  if (alt) {
+    await rememberLid(instanceId, jid, alt);
+    return { jid, displayNumber: digitsOf(alt) };
   }
-  if (altJid && altJid.endsWith("@s.whatsapp.net")) {
-    return { jid, displayNumber: normalizeWaNumber(altJid.replace("@s.whatsapp.net", "")) };
-  }
-  // NEW: second resolution attempt, using Baileys' own internal LID<->phone-
-  // number mapping store when it exists — a real, dedicated API for exactly
-  // this, rather than another guess. Wrapped defensively since this is a
-  // newer, less consistently-documented part of Baileys across versions;
-  // if it's not present or throws, this just falls through to the honest
-  // "lid:..." label below instead of breaking anything.
-  if (jid && jid.endsWith("@lid") && sock?.signalRepository?.lidMapping?.getPNForLID) {
+
+  const known = await lookupLid(instanceId, jid);
+  if (known) return { jid, displayNumber: known };
+
+  if (sock?.signalRepository?.lidMapping?.getPNForLID) {
     try {
-      const pn = await sock.signalRepository.lidMapping.getPNForLID(jid);
-      if (pn) return { jid, displayNumber: normalizeWaNumber(String(pn).replace("@s.whatsapp.net", "")) };
-    } catch { /* fall through to the lid: label below */ }
+      const pn = jidNorm(await sock.signalRepository.lidMapping.getPNForLID(jid));
+      if (isPnJid(pn)) {
+        await rememberLid(instanceId, jid, pn);
+        return { jid, displayNumber: digitsOf(pn) };
+      }
+    } catch { /* not resolvable yet — merged automatically later */ }
   }
-  // Logs the full key whenever neither field resolves to a real phone-
-  // number JID — this is the exact data needed to find the right field for
-  // real if remoteJidAlt/lidMapping aren't where a given Baileys version
-  // puts this, instead of guessing at another field name blind.
-  console.log(`[Self-hosted WhatsApp] could not resolve a real number — raw key: ${JSON.stringify(key)}`);
-  const lidDigits = jid ? jid.replace("@lid", "").replace(/[^\d]/g, "") : "";
-  return { jid: jid || "", displayNumber: lidDigits ? `lid:${lidDigits}` : "" };
+  return { jid, displayNumber: lidLabel(jid) };
 }
 
 async function sendSelfHostedMessage(sessionId, target, text) {
   const sock = activeSelfHostedSockets.get(sessionId);
   if (!sock) throw new Error("This number isn't connected right now");
-  // target can be a plain number (a phone-number JID gets constructed) or
-  // an already-complete JID (used exactly as given) — replying within an
-  // existing thread passes the exact stored jid, which is what makes
-  // replies reach LID-based contacts correctly instead of assuming every
-  // contact uses a phone-number JID.
   const jid = String(target).includes("@") ? target : toWhatsAppJid(target);
   const sent = await sock.sendMessage(jid, { text });
-  // NEW: returns the real Baileys message ID for this send — this is what
-  // lets the live message handler below recognize "this is an echo of a
-  // message the dashboard itself already logged" and skip re-logging it,
-  // while still logging every OTHER outgoing message (sent from the
-  // connected phone directly, or any other linked device) that never went
-  // through this function at all.
+  // Learn this number's LID now, so the reply joins this same thread.
+  learnLidForPn(sessionId, sock, jid).catch(() => {});
   return sent?.key?.id || "";
 }
 
-// Runs in the background (not awaited by the route that starts it) — sends
-// with a randomized pause between each message. This isn't just politeness:
-// sending many messages back-to-back is exactly the pattern WhatsApp's spam
-// detection looks for, and pacing genuinely reduces (never eliminates) the
-// chance of the number getting flagged.
 async function runBulkJob(jobId, sessionId, numbers, message) {
   const results = [];
   for (const number of numbers) {
     try {
       const waMessageId = await sendSelfHostedMessage(sessionId, number, message);
-      await logWhatsAppMessage({ instanceId: sessionId, direction: "outgoing", number: normalizeWaNumber(number), message, status: "sent", source: "bulk", waMessageId });
+      await logWhatsAppMessage({ instanceId: sessionId, direction: "outgoing", number: normalizeWaNumber(number), jid: toWhatsAppJid(number), message, status: "sent", source: "bulk", waMessageId });
       results.push({ number, success: true, error: "" });
     } catch (err) {
       await logWhatsAppMessage({ instanceId: sessionId, direction: "outgoing", number: normalizeWaNumber(number), message, status: "failed", source: "bulk" });
@@ -609,10 +700,6 @@ async function runBulkJob(jobId, sessionId, numbers, message) {
   await WhatsAppBulkJob.findByIdAndUpdate(jobId, { status: "done", results });
 }
 
-// Real, documented OpenAI Chat Completions API —
-// https://platform.openai.com/docs/api-reference/chat. Same "real,
-// documented API, not a guess" reasoning as the Anthropic integration this
-// replaces — swapped to OpenAI per request, since it's the cheaper option.
 async function callOpenAI({ systemPrompt, history, model }) {
   const settings = await getSiteSettings();
   const apiKey = settings.openaiApiKey;
@@ -635,13 +722,13 @@ async function callOpenAI({ systemPrompt, history, model }) {
   return data.choices?.[0]?.message?.content || "";
 }
 
-// Builds the last ~10 messages between this number and this instance as
-// Anthropic-format conversation history, oldest first, alternating
-// user/assistant — real prior context, not a blank slate every message.
 async function buildBotHistory(instanceId, number, latestIncomingText) {
   const prior = await WhatsAppMessage.find({ instanceId, number, groupId: "" }).sort("-createdAt").limit(10);
   const history = prior.reverse().map((m) => ({ role: m.direction === "incoming" ? "user" : "assistant", content: m.message }));
-  history.push({ role: "user", content: latestIncomingText });
+  const last = history[history.length - 1];
+  if (!(last && last.role === "user" && last.content === latestIncomingText)) {
+    history.push({ role: "user", content: latestIncomingText });
+  }
   return history;
 }
 
@@ -664,7 +751,7 @@ async function sendWhatsAppRaw({ to, text }) {
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
     body: JSON.stringify({
       messaging_product: "whatsapp",
-      to: String(to).replace(/[^\d+]/g, ""), // WhatsApp Cloud API wants digits (with country code), no spaces/dashes
+      to: String(to).replace(/[^\d+]/g, ""),
       type: "text",
       text: { body: text, preview_url: true },
     }),
@@ -674,10 +761,7 @@ async function sendWhatsAppRaw({ to, text }) {
   return data;
 }
 
-// Super Admin → Settings → WhatsApp. GET never returns the actual access
-// token back — only whether one is currently saved — same convention as any
-// password field: you re-enter it to change it, you don't get to read it
-// back out.
+// ── Super Admin → Settings → WhatsApp (Meta Cloud API) ──────────────────────
 app.get("/api/admin/settings/whatsapp", protect, adminOnly, async (req, res) => {
   try {
     const settings = await getSiteSettings();
@@ -709,12 +793,7 @@ app.delete("/api/admin/settings/whatsapp", protect, adminOnly, async (req, res) 
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// ══════════════════════════════════════════════════════════════════════════════
-// AI PROVIDER SETTINGS — Super Admin → WhatsApp → AI Bot
-// ══════════════════════════════════════════════════════════════════════════════
-
-// OpenAI API key — powers the WhatsApp AI Bot. Same never-returned-once-
-// saved convention as the other tokens above.
+// ── OpenAI key — Super Admin → WhatsApp → Chatbot ───────────────────────────
 app.get("/api/admin/settings/openai", protect, adminOnly, async (req, res) => {
   try {
     const settings = await getSiteSettings();
@@ -736,10 +815,7 @@ app.delete("/api/admin/settings/openai", protect, adminOnly, async (req, res) =>
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// ══════════════════════════════════════════════════════════════════════════════
-// AI BOT — Super Admin → WhatsApp → AI Bot
-// ══════════════════════════════════════════════════════════════════════════════
-
+// ── AI Bot ──────────────────────────────────────────────────────────────────
 app.get("/api/admin/whatsapp/bot-settings", protect, adminOnly, async (req, res) => {
   try {
     res.json(await getBotSettings());
@@ -759,9 +835,6 @@ app.post("/api/admin/whatsapp/bot-settings", protect, adminOnly, async (req, res
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// Test the bot's current "training" without touching real WhatsApp at
-// all — lets you refine the instructions and see exactly how it'll answer
-// before turning it on for actual customers.
 app.post("/api/admin/whatsapp/bot-test", protect, adminOnly, async (req, res) => {
   try {
     const { message, history } = req.body || {};
@@ -774,10 +847,8 @@ app.post("/api/admin/whatsapp/bot-test", protect, adminOnly, async (req, res) =>
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-// SELF-HOSTED WHATSAPP SERVER ROUTES — Super Admin → WhatsApp → Self-Hosted Server
+// SELF-HOSTED WHATSAPP SERVER ROUTES
 // ══════════════════════════════════════════════════════════════════════════════
-// Every route here returns a clear 503 instead of crashing if Baileys isn't
-// installed yet — see the require() at the top of this file.
 function requireBaileys(req, res, next) {
   if (!Baileys) return res.status(503).json({ message: "The self-hosted WhatsApp server isn't installed yet — run `npm install @whiskeysockets/baileys` and redeploy." });
   next();
@@ -800,10 +871,6 @@ app.post("/api/admin/whatsapp-server/sessions", protect, adminOnly, requireBaile
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// Poll this after creating a session (or after Reconnect) until it returns
-// a QR, then again after scanning until status flips to "connected" —
-// Baileys emits the QR as an event, so this is read from whatever the
-// connection.update handler last saved rather than generated on demand.
 app.get("/api/admin/whatsapp-server/sessions/:id/qr", protect, adminOnly, requireBaileys, async (req, res) => {
   try {
     const session = await WhatsAppSelfSession.findById(req.params.id).select("-authState");
@@ -812,13 +879,17 @@ app.get("/api/admin/whatsapp-server/sessions/:id/qr", protect, adminOnly, requir
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
+// Reconnect = full fresh link: log out the old link, wipe its credentials,
+// start a new socket → a NEW QR code. Scanning it also re-imports history.
 app.post("/api/admin/whatsapp-server/sessions/:id/reconnect", protect, adminOnly, requireBaileys, async (req, res) => {
   try {
     const session = await WhatsAppSelfSession.findById(req.params.id);
     if (!session) return res.status(404).json({ message: "Session not found" });
-    activeSelfHostedSockets.delete(session.sessionId);
-    startSelfHostedSession(session).catch((err) => console.error("[Self-hosted WhatsApp] reconnect failed:", err.message));
-    res.json({ started: true });
+    await stopSelfHostedSocket(session.sessionId, { logout: true });
+    wipeSessionFolder(session.sessionId);
+    const fresh = await WhatsAppSelfSession.findByIdAndUpdate(session._id, { status: "pending_qr", lastQr: "" }, { new: true });
+    startSelfHostedSession(fresh).catch((err) => console.error("[Self-hosted WhatsApp] reconnect failed:", err.message));
+    res.json({ _id: fresh._id, label: fresh.label, sessionId: fresh.sessionId, status: fresh.status });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
@@ -826,18 +897,15 @@ app.delete("/api/admin/whatsapp-server/sessions/:id", protect, adminOnly, requir
   try {
     const session = await WhatsAppSelfSession.findById(req.params.id);
     if (!session) return res.status(404).json({ message: "Session not found" });
-    const sock = activeSelfHostedSockets.get(session.sessionId);
-    if (sock) { try { await sock.logout(); } catch { /* ignore — removing our record either way */ } }
-    activeSelfHostedSockets.delete(session.sessionId);
+    await stopSelfHostedSocket(session.sessionId, { logout: true });
+    wipeSessionFolder(session.sessionId);
     await WhatsAppSelfSession.findByIdAndDelete(req.params.id);
     res.json({ deleted: true });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// Wipes stored message history for one number WITHOUT disconnecting it —
-// useful for clearing out old records that were saved before a fix (like
-// the LID-resolution one), so a later history sync repopulates cleanly
-// instead of mixing old, incorrectly-labeled rows with new correct ones.
+// Wipes stored message history for one number WITHOUT disconnecting it.
+// To re-import the full history afterwards, click Reconnect and scan the QR.
 app.delete("/api/admin/whatsapp-server/sessions/:id/messages", protect, adminOnly, requireBaileys, async (req, res) => {
   try {
     const session = await WhatsAppSelfSession.findById(req.params.id);
@@ -853,14 +921,10 @@ app.post("/api/admin/whatsapp-server/send", protect, adminOnly, requireBaileys, 
     if (!sessionDocId || !to?.trim() || !message?.trim()) return res.status(400).json({ message: "A number and a message are required" });
     const session = await WhatsAppSelfSession.findById(sessionDocId);
     if (!session) return res.status(404).json({ message: "Session not found" });
-    const displayNumber = normalizeWaNumber(to);
-    // If this contact has messaged before, reply to the exact identifier
-    // their messages came from rather than reconstructing a phone-number
-    // JID — this is what makes replying work for contacts WhatsApp has
-    // moved to its "LID" privacy-ID system, where a phone-number-based JID
-    // simply doesn't reach them.
+    // Keep "lid:xxxx" thread keys intact; normalize real numbers to digits
+    const displayNumber = to.trim().startsWith("lid:") ? to.trim() : normalizeWaNumber(to);
     const priorMessage = await WhatsAppMessage.findOne({ instanceId: session.sessionId, number: displayNumber, jid: { $ne: "" } }).sort("-createdAt");
-    const sendTarget = priorMessage?.jid || to.trim();
+    const sendTarget = priorMessage?.jid || (displayNumber.startsWith("lid:") ? `${displayNumber.slice(4)}@lid` : displayNumber);
     try {
       const waMessageId = await sendSelfHostedMessage(session.sessionId, sendTarget, message.trim());
       await logWhatsAppMessage({ instanceId: session.sessionId, direction: "outgoing", number: displayNumber, jid: sendTarget.includes("@") ? sendTarget : toWhatsAppJid(sendTarget), message: message.trim(), status: "sent", source: "manual", waMessageId });
@@ -872,10 +936,6 @@ app.post("/api/admin/whatsapp-server/send", protect, adminOnly, requireBaileys, 
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// Starts a bulk send in the background and returns immediately with a job
-// ID to poll — sending to many numbers one request at a time (with pacing
-// between each) can easily take longer than a normal HTTP request should
-// be left open for.
 app.post("/api/admin/whatsapp-server/send-bulk", protect, adminOnly, requireBaileys, async (req, res) => {
   try {
     const { sessionDocId, numbers, message } = req.body || {};
@@ -897,10 +957,6 @@ app.get("/api/admin/whatsapp-server/bulk-jobs/:id", protect, adminOnly, requireB
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// Simple external API key so this can be called by another app/service you
-// build or share with a partner, without needing a Super Admin login —
-// stored the same way as the other secrets (Super Admin → WhatsApp →
-// Self-Hosted Server).
 app.post("/api/whatsapp-server/external/send", requireBaileys, async (req, res) => {
   try {
     const { apiKey, sessionId, to, message } = req.body || {};
@@ -909,7 +965,7 @@ app.post("/api/whatsapp-server/external/send", requireBaileys, async (req, res) 
       return res.status(401).json({ message: "Invalid API key" });
     if (!sessionId || !to?.trim() || !message?.trim()) return res.status(400).json({ message: "sessionId, to, and message are required" });
     const waMessageId = await sendSelfHostedMessage(sessionId, to.trim(), message.trim());
-    await logWhatsAppMessage({ instanceId: sessionId, direction: "outgoing", number: normalizeWaNumber(to), message: message.trim(), status: "sent", source: "external_api", waMessageId });
+    await logWhatsAppMessage({ instanceId: sessionId, direction: "outgoing", number: normalizeWaNumber(to), jid: toWhatsAppJid(to), message: message.trim(), status: "sent", source: "external_api", waMessageId });
     res.json({ sent: true });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
@@ -928,8 +984,6 @@ app.post("/api/admin/settings/whatsapp-server-key", protect, adminOnly, async (r
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// Message history for one number — real sent/received counts and the
-// actual message list, for Super Admin → WhatsApp → Messages.
 app.get("/api/admin/whatsapp/messages", protect, adminOnly, async (req, res) => {
   try {
     const { instanceId } = req.query;
@@ -943,14 +997,11 @@ app.get("/api/admin/whatsapp/messages", protect, adminOnly, async (req, res) => 
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-// CONVERSATIONS — Super Admin → Conversation (proper per-contact chat threads)
+// CONVERSATIONS — one thread per contact
 // ══════════════════════════════════════════════════════════════════════════════
-// For now this only covers WhatsApp (via the self-hosted server) — the plan
-// is for this tab to eventually also show email and Messenger threads in
-// the same place, but that's a later step.
 
-// One row per real contact (number) for the chosen number, with their most
-// recent message, newest conversation first.
+// One row per contact, newest first. `name` = saved contact name (empty if
+// the number isn't saved → the frontend shows the full number instead).
 app.get("/api/admin/whatsapp/conversations", protect, adminOnly, async (req, res) => {
   try {
     const { instanceId } = req.query;
@@ -960,43 +1011,40 @@ app.get("/api/admin/whatsapp/conversations", protect, adminOnly, async (req, res
       { $sort: { createdAt: -1 } },
       { $group: { _id: "$number", jid: { $first: "$jid" }, lastMessage: { $first: "$message" }, lastDirection: { $first: "$direction" }, lastAt: { $first: "$createdAt" }, count: { $sum: 1 } } },
       { $sort: { lastAt: -1 } },
-    ]);
-    // Saved contact names — matches WhatsApp's own behavior: a name shows
-    // when that number/jid is saved as a contact, otherwise just the
-    // number shows (formatDisplayNumber on the frontend handles that part).
-    const jids = threads.map((t) => t.jid).filter(Boolean);
-    const contacts = jids.length > 0 ? await WhatsAppContact.find({ instanceId, jid: { $in: jids } }) : [];
-    const nameByJid = Object.fromEntries(contacts.filter((c) => c.name).map((c) => [c.jid, c.name]));
-    res.json(threads.map((t) => ({ number: t._id, name: nameByJid[t.jid] || "", lastMessage: t.lastMessage, lastDirection: t.lastDirection, lastAt: t.lastAt, count: t.count })));
+    ]).allowDiskUse(true);
+    const numbers = threads.map((t) => t._id);
+    const contacts = numbers.length > 0 ? await WhatsAppContact.find({ instanceId, number: { $in: numbers } }).lean() : [];
+    const byNumber = Object.fromEntries(contacts.map((c) => [c.number, c]));
+    res.json(threads.map((t) => {
+      const c = byNumber[t._id];
+      return {
+        number: t._id,
+        name: c?.name || "",
+        pushName: c?.name ? "" : (c?.notify || ""),
+        lastMessage: t.lastMessage,
+        lastDirection: t.lastDirection,
+        lastAt: t.lastAt,
+        count: t.count,
+      };
+    }));
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// Full back-and-forth with one specific contact, oldest first (natural chat order).
+// Full chat with one contact — the LATEST messages, returned oldest-first.
 app.get("/api/admin/whatsapp/conversations/:instanceId/:number", protect, adminOnly, async (req, res) => {
   try {
     const { instanceId, number } = req.params;
-    // NEW: no longer re-normalizing this — normalizeWaNumber strips
-    // non-digit characters, which corrupts a "lid:12345" identifier
-    // (stripping the "lid:" prefix) so it no longer matches what's
-    // actually stored. The frontend already passes back the exact
-    // `number` value the thread list gave it, which is already canonical.
-    const messages = await WhatsAppMessage.find({ instanceId, number, groupId: "" }).sort("createdAt").limit(500);
-    res.json({ messages });
+    const limit = Math.min(Number(req.query.limit) || 1000, 5000);
+    const latest = await WhatsAppMessage.find({ instanceId, number, groupId: "" }).sort("-createdAt").limit(limit);
+    res.json({ messages: latest.reverse() });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// Profile photo — real Baileys method (sock.profilePictureUrl). Pass
-// number="me" for the connected business number's own photo. Baileys
-// throws when there's no photo set or the person's privacy settings hide
-// it from you — either way that's "no photo available", not a real error.
-// Looks up the exact jid to use for a displayNumber (which might be a real
-// phone number OR a "lid:xxxxx" label) by checking a prior message from
-// that contact — same lookup the /send route uses. Falls back to
-// constructing a phone-number JID only when there's no prior message to
-// learn the real jid from.
 async function resolveJidForNumber(instanceId, number) {
   const prior = await WhatsAppMessage.findOne({ instanceId, number, jid: { $ne: "" } }).sort("-createdAt");
-  return prior?.jid || toWhatsAppJid(number);
+  if (prior?.jid) return prior.jid;
+  if (String(number).startsWith("lid:")) return `${String(number).slice(4)}@lid`;
+  return toWhatsAppJid(number);
 }
 
 app.get("/api/admin/whatsapp/profile-photo/:instanceId/:number", protect, adminOnly, async (req, res) => {
@@ -1015,13 +1063,6 @@ app.get("/api/admin/whatsapp/profile-photo/:instanceId/:number", protect, adminO
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// Last seen / online status — presence in Baileys arrives as a pushed
-// event, not a plain request/response value, so this subscribes and waits
-// briefly for one update. IMPORTANT, honest limitation: most people hide
-// "last seen" in their WhatsApp privacy settings, especially from numbers
-// they haven't saved — when that's the case, WhatsApp simply never sends
-// an update at all, this times out, and the frontend shows "unavailable".
-// That's expected WhatsApp behavior, not a bug to chase.
 app.get("/api/admin/whatsapp/presence/:instanceId/:number", protect, adminOnly, async (req, res) => {
   try {
     const { instanceId, number } = req.params;
@@ -1034,18 +1075,15 @@ app.get("/api/admin/whatsapp/presence/:instanceId/:number", protect, adminOnly, 
         if (update.id !== jid) return;
         clearTimeout(timeout);
         sock.ev.off("presence.update", handler);
-        resolve(update.presences?.[jid] || null);
+        resolve(update.presences?.[jid] || Object.values(update.presences || {})[0] || null);
       };
       sock.ev.on("presence.update", handler);
-      sock.presenceSubscribe(jid).catch(() => { clearTimeout(timeout); resolve(null); });
+      sock.presenceSubscribe(jid).catch(() => { clearTimeout(timeout); sock.ev.off("presence.update", handler); resolve(null); });
     });
     res.json({ presence });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// WhatsApp "About" text — real Baileys method (sock.fetchStatus). Like the
-// profile photo, this can come back empty if the contact hides it in their
-// privacy settings — that's expected, not an error.
 app.get("/api/admin/whatsapp/about/:instanceId/:number", protect, adminOnly, async (req, res) => {
   try {
     const { instanceId, number } = req.params;
@@ -1054,17 +1092,14 @@ app.get("/api/admin/whatsapp/about/:instanceId/:number", protect, adminOnly, asy
     const jid = await resolveJidForNumber(instanceId, number);
     try {
       const result = await sock.fetchStatus(jid);
-      res.json({ status: result?.status || "", setAt: result?.setAt || null });
+      const row = Array.isArray(result) ? result[0]?.status : result; // newer Baileys returns an array
+      res.json({ status: row?.status || "", setAt: row?.setAt || null });
     } catch {
       res.json({ status: "", setAt: null });
     }
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-  // Everything server.js needs to reach from outside this file — the
-  // Automation Workflow engine's send_whatsapp action, and the startup
-  // reconnect call in the mongoose "open" handler. See the wiring notes
-  // at the top of this file for exactly where each of these is used.
   return {
     WhatsAppMessage,
     WhatsAppSelfSession,
