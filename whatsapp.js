@@ -58,15 +58,31 @@
 //    the new session.
 // 5. Duplicate messages (dashboard send + WhatsApp echo) are prevented with a
 //    unique (instanceId, waMessageId) index + upserts.
-// 6. FIX — QR code not showing up: the QR was previously rendered by asking a
-//    third-party image service (api.qrserver.com) to draw it from the raw QR
-//    string. If that external domain is blocked or unreachable from your
-//    server's network (common on many hosts/firewalls), the image silently
-//    never rendered and the account could never connect. The QR is now
-//    rendered LOCALLY on this server (using the `qrcode` package) and sent to
-//    the browser as a ready-made image — no external service required. The
-//    old method is kept only as an automatic fallback if `qrcode` isn't
-//    installed.
+// 6. FIX — QR code not showing up (image rendering): the QR was previously
+//    rendered by asking a third-party image service (api.qrserver.com) to
+//    draw it from the raw QR string. If that external domain is blocked or
+//    unreachable from your server's network, the image silently never
+//    rendered. The QR is now rendered LOCALLY on this server (using the
+//    `qrcode` package) and sent to the browser as a ready-made image — no
+//    external service required. The old method is kept only as an automatic
+//    fallback if `qrcode` isn't installed.
+// 7. FIX — QR code not showing up (the real cause): a "give up after the
+//    first unscanned QR" check was added to connection.update — as soon as
+//    ANY qr event had fired and the socket then closed for ANY reason before
+//    a successful open, it wiped the QR and stopped retrying entirely, with
+//    no further attempt. WhatsApp/Baileys routinely close and reopen the
+//    connection a few times during the normal handshake BEFORE anyone has
+//    had a chance to scan anything — that's expected, not a failure — so
+//    this was giving up almost immediately on session creation, before the
+//    QR had a real chance to be scanned. Removed that check; a close now
+//    only stops retrying on a genuine logout (401) or being replaced by
+//    another connection (440), exactly like the version that was previously
+//    confirmed working — everything else keeps retrying every 5s. The
+//    socket-creation options were also reverted to that same simpler,
+//    confirmed-working set (no Desktop browser override, no
+//    shouldSyncHistoryMessage, no markOnlineOnConnect, no cached key store
+//    wrapper) to remove extra surface area, since none of those are needed
+//    for the connection itself.
 
 let Baileys = null;
 try {
@@ -433,7 +449,7 @@ async function startSelfHostedSession(sessionDoc) {
   if (!Baileys) throw new Error("Baileys isn't installed on the server yet");
   const {
     default: makeWASocket, DisconnectReason, fetchLatestBaileysVersion,
-    useMultiFileAuthState, makeCacheableSignalKeyStore, Browsers,
+    useMultiFileAuthState,
   } = Baileys;
   const instanceId = sessionDoc.sessionId;
 
@@ -455,22 +471,13 @@ async function startSelfHostedSession(sessionDoc) {
   const logger = pino({ level: "silent" });
   const sock = makeWASocket({
     ...(version ? { version } : {}),
-    auth: makeCacheableSignalKeyStore
-      ? { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) }
-      : state,
+    auth: state,
     logger,
     printQRInTerminal: false,
-    // A "desktop" link gets far more history from WhatsApp than a web link.
-    browser: Browsers ? Browsers.macOS("Desktop") : ["Mac OS", "Desktop", "10.15.7"],
     syncFullHistory: true,
-    shouldSyncHistoryMessage: () => true,
-    markOnlineOnConnect: false,
     keepAliveIntervalMs: 15000,
   });
   activeSelfHostedSockets.set(instanceId, sock);
-
-  let everOpened = false;
-  let qrIssued = false;
 
   sock.ev.on("creds.update", saveCreds);
 
@@ -478,12 +485,10 @@ async function startSelfHostedSession(sessionDoc) {
     if (!isCurrent()) return;
     const { connection, lastDisconnect, qr } = update;
     if (qr) {
-      qrIssued = true;
       console.log(`[Self-hosted WhatsApp] "${sessionDoc.label}" — new QR issued`);
       await WhatsAppSelfSession.findByIdAndUpdate(sessionDoc._id, { lastQr: qr, status: "pending_qr" });
     }
     if (connection === "open") {
-      everOpened = true;
       const phoneNumber = sock.user?.id ? sock.user.id.split(":")[0] : "";
       console.log(`[Self-hosted WhatsApp] "${sessionDoc.label}" — connected (${phoneNumber})`);
       await WhatsAppSelfSession.findByIdAndUpdate(sessionDoc._id, { status: "connected", phoneNumber, lastQr: "" });
@@ -506,12 +511,13 @@ async function startSelfHostedSession(sessionDoc) {
         console.log(`[Self-hosted WhatsApp] "${sessionDoc.label}" — replaced by another connection using the same session; not auto-reconnecting.`);
         return;
       }
-      if (qrIssued && !everOpened && statusCode !== DisconnectReason.restartRequired) {
-        // QR was shown but never scanned — stop instead of generating QRs forever.
-        await WhatsAppSelfSession.findByIdAndUpdate(sessionDoc._id, { status: "disconnected", lastQr: "" });
-        console.log(`[Self-hosted WhatsApp] "${sessionDoc.label}" — QR expired without being scanned.`);
-        return;
-      }
+      // Any other close — including the normal close/reopen cycles WhatsApp
+      // does while a QR code is sitting there waiting to be scanned, which
+      // is completely normal and NOT a failure — keeps retrying. Only a
+      // genuine logout (401, above) or being replaced by another connection
+      // (440, above) stops the retry loop. This matches the original,
+      // confirmed-working behavior (see fix #7 in the header comment).
+      //
       // 515 (restartRequired) happens right after a successful QR scan — don't
       // flip the status to "disconnected" for that, the new socket opens in a moment.
       if (statusCode !== DisconnectReason.restartRequired) {
