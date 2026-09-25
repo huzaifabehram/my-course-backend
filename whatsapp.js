@@ -252,6 +252,18 @@ function extractMessageText(msg) {
   );
 }
 
+// NEW: WhatsApp/Baileys' internal protocol traffic — message deletions,
+// ephemeral-timer changes, app-state sync keys, and similar — rides on the
+// exact same event stream as real messages, but isn't a real message at
+// all. This was showing up as literal "[protocolMessage]" bubbles in the
+// chat view, which is genuinely confusing since it isn't something anyone
+// actually sent. These are filtered out entirely now — not logged, not
+// shown as a placeholder — in both the live handler and history import.
+function isSystemMessageType(msg) {
+  const type = Object.keys(msg.message || {})[0] || "";
+  return ["protocolMessage", "senderKeyDistributionMessage", "messageContextInfo", "reactionMessage", "pollUpdateMessage"].includes(type);
+}
+
 async function startSelfHostedSession(sessionDoc) {
   if (!Baileys) throw new Error("Baileys isn't installed on the server yet");
   const { default: makeWASocket, DisconnectReason, fetchLatestBaileysVersion, useMultiFileAuthState } = Baileys;
@@ -335,8 +347,9 @@ async function startSelfHostedSession(sessionDoc) {
       try {
         if (!msg.message) continue;
         if (msg.key.remoteJid?.endsWith("@g.us")) continue; // skip group messages for the AI bot/logging path here
+        if (isSystemMessageType(msg)) continue; // protocol traffic, not a real message — see isSystemMessageType above
 
-        const { jid, displayNumber } = resolveMessageIdentity(msg.key);
+        const { jid, displayNumber } = await resolveMessageIdentity(msg.key, sock);
         if (!jid) continue;
         const text = extractMessageText(msg);
         const messageType = Object.keys(msg.message)[0] || "unknown";
@@ -400,10 +413,18 @@ async function startSelfHostedSession(sessionDoc) {
     console.log(`[Self-hosted WhatsApp] history sync for "${sessionDoc.label}" — ${messages.length} message(s), ${contacts?.length || 0} contact(s), isLatest=${isLatest}, memory=${memMB}MB`);
 
     if (contacts?.length > 0) {
-      const ops = contacts
-        .map((c) => ({ id: c.id, name: c.name || c.notify || c.verifiedName || "" }))
-        .filter((c) => c.id && c.name)
-        .map((c) => ({ updateOne: { filter: { instanceId: sessionDoc.sessionId, jid: c.id }, update: { $set: { name: c.name } }, upsert: true } }));
+      const ops = [];
+      for (const c of contacts) {
+        const name = c.name || c.notify || c.verifiedName || "";
+        if (!c.id || !name) continue;
+        // NEW: resolves the contact's id through the same LID-mapping logic
+        // as messages — a contact synced under a LID needs to end up keyed
+        // by the same resolved identifier a message from that same person
+        // gets stored under, or the name lookup silently never matches.
+        const { jid: resolvedJid } = await resolveMessageIdentity({ remoteJid: c.id }, sock);
+        if (!resolvedJid) continue;
+        ops.push({ updateOne: { filter: { instanceId: sessionDoc.sessionId, jid: resolvedJid }, update: { $set: { name } }, upsert: true } });
+      }
       if (ops.length > 0) {
         try { await WhatsAppContact.bulkWrite(ops, { ordered: false }); }
         catch (err) { console.error("[Self-hosted WhatsApp] bulk contact save failed:", err.message); }
@@ -414,9 +435,10 @@ async function startSelfHostedSession(sessionDoc) {
     for (const msg of messages) {
       if (!msg.message || !msg.key?.remoteJid) continue;
       if (msg.key.remoteJid.endsWith("@g.us")) continue; // groups skipped here too, same as the live handler
+      if (isSystemMessageType(msg)) continue; // protocol traffic, not a real message
       const text = extractMessageText(msg);
       if (!text) continue; // history items with no plain text are skipped rather than filling the thread with placeholders
-      const { jid, displayNumber } = resolveMessageIdentity(msg.key);
+      const { jid, displayNumber } = await resolveMessageIdentity(msg.key, sock);
       if (!jid) continue;
       const direction = msg.key.fromMe ? "outgoing" : "incoming";
       candidates.push({
@@ -460,13 +482,17 @@ async function startSelfHostedSession(sessionDoc) {
   sock.ev.on("contacts.upsert", async (contacts) => {
     for (const contact of contacts || []) {
       const name = contact.name || contact.notify || contact.verifiedName || "";
-      await upsertWhatsAppContact(sessionDoc.sessionId, contact.id, name);
+      if (!contact.id || !name) continue;
+      const { jid: resolvedJid } = await resolveMessageIdentity({ remoteJid: contact.id }, sock);
+      if (resolvedJid) await upsertWhatsAppContact(sessionDoc.sessionId, resolvedJid, name);
     }
   });
   sock.ev.on("contacts.update", async (contacts) => {
     for (const contact of contacts || []) {
       const name = contact.name || contact.notify || contact.verifiedName || "";
-      if (name) await upsertWhatsAppContact(sessionDoc.sessionId, contact.id, name);
+      if (!contact.id || !name) continue;
+      const { jid: resolvedJid } = await resolveMessageIdentity({ remoteJid: contact.id }, sock);
+      if (resolvedJid) await upsertWhatsAppContact(sessionDoc.sessionId, resolvedJid, name);
     }
   });
 
@@ -512,7 +538,7 @@ function toWhatsAppJid(number) {
 // reaches the contact; displayNumber is the best-effort human-readable
 // number, honestly labeled "lid:..." rather than shown as a fake phone
 // number when a real one genuinely can't be determined.
-function resolveMessageIdentity(key) {
+async function resolveMessageIdentity(key, sock) {
   const jid = key.remoteJid;
   const altJid = key.remoteJidAlt;
   if (jid && jid.endsWith("@s.whatsapp.net")) {
@@ -521,10 +547,22 @@ function resolveMessageIdentity(key) {
   if (altJid && altJid.endsWith("@s.whatsapp.net")) {
     return { jid, displayNumber: normalizeWaNumber(altJid.replace("@s.whatsapp.net", "")) };
   }
-  // NEW: logs the full key whenever neither field resolves to a real
-  // phone-number JID — this is the exact data needed to find the right
-  // field for real if remoteJidAlt isn't actually where this Baileys
-  // version puts it, instead of guessing at another field name blind.
+  // NEW: second resolution attempt, using Baileys' own internal LID<->phone-
+  // number mapping store when it exists — a real, dedicated API for exactly
+  // this, rather than another guess. Wrapped defensively since this is a
+  // newer, less consistently-documented part of Baileys across versions;
+  // if it's not present or throws, this just falls through to the honest
+  // "lid:..." label below instead of breaking anything.
+  if (jid && jid.endsWith("@lid") && sock?.signalRepository?.lidMapping?.getPNForLID) {
+    try {
+      const pn = await sock.signalRepository.lidMapping.getPNForLID(jid);
+      if (pn) return { jid, displayNumber: normalizeWaNumber(String(pn).replace("@s.whatsapp.net", "")) };
+    } catch { /* fall through to the lid: label below */ }
+  }
+  // Logs the full key whenever neither field resolves to a real phone-
+  // number JID — this is the exact data needed to find the right field for
+  // real if remoteJidAlt/lidMapping aren't where a given Baileys version
+  // puts this, instead of guessing at another field name blind.
   console.log(`[Self-hosted WhatsApp] could not resolve a real number — raw key: ${JSON.stringify(key)}`);
   const lidDigits = jid ? jid.replace("@lid", "").replace(/[^\d]/g, "") : "";
   return { jid: jid || "", displayNumber: lidDigits ? `lid:${lidDigits}` : "" };
