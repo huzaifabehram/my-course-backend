@@ -22,35 +22,32 @@
 //      whatsapp.whatsappConfigured(), whatsapp.sendWhatsAppRaw(...)
 //
 // 4. Dependencies — make sure these are installed and redeployed:
-//      npm install @whiskeysockets/baileys qrcode pino
+//      npm install @whiskeysockets/baileys qrcode pino ffmpeg-static
 //
 // ── WHAT CHANGED IN THIS VERSION ─────────────────────────────────────────────
 // A. NO MORE AUTO-LOGOUT
-//    The WhatsApp login (creds + encryption keys) used to be saved in
-//    /tmp/wa-sessions. Render wipes /tmp every time the service restarts,
-//    sleeps (free plan sleeps after ~15 min without traffic) or redeploys →
-//    the login was lost → new QR needed ("logged out after 30-40 min").
-//    Now the login is saved in MongoDB (collection: whatsappauthkeys), so it
-//    survives restarts, sleeps and redeploys. The account stays linked until
-//    YOU click Reconnect / Remove Account, or unlink it from the phone.
-//    - On server start, every account that has a saved login reconnects
-//      automatically (no QR).
-//    - Writes from an old/stopped socket are ignored, so a Reconnect can
-//      never be mixed up with stale keys.
-//    - Optional keep-awake ping (see bottom of file): if RENDER_EXTERNAL_URL
-//      (set automatically by Render) or WHATSAPP_KEEPALIVE_URL exists, the
-//      server pings itself every 10 minutes so the free instance doesn't
-//      sleep and miss live messages.
+//    The WhatsApp login used to be saved in /tmp/wa-sessions. Render wipes
+//    /tmp every time the service restarts, sleeps or redeploys → the login
+//    was lost → new QR needed. Now the login is saved in MongoDB
+//    (collection: whatsappauthkeys), so it survives restarts, sleeps and
+//    redeploys. Writes from an old/stopped socket are ignored.
+//    Keep-awake ping (bottom of file) stops Render's free plan from sleeping.
 //
 // B. FULL OLD CHAT HISTORY WITH REAL NUMBERS / SAVED NAMES
-//    - Links as "Desktop" (WhatsApp sends much more history to desktop links
-//      than to web links) + syncFullHistory + shouldSyncHistoryMessage → true
-//      (newer Baileys skips the FULL history chunk by default).
-//    - After deploying this, click Profile → Reconnect ONCE and scan, so the
-//      new "Desktop" link receives the full history.
+//    Links as "Desktop" + syncFullHistory + shouldSyncHistoryMessage → true,
+//    with an automatic fallback to the default link mode if no QR appears.
 //
-// Everything else (sending, receiving, LID merge, bulk, bot, API, routes) is
-// unchanged.
+// C. CHAT FEATURES (this version) — login / QR / history code untouched
+//    - Faster chat list & chats: `since` / `after` delta polling, paging,
+//      cached profile photos (no more hundreds of requests per page load)
+//    - Unread counts (synced with the phone), tags, clear chat, read ticks
+//    - Media: stores what's needed to download images / videos / voice /
+//      documents on demand → view, play, full-screen, download
+//    - Send photos, videos, documents, voice notes, polls, events, contacts
+//    - Contact info: common groups, block / unblock
+//    New dependency:  npm install ffmpeg-static   (voice note conversion)
+//    Media received BEFORE this update has no download info — to get it,
+//    use Clear History + Reconnect once (optional).
 
 let Baileys = null;
 try {
@@ -150,8 +147,94 @@ function getMessageContent(msg) {
     pollCreationMessageV2: "📊 Poll",
     pollCreationMessageV3: "📊 Poll",
     documentMessage: `📄 ${m.documentMessage?.fileName || "Document"}`,
+    ptvMessage: "🎥 Video",
+    eventMessage: `📅 ${m.eventMessage?.name || "Event"}`,
   };
+  if (type === "audioMessage" && m.audioMessage?.ptt) return { text: "🎤 Voice message", hasText: false };
+  if (type === "pollCreationMessage" || type === "pollCreationMessageV2" || type === "pollCreationMessageV3") {
+    const p = m[type];
+    return { text: `📊 ${p?.name || "Poll"}`, hasText: false };
+  }
   return { text: placeholders[type] || `[${type}]`, hasText: false };
+}
+
+// ── NEW: rich message details (media, polls, events, contacts, location) ────
+function unwrapMessage(message) {
+  let m = message;
+  for (let i = 0; m && i < 5; i++) {
+    const inner = m.ephemeralMessage?.message || m.viewOnceMessage?.message ||
+      m.viewOnceMessageV2?.message || m.viewOnceMessageV2Extension?.message ||
+      m.documentWithCaptionMessage?.message || m.editedMessage?.message;
+    if (!inner) break;
+    m = inner;
+  }
+  return m;
+}
+
+// Stores just enough of a media message to download it later on demand
+// (no thumbnails / quoted messages → stays small in MongoDB).
+function serializeMediaRaw(message) {
+  try {
+    const { proto } = Baileys;
+    const obj = proto.Message.toObject(proto.Message.fromObject(message), { bytes: String, longs: String, enums: Number, defaults: false });
+    const strip = (o) => {
+      if (!o || typeof o !== "object") return;
+      for (const k of Object.keys(o)) {
+        if (["jpegThumbnail", "pngThumbnail", "contextInfo", "messageContextInfo", "thumbnail"].includes(k)) delete o[k];
+        else strip(o[k]);
+      }
+    };
+    strip(obj);
+    return JSON.stringify(obj);
+  } catch { return ""; }
+}
+
+function vcardNumber(vcard) {
+  const m = String(vcard || "").match(/waid=(\d+)/) || String(vcard || "").match(/TEL[^:]*:([+\d\s-]+)/);
+  return m ? m[1].replace(/[^\d]/g, "") : "";
+}
+
+const MEDIA_TYPES = { imageMessage: "image", videoMessage: "video", ptvMessage: "video", audioMessage: "audio", documentMessage: "document", stickerMessage: "sticker" };
+
+function describeMessage(msg) {
+  const out = { msgType: "text" };
+  const m = unwrapMessage(msg?.message);
+  if (!m) return out;
+  const type = (Baileys?.getContentType && Baileys.getContentType(m)) ||
+    Object.keys(m).find((k) => !["senderKeyDistributionMessage", "messageContextInfo"].includes(k));
+  if (MEDIA_TYPES[type]) {
+    const media = m[type] || {};
+    out.msgType = MEDIA_TYPES[type];
+    out.mimetype = media.mimetype || "";
+    out.fileName = media.fileName || "";
+    out.seconds = Number(media.seconds) || 0;
+    out.ptt = !!media.ptt;
+    out.mediaRaw = serializeMediaRaw(msg.message);
+  } else if (type === "pollCreationMessage" || type === "pollCreationMessageV2" || type === "pollCreationMessageV3") {
+    const p = m[type] || {};
+    out.msgType = "poll";
+    out.meta = { name: p.name || "", options: (p.options || []).map((o) => o.optionName || ""), selectableCount: p.selectableCount || 1 };
+  } else if (type === "eventMessage") {
+    const e = m.eventMessage || {};
+    out.msgType = "event";
+    out.meta = {
+      name: e.name || "", description: e.description || "",
+      startTime: e.startTime ? toDate(e.startTime).toISOString() : null,
+      endTime: e.endTime ? toDate(e.endTime).toISOString() : null,
+      location: e.location?.name || "",
+    };
+  } else if (type === "contactMessage") {
+    out.msgType = "contact";
+    out.meta = { contacts: [{ name: m.contactMessage?.displayName || "", number: vcardNumber(m.contactMessage?.vcard) }] };
+  } else if (type === "contactsArrayMessage") {
+    out.msgType = "contact";
+    out.meta = { contacts: (m.contactsArrayMessage?.contacts || []).map((c) => ({ name: c.displayName || "", number: vcardNumber(c.vcard) })) };
+  } else if (type === "locationMessage" || type === "liveLocationMessage") {
+    const l = m[type] || {};
+    out.msgType = "location";
+    out.meta = { lat: l.degreesLatitude, lng: l.degreesLongitude, name: l.name || l.address || "" };
+  }
+  return out;
 }
 
 module.exports = function setupWhatsApp(app, deps) {
@@ -172,8 +255,17 @@ const WhatsAppMessageSchema = new mongoose.Schema({
   // Exact WhatsApp identifier the message came from / went to (phone JID or
   // LID) — replies are sent to this.
   jid: { type: String, default: "" },
+  // NEW — rich messages
+  msgType:  { type: String, default: "text" }, // text | image | video | audio | document | sticker | poll | event | contact | location
+  mediaRaw: { type: String, default: "" },     // what's needed to download the media on demand
+  mimetype: { type: String, default: "" },
+  fileName: { type: String, default: "" },
+  seconds:  { type: Number, default: 0 },
+  ptt:      { type: Boolean, default: false },  // voice note
+  meta:     { type: mongoose.Schema.Types.Mixed, default: null },
 }, { timestamps: true });
 WhatsAppMessageSchema.index({ instanceId: 1, createdAt: -1 });
+WhatsAppMessageSchema.index({ instanceId: 1, updatedAt: -1 });
 WhatsAppMessageSchema.index({ instanceId: 1, number: 1, createdAt: -1 });
 WhatsAppMessageSchema.index(
   { instanceId: 1, waMessageId: 1 },
@@ -342,6 +434,28 @@ async function hasSavedLogin(sessionId) {
   try { return !!JSON.parse(row.value)?.me?.id; } catch { return false; }
 }
 
+// NEW — per-chat state: unread count + tags
+const WhatsAppChatStateSchema = new mongoose.Schema({
+  instanceId:  { type: String, required: true },
+  number:      { type: String, required: true },
+  unreadCount: { type: Number, default: 0 },
+  tags:        { type: [String], default: [] },
+}, { timestamps: true });
+WhatsAppChatStateSchema.index({ instanceId: 1, number: 1 }, { unique: true });
+WhatsAppChatStateSchema.index({ instanceId: 1, updatedAt: -1 });
+const WhatsAppChatState = mongoose.model("WhatsAppChatState", WhatsAppChatStateSchema);
+
+async function setUnread(instanceId, number, value) {
+  if (!number) return;
+  try { await WhatsAppChatState.updateOne({ instanceId, number }, { $set: { unreadCount: Math.max(0, value) } }, { upsert: true }); }
+  catch (err) { if (err.code !== 11000) console.error("[WhatsApp] unread update failed:", err.message); }
+}
+async function incUnread(instanceId, number) {
+  if (!number) return;
+  try { await WhatsAppChatState.updateOne({ instanceId, number }, { $inc: { unreadCount: 1 } }, { upsert: true }); }
+  catch (err) { if (err.code !== 11000) console.error("[WhatsApp] unread update failed:", err.message); }
+}
+
 const lidCache = new Map(); // `${instanceId}|${lidJid}` → phone digits
 
 // Records a LID ↔ number mapping and merges any "lid:xxxx" thread (messages
@@ -366,6 +480,15 @@ async function rememberLid(instanceId, lidJid, pnJid) {
       if (!pnContact?.notify && lidContact.notify) set.notify = lidContact.notify;
       await WhatsAppContact.deleteOne({ _id: lidContact._id });
       await WhatsAppContact.updateOne({ instanceId, number: pnNumber }, { $set: set }, { upsert: true });
+    }
+    const lidState = await WhatsAppChatState.findOne({ instanceId, number: label });
+    if (lidState) {
+      await WhatsAppChatState.deleteOne({ _id: lidState._id });
+      await WhatsAppChatState.updateOne(
+        { instanceId, number: pnNumber },
+        { $inc: { unreadCount: lidState.unreadCount || 0 }, $addToSet: { tags: { $each: lidState.tags || [] } } },
+        { upsert: true }
+      );
     }
     if (moved.modifiedCount > 0) {
       console.log(`[Self-hosted WhatsApp] merged ${moved.modifiedCount} message(s) from ${label} into +${pnNumber}`);
@@ -607,7 +730,12 @@ async function startSelfHostedSession(sessionDoc) {
           source: fromMe ? "mobile_app" : "self_hosted",
           waMessageId: msg.key.id || "",
           createdAt: toDate(msg.messageTimestamp),
+          ...describeMessage(msg),
         });
+        if (type === "notify") {
+          if (fromMe) await setUnread(instanceId, displayNumber, 0);
+          else await incUnread(instanceId, displayNumber);
+        }
 
         // AI bot: only for genuinely new incoming text messages
         if (!fromMe && type === "notify" && content.hasText) {
@@ -641,6 +769,13 @@ async function startSelfHostedSession(sessionDoc) {
     }
     // 2) contact names
     await saveContacts(instanceId, sock, contacts);
+    // 2b) unread counts, as shown on the phone
+    for (const c of chats || []) {
+      if (!c?.id || c.id.endsWith("@g.us") || c.id.endsWith("@broadcast") || c.id.endsWith("@newsletter")) continue;
+      if (typeof c.unreadCount !== "number") continue;
+      const { displayNumber } = await resolveMessageIdentity({ remoteJid: c.id }, sock, instanceId);
+      if (displayNumber) await setUnread(instanceId, displayNumber, c.unreadCount);
+    }
 
     // 3) messages
     const ops = [];
@@ -662,6 +797,7 @@ async function startSelfHostedSession(sessionDoc) {
               instanceId, direction: fromMe ? "outgoing" : "incoming", number: displayNumber, groupId: "",
               jid, message: content.text, status: fromMe ? "sent" : "received", source: "history_sync",
               waMessageId: msg.key.id, createdAt: toDate(msg.messageTimestamp), updatedAt: now,
+              ...describeMessage(msg),
             },
           },
           upsert: true,
@@ -693,6 +829,19 @@ async function startSelfHostedSession(sessionDoc) {
   sock.ev.on("lid-mapping.update", async (update) => {
     if (!isCurrent()) return;
     for (const m of Array.isArray(update) ? update : [update]) await rememberLid(instanceId, m?.lid, m?.pn);
+  });
+
+  // Chat read / unread changes (e.g. you opened the chat on your phone)
+  sock.ev.on("chats.update", async (updates) => {
+    if (!isCurrent()) return;
+    for (const u of updates || []) {
+      if (!u?.id || u.unreadCount !== 0 || u.id.endsWith("@g.us")) continue;
+      try {
+        const { displayNumber } = await resolveMessageIdentity({ remoteJid: u.id }, sock, instanceId);
+        if (!displayNumber) continue;
+        if (u.unreadCount === 0) await setUnread(instanceId, displayNumber, 0); // read on another device
+      } catch { /* ignore */ }
+    }
   });
 
   // Saved-name changes after the initial sync
@@ -1090,41 +1239,80 @@ app.get("/api/admin/whatsapp/messages", protect, adminOnly, async (req, res) => 
 
 // One row per contact, newest first. `name` = saved contact name (empty if
 // the number isn't saved → the frontend shows the full number instead).
+// NEW: `since` → only the chats that changed since then (fast polling);
+// `v=2` → { threads, serverTime } response with unreadCount + tags.
 app.get("/api/admin/whatsapp/conversations", protect, adminOnly, async (req, res) => {
   try {
-    const { instanceId } = req.query;
+    const { instanceId, since, v } = req.query;
     if (!instanceId) return res.status(400).json({ message: "instanceId is required" });
+    const serverTime = new Date(Date.now() - 3000);
+    const match = { instanceId, number: { $ne: "" }, groupId: "" };
+    const sinceDate = since ? new Date(since) : null;
+    if (sinceDate && !isNaN(sinceDate)) {
+      const [changedMsgs, changedStates] = await Promise.all([
+        WhatsAppMessage.distinct("number", { instanceId, groupId: "", updatedAt: { $gte: sinceDate } }),
+        WhatsAppChatState.distinct("number", { instanceId, updatedAt: { $gte: sinceDate } }),
+      ]);
+      const changed = [...new Set([...changedMsgs, ...changedStates])].filter(Boolean);
+      if (changed.length === 0) return res.json({ threads: [], serverTime, partial: true });
+      match.number = { $in: changed };
+    }
     const threads = await WhatsAppMessage.aggregate([
-      { $match: { instanceId, number: { $ne: "" }, groupId: "" } },
+      { $match: match },
       { $sort: { createdAt: -1 } },
-      { $group: { _id: "$number", jid: { $first: "$jid" }, lastMessage: { $first: "$message" }, lastDirection: { $first: "$direction" }, lastAt: { $first: "$createdAt" }, count: { $sum: 1 } } },
+      { $group: { _id: "$number", jid: { $first: "$jid" }, lastMessage: { $first: "$message" }, lastDirection: { $first: "$direction" }, lastType: { $first: "$msgType" }, lastAt: { $first: "$createdAt" }, count: { $sum: 1 } } },
       { $sort: { lastAt: -1 } },
     ]).allowDiskUse(true);
     const numbers = threads.map((t) => t._id);
-    const contacts = numbers.length > 0 ? await WhatsAppContact.find({ instanceId, number: { $in: numbers } }).lean() : [];
+    const [contacts, states] = numbers.length > 0
+      ? await Promise.all([
+          WhatsAppContact.find({ instanceId, number: { $in: numbers } }).lean(),
+          WhatsAppChatState.find({ instanceId, number: { $in: numbers } }).lean(),
+        ])
+      : [[], []];
     const byNumber = Object.fromEntries(contacts.map((c) => [c.number, c]));
-    res.json(threads.map((t) => {
+    const stateByNumber = Object.fromEntries(states.map((c) => [c.number, c]));
+    const list = threads.map((t) => {
       const c = byNumber[t._id];
+      const st = stateByNumber[t._id];
       return {
         number: t._id,
         name: c?.name || "",
         pushName: c?.name ? "" : (c?.notify || ""),
         lastMessage: t.lastMessage,
         lastDirection: t.lastDirection,
+        lastType: t.lastType || "text",
         lastAt: t.lastAt,
         count: t.count,
+        unreadCount: st?.unreadCount || 0,
+        tags: st?.tags || [],
       };
-    }));
+    });
+    if (v === "2" || since) return res.json({ threads: list, serverTime, partial: !!since });
+    res.json(list);
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// Full chat with one contact — the LATEST messages, returned oldest-first.
+// Chat with one contact, returned oldest-first.
+//   default      → the LATEST `limit` messages
+//   ?before=ISO  → older page (scrolling up)
+//   ?after=ISO   → only messages added/changed since then (fast polling)
 app.get("/api/admin/whatsapp/conversations/:instanceId/:number", protect, adminOnly, async (req, res) => {
   try {
     const { instanceId, number } = req.params;
     const limit = Math.min(Number(req.query.limit) || 1000, 5000);
-    const latest = await WhatsAppMessage.find({ instanceId, number, groupId: "" }).sort("-createdAt").limit(limit);
-    res.json({ messages: latest.reverse() });
+    const serverTime = new Date(Date.now() - 3000);
+    const q = { instanceId, number, groupId: "" };
+    let rows;
+    if (req.query.after) {
+      q.updatedAt = { $gte: new Date(req.query.after) };
+      rows = await WhatsAppMessage.find(q).sort("createdAt").limit(500).lean();
+    } else {
+      if (req.query.before) q.createdAt = { $lt: new Date(req.query.before) };
+      rows = (await WhatsAppMessage.find(q).sort("-createdAt").limit(limit).lean()).reverse();
+    }
+    const messages = rows.map(({ mediaRaw, ...m }) => ({ ...m, hasMedia: !!mediaRaw }));
+    res.json({ messages, serverTime, hasMore: !req.query.after && rows.length === limit });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
@@ -1135,19 +1323,23 @@ async function resolveJidForNumber(instanceId, number) {
   return toWhatsAppJid(number);
 }
 
+// Profile photos are cached (6h, or 1h for "no photo") so opening the chat
+// list doesn't fire hundreds of requests at WhatsApp every time.
+const photoCache = new Map(); // `${instanceId}|${number}` → { url, at }
 app.get("/api/admin/whatsapp/profile-photo/:instanceId/:number", protect, adminOnly, async (req, res) => {
   try {
     const { instanceId, number } = req.params;
+    const cacheKey = `${instanceId}|${number}`;
+    const cached = photoCache.get(cacheKey);
+    if (cached && Date.now() - cached.at < (cached.url ? 6 : 1) * 60 * 60 * 1000) return res.json({ url: cached.url });
     const sock = activeSelfHostedSockets.get(instanceId);
     if (!sock) return res.status(404).json({ message: "This number isn't connected right now" });
     const jid = number === "me" ? sock.user?.id : await resolveJidForNumber(instanceId, number);
     if (!jid) return res.json({ url: null });
-    try {
-      const url = await sock.profilePictureUrl(jid, "image");
-      res.json({ url });
-    } catch {
-      res.json({ url: null });
-    }
+    let url = null;
+    try { url = await sock.profilePictureUrl(jid, "image"); } catch { url = null; }
+    photoCache.set(cacheKey, { url: url || null, at: Date.now() });
+    res.json({ url: url || null });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
@@ -1185,6 +1377,318 @@ app.get("/api/admin/whatsapp/about/:instanceId/:number", protect, adminOnly, asy
     } catch {
       res.json({ status: "", setAt: null });
     }
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// NEW — CHAT FEATURES: unread, tags, clear, media, voice, polls, events,
+// contacts, common groups, block / unblock
+// ══════════════════════════════════════════════════════════════════════════════
+const express = require("express");
+const silentLogger = (() => { try { return require("pino")({ level: "silent" }); } catch { return undefined; } })();
+
+let ffmpegPath = null;
+try { ffmpegPath = require("ffmpeg-static"); } catch { /* optional */ }
+if (!ffmpegPath) console.error("⚠️  ffmpeg-static not installed — voice messages recorded in Chrome may not play on phones. Run: npm install ffmpeg-static");
+
+// WhatsApp voice notes must be OGG/Opus. Chrome records WebM → convert.
+function toOggOpus(buf, mimetype) {
+  if (/ogg/i.test(mimetype || "") || !ffmpegPath) return Promise.resolve(buf);
+  return new Promise((resolve, reject) => {
+    const { spawn } = require("child_process");
+    const p = spawn(ffmpegPath, ["-hide_banner", "-loglevel", "error", "-i", "pipe:0", "-vn", "-ac", "1", "-ar", "48000", "-c:a", "libopus", "-b:a", "32k", "-f", "ogg", "pipe:1"]);
+    const chunks = [];
+    let errText = "";
+    p.stdout.on("data", (c) => chunks.push(c));
+    p.stderr.on("data", (d) => { errText += d; });
+    p.on("error", reject);
+    p.on("close", (code) => (code === 0 && chunks.length ? resolve(Buffer.concat(chunks)) : reject(new Error(`Voice conversion failed ${errText.slice(0, 200)}`))));
+    p.stdin.on("error", () => {});
+    p.stdin.end(buf);
+  });
+}
+
+async function resolveSendTarget(session, to) {
+  const raw = String(to || "").trim();
+  const displayNumber = raw.startsWith("lid:") ? raw : normalizeWaNumber(raw);
+  const prior = await WhatsAppMessage.findOne({ instanceId: session.sessionId, number: displayNumber, jid: { $ne: "" } }).sort("-createdAt");
+  const jid = prior?.jid || (displayNumber.startsWith("lid:") ? `${displayNumber.slice(4)}@lid` : toWhatsAppJid(displayNumber));
+  return { displayNumber, jid };
+}
+
+async function sendContentAndLog(session, to, content, logText) {
+  const sock = activeSelfHostedSockets.get(session.sessionId);
+  if (!sock) throw new Error("This number isn't connected right now");
+  const { displayNumber, jid } = await resolveSendTarget(session, to);
+  const sent = await sock.sendMessage(jid, content);
+  learnLidForPn(session.sessionId, sock, jid).catch(() => {});
+  await logWhatsAppMessage({
+    instanceId: session.sessionId, direction: "outgoing", number: displayNumber, jid,
+    message: logText, status: "sent", source: "manual", waMessageId: sent?.key?.id || "",
+    ...(sent?.message ? describeMessage(sent) : {}),
+  });
+  await setUnread(session.sessionId, displayNumber, 0);
+  return sent;
+}
+
+async function findSession(sessionDocId) {
+  if (!sessionDocId || !mongoose.isValidObjectId(sessionDocId)) return null;
+  return WhatsAppSelfSession.findById(sessionDocId);
+}
+
+// Mark a chat as read (dashboard + blue ticks on WhatsApp)
+app.post("/api/admin/whatsapp/conversations/:instanceId/:number/read", protect, adminOnly, async (req, res) => {
+  try {
+    const { instanceId, number } = req.params;
+    const state = await WhatsAppChatState.findOne({ instanceId, number }).lean();
+    const unread = state?.unreadCount || 0;
+    if (unread > 0) {
+      await setUnread(instanceId, number, 0);
+      const sock = activeSelfHostedSockets.get(instanceId);
+      if (sock) {
+        const rows = await WhatsAppMessage.find({ instanceId, number, direction: "incoming", waMessageId: { $gt: "" }, jid: { $gt: "" } })
+          .sort("-createdAt").limit(Math.min(unread, 50)).lean();
+        const keys = rows.map((m) => ({ remoteJid: m.jid, id: m.waMessageId, fromMe: false }));
+        if (keys.length) sock.readMessages(keys).catch(() => {});
+      }
+    }
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Tags for a chat
+app.post("/api/admin/whatsapp/conversations/:instanceId/:number/tags", protect, adminOnly, async (req, res) => {
+  try {
+    const { instanceId, number } = req.params;
+    const tags = [...new Set((Array.isArray(req.body?.tags) ? req.body.tags : []).map((t) => String(t).trim()).filter(Boolean))].slice(0, 20);
+    await WhatsAppChatState.updateOne({ instanceId, number }, { $set: { tags } }, { upsert: true });
+    res.json({ tags });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Clear chat (removes this chat's messages from the dashboard)
+app.delete("/api/admin/whatsapp/conversations/:instanceId/:number/messages", protect, adminOnly, async (req, res) => {
+  try {
+    const { instanceId, number } = req.params;
+    const result = await WhatsAppMessage.deleteMany({ instanceId, number });
+    await setUnread(instanceId, number, 0);
+    res.json({ deletedCount: result.deletedCount });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Saved contacts (for "Share contact")
+app.get("/api/admin/whatsapp/contacts/:instanceId", protect, adminOnly, async (req, res) => {
+  try {
+    const contacts = await WhatsAppContact.find({ instanceId: req.params.instanceId, name: { $gt: "" }, number: { $not: /^lid:/ } })
+      .select("number name").sort("name").limit(5000).lean();
+    res.json(contacts.map((c) => ({ number: c.number, name: c.name })));
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Download / stream a media message (image, video, voice, document)
+const mediaCache = new Map(); // messageId → Buffer (small in-memory cache)
+let mediaCacheBytes = 0;
+const MEDIA_CACHE_MAX = 60 * 1024 * 1024;
+app.get("/api/admin/whatsapp/media/:id", protect, adminOnly, requireBaileys, async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ message: "Invalid id" });
+    const row = await WhatsAppMessage.findById(req.params.id).lean();
+    if (!row?.mediaRaw) return res.status(404).json({ message: "This media isn't available (it was imported before media support was added)." });
+    let buf = mediaCache.get(String(row._id));
+    if (!buf) {
+      const sock = activeSelfHostedSockets.get(row.instanceId);
+      const message = Baileys.proto.Message.fromObject(JSON.parse(row.mediaRaw));
+      const waMsg = { key: { remoteJid: row.jid, id: row.waMessageId, fromMe: row.direction === "outgoing" }, message };
+      buf = await Baileys.downloadMediaMessage(waMsg, "buffer", {}, sock ? { logger: silentLogger, reuploadRequest: sock.updateMediaMessage } : undefined);
+      if (buf.length < 20 * 1024 * 1024) {
+        mediaCache.set(String(row._id), buf);
+        mediaCacheBytes += buf.length;
+        for (const [k, v] of mediaCache) {
+          if (mediaCacheBytes <= MEDIA_CACHE_MAX) break;
+          mediaCache.delete(k);
+          mediaCacheBytes -= v.length;
+        }
+      }
+    }
+    const type = (row.mimetype || "application/octet-stream").split(";")[0].trim();
+    const name = row.fileName || `whatsapp-${row.waMessageId || row._id}`;
+    res.set({
+      "Content-Type": type,
+      "Content-Length": buf.length,
+      "Cache-Control": "private, max-age=86400",
+      "Content-Disposition": `${req.query.download ? "attachment" : "inline"}; filename*=UTF-8''${encodeURIComponent(name)}`,
+    });
+    res.send(buf);
+  } catch (err) {
+    res.status(500).json({ message: "Couldn't download this media from WhatsApp — it may no longer be available on the phone." });
+  }
+});
+
+// Send an image / video / document / audio file / voice note.
+// Body = the raw file (Content-Type: application/octet-stream); details go in the query string.
+app.post(
+  "/api/admin/whatsapp-server/send-media",
+  protect, adminOnly, requireBaileys,
+  express.raw({ type: "application/octet-stream", limit: "64mb" }),
+  async (req, res) => {
+    try {
+      const { sessionDocId, to, kind, fileName = "", mimetype = "", caption = "", seconds } = req.query;
+      const buf = req.body;
+      if (!Buffer.isBuffer(buf) || buf.length === 0) return res.status(400).json({ message: "No file received" });
+      if (!to) return res.status(400).json({ message: "A number is required" });
+      const session = await findSession(sessionDocId);
+      if (!session) return res.status(404).json({ message: "Session not found" });
+
+      let content;
+      let logText;
+      if (kind === "voice") {
+        const ogg = await toOggOpus(buf, mimetype);
+        content = { audio: ogg, mimetype: "audio/ogg; codecs=opus", ptt: true, ...(Number(seconds) > 0 ? { seconds: Math.round(Number(seconds)) } : {}) };
+        logText = "🎤 Voice message";
+      } else if (kind === "image") {
+        content = { image: buf, caption: caption || undefined, ...(mimetype ? { mimetype } : {}) };
+        logText = caption || "📷 Photo";
+      } else if (kind === "video") {
+        content = { video: buf, caption: caption || undefined, mimetype: mimetype || "video/mp4" };
+        logText = caption || "🎥 Video";
+      } else if (kind === "audio") {
+        content = { audio: buf, mimetype: mimetype || "audio/mpeg" };
+        logText = "🎵 Audio";
+      } else {
+        content = { document: buf, mimetype: mimetype || "application/octet-stream", fileName: fileName || "file", caption: caption || undefined };
+        logText = caption || `📄 ${fileName || "Document"}`;
+      }
+      await sendContentAndLog(session, to, content, logText);
+      res.json({ sent: true });
+    } catch (err) { res.status(500).json({ message: err.message }); }
+  }
+);
+
+// Send a poll, an event or a contact card
+app.post("/api/admin/whatsapp-server/send-special", protect, adminOnly, requireBaileys, async (req, res) => {
+  try {
+    const { sessionDocId, to, kind, payload = {} } = req.body || {};
+    if (!to) return res.status(400).json({ message: "A number is required" });
+    const session = await findSession(sessionDocId);
+    if (!session) return res.status(404).json({ message: "Session not found" });
+
+    if (kind === "poll") {
+      const name = String(payload.name || "").trim();
+      const values = [...new Set((payload.options || []).map((o) => String(o).trim()).filter(Boolean))];
+      if (!name || values.length < 2) return res.status(400).json({ message: "A poll needs a question and at least 2 options" });
+      if (values.length > 12) return res.status(400).json({ message: "A poll can have at most 12 options" });
+      await sendContentAndLog(session, to, { poll: { name, values, selectableCount: payload.multiple ? 0 : 1 } }, `📊 ${name}`);
+      return res.json({ sent: true });
+    }
+
+    if (kind === "event") {
+      const name = String(payload.name || "").trim();
+      const start = payload.startTime ? new Date(payload.startTime) : null;
+      if (!name || !start || isNaN(start)) return res.status(400).json({ message: "An event needs a name and a start date/time" });
+      const end = payload.endTime ? new Date(payload.endTime) : null;
+      const event = {
+        name,
+        description: String(payload.description || "").trim() || undefined,
+        startDate: start,
+        ...(end && !isNaN(end) ? { endDate: end } : {}),
+        ...(payload.location ? { location: { name: String(payload.location).trim() } } : {}),
+        isCancelled: false,
+        extraGuestsAllowed: false,
+      };
+      try {
+        await sendContentAndLog(session, to, { event }, `📅 ${name}`);
+        return res.json({ sent: true });
+      } catch (err) {
+        // Older Baileys versions can't send native events → send it as a formatted message instead
+        const lines = [`📅 *${name}*`, start.toLocaleString("en-US", { dateStyle: "medium", timeStyle: "short" })];
+        if (end && !isNaN(end)) lines[1] += ` – ${end.toLocaleString("en-US", { dateStyle: "medium", timeStyle: "short" })}`;
+        if (payload.location) lines.push(`📍 ${payload.location}`);
+        if (payload.description) lines.push("", String(payload.description));
+        await sendContentAndLog(session, to, { text: lines.join("\n") }, lines.join("\n"));
+        return res.json({ sent: true, fallback: true, reason: err.message });
+      }
+    }
+
+    if (kind === "contact") {
+      const list = (payload.contacts || [])
+        .map((c) => ({ name: String(c.name || "").trim(), number: normalizeWaNumber(c.number || "") }))
+        .filter((c) => c.number);
+      if (list.length === 0) return res.status(400).json({ message: "Pick at least one contact" });
+      const vcards = list.map((c) => ({
+        vcard: `BEGIN:VCARD\nVERSION:3.0\nFN:${c.name || "+" + c.number}\nTEL;type=CELL;type=VOICE;waid=${c.number}:+${c.number}\nEND:VCARD`,
+      }));
+      const displayName = list.length === 1 ? (list[0].name || `+${list[0].number}`) : `${list.length} contacts`;
+      await sendContentAndLog(session, to, { contacts: { displayName, contacts: vcards } }, `👤 ${displayName}`);
+      return res.json({ sent: true });
+    }
+
+    res.status(400).json({ message: "Unknown message type" });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// All identifiers (phone JID + known LIDs) for a chat number
+async function identifiersFor(instanceId, number) {
+  const ids = new Set();
+  if (String(number).startsWith("lid:")) ids.add(`${String(number).slice(4)}@lid`);
+  else {
+    ids.add(`${number}@s.whatsapp.net`);
+    const maps = await WhatsAppLidMap.find({ instanceId, pn: number }).lean();
+    for (const m of maps) ids.add(jidNorm(m.lid));
+  }
+  return ids;
+}
+
+// Groups you and this contact are both in
+const groupCache = new Map(); // instanceId → { at, groups }
+app.get("/api/admin/whatsapp/common-groups/:instanceId/:number", protect, adminOnly, async (req, res) => {
+  try {
+    const { instanceId, number } = req.params;
+    const sock = activeSelfHostedSockets.get(instanceId);
+    if (!sock) return res.json({ groups: [] });
+    let cached = groupCache.get(instanceId);
+    if (!cached || Date.now() - cached.at > 10 * 60 * 1000) {
+      const all = await sock.groupFetchAllParticipating().catch(() => ({}));
+      cached = { at: Date.now(), groups: Object.values(all || {}) };
+      groupCache.set(instanceId, cached);
+    }
+    const targets = await identifiersFor(instanceId, number);
+    const groups = cached.groups
+      .filter((g) => (g.participants || []).some((p) => [p.id, p.jid, p.phoneNumber, p.lid].map(jidNorm).some((j) => j && targets.has(j))))
+      .map((g) => ({ id: g.id, subject: g.subject || "Group", size: (g.participants || []).length }));
+    res.json({ groups });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Block / unblock
+const blockCache = new Map(); // instanceId → { at, list:Set }
+async function getBlocklist(instanceId, sock) {
+  const cached = blockCache.get(instanceId);
+  if (cached && Date.now() - cached.at < 60 * 1000) return cached.list;
+  const raw = await sock.fetchBlocklist().catch(() => []);
+  const list = new Set((raw || []).map((x) => jidNorm(typeof x === "string" ? x : x?.jid || x?.id)).filter(Boolean));
+  blockCache.set(instanceId, { at: Date.now(), list });
+  return list;
+}
+app.get("/api/admin/whatsapp/block-status/:instanceId/:number", protect, adminOnly, async (req, res) => {
+  try {
+    const { instanceId, number } = req.params;
+    const sock = activeSelfHostedSockets.get(instanceId);
+    if (!sock) return res.json({ blocked: false });
+    const list = await getBlocklist(instanceId, sock);
+    const targets = await identifiersFor(instanceId, number);
+    res.json({ blocked: [...targets].some((t) => list.has(t)) });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+app.post("/api/admin/whatsapp/block/:instanceId/:number", protect, adminOnly, async (req, res) => {
+  try {
+    const { instanceId, number } = req.params;
+    const sock = activeSelfHostedSockets.get(instanceId);
+    if (!sock) return res.status(404).json({ message: "This number isn't connected right now" });
+    const jid = String(number).startsWith("lid:") ? `${String(number).slice(4)}@lid` : `${normalizeWaNumber(number)}@s.whatsapp.net`;
+    await sock.updateBlockStatus(jid, req.body?.block ? "block" : "unblock");
+    blockCache.delete(instanceId);
+    res.json({ blocked: !!req.body?.block });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
