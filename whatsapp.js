@@ -430,6 +430,16 @@ const activeSelfHostedSockets = new Map();
 // auth writes and auto-reconnect timers from an OLDER socket are ignored.
 const socketGenerations = new Map();
 
+// QR SAFETY NET:
+// - "desktop" link mode gives the full chat history, but on some Baileys /
+//   WhatsApp versions it fails before a QR is ever issued. If a not-yet-
+//   scanned session closes twice in a row WITHOUT producing a QR, it falls
+//   back to the default (web) link mode, which is the confirmed-working one.
+// - Unscanned (half-made) login data is wiped after such a failure so a bad
+//   half-made login can never get stuck in MongoDB and block the QR forever.
+const linkMode = new Map();        // sessionId → "desktop" | "default"
+const noQrFailures = new Map();    // sessionId → consecutive closes with no QR
+
 // Legacy folder (older versions stored the login here) — only cleaned up now.
 function sessionFolderFor(sessionId) {
   return path.join("/tmp/wa-sessions", sessionId);
@@ -477,6 +487,9 @@ async function startSelfHostedSession(sessionDoc) {
 
   const pino = require("pino");
   const logger = pino({ level: "silent" });
+  const useDesktop = linkMode.get(instanceId) !== "default";
+  let gotQrThisSocket = false;
+  console.log(`[Self-hosted WhatsApp] "${sessionDoc.label}" — starting socket (link mode: ${useDesktop ? "desktop / full history" : "default"}, saved login: ${state.creds?.me?.id ? "yes" : "no"})`);
   const sock = makeWASocket({
     ...(version ? { version } : {}),
     auth: {
@@ -485,11 +498,13 @@ async function startSelfHostedSession(sessionDoc) {
     },
     logger,
     printQRInTerminal: false,
-    // "Desktop" links receive the FULL chat history (web links only get a little)
-    browser: Browsers?.macOS ? Browsers.macOS("Desktop") : ["Mac OS", "Desktop", "14.4.1"],
+    ...(useDesktop ? {
+      // "Desktop" links receive the FULL chat history (web links get less)
+      browser: Browsers?.macOS ? Browsers.macOS("Desktop") : ["Mac OS", "Desktop", "14.4.1"],
+      // Newer Baileys skips the FULL history chunk by default — accept everything
+      shouldSyncHistoryMessage: () => true,
+    } : {}),
     syncFullHistory: true,
-    // Newer Baileys skips the FULL history chunk by default — accept everything
-    shouldSyncHistoryMessage: () => true,
     keepAliveIntervalMs: 15000,
   });
   activeSelfHostedSockets.set(instanceId, sock);
@@ -500,6 +515,8 @@ async function startSelfHostedSession(sessionDoc) {
     if (!isCurrent()) return;
     const { connection, lastDisconnect, qr } = update;
     if (qr) {
+      gotQrThisSocket = true;
+      noQrFailures.delete(instanceId);
       console.log(`[Self-hosted WhatsApp] "${sessionDoc.label}" — new QR issued`);
       await WhatsAppSelfSession.findByIdAndUpdate(sessionDoc._id, { lastQr: qr, status: "pending_qr" });
     }
@@ -527,10 +544,24 @@ async function startSelfHostedSession(sessionDoc) {
         console.log(`[Self-hosted WhatsApp] "${sessionDoc.label}" — replaced by another connection using the same session; not auto-reconnecting.`);
         return;
       }
+      // Not scanned yet and this socket never produced a QR → the half-made
+      // login is useless: wipe it so the retry starts clean, and after two
+      // such failures fall back to the default link mode.
+      if (!state.creds?.me?.id && !gotQrThisSocket && statusCode !== DisconnectReason.restartRequired) {
+        const fails = (noQrFailures.get(instanceId) || 0) + 1;
+        noQrFailures.set(instanceId, fails);
+        try { await WhatsAppAuthKey.deleteMany({ sessionId: instanceId }); } catch { /* ignore */ }
+        if (fails >= 2 && useDesktop) {
+          linkMode.set(instanceId, "default");
+          console.log(`[Self-hosted WhatsApp] "${sessionDoc.label}" — no QR in desktop mode (statusCode=${statusCode}); switching to default link mode so the QR can show.`);
+        }
+      }
       // Any other close keeps retrying with the SAME saved login (no QR).
       // 515 (restartRequired) happens right after a successful QR scan.
+      // While still waiting for a scan, keep the status "pending_qr" so the
+      // QR window keeps waiting for the next QR instead of showing "expired".
       if (statusCode !== DisconnectReason.restartRequired) {
-        await WhatsAppSelfSession.findByIdAndUpdate(sessionDoc._id, { status: "disconnected" });
+        await WhatsAppSelfSession.findByIdAndUpdate(sessionDoc._id, { status: state.creds?.me?.id ? "disconnected" : "pending_qr" });
       }
       setTimeout(async () => {
         if (!isCurrent()) return; // user clicked Reconnect/Remove meanwhile
