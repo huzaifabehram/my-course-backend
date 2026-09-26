@@ -557,7 +557,7 @@ module.exports = function setupAutomation(app, deps) {
     } finally {
       pollerBusy = false;
     }
-  }, 30 * 1000);
+  }, 10 * 1000); // tightened from 30s → 10s so a scheduled wait resumes closer to on time
 
   // ══════════════════════════════════════════════════════════════════════════
   // ROUTES — Automation Workflow
@@ -579,7 +579,7 @@ module.exports = function setupAutomation(app, deps) {
   });
 
   app.get("/api/admin/workflows", protect, adminOnly, async (req, res) => {
-    try { res.json(await Workflow.find({}).sort("-createdAt")); }
+    try { res.json(await Workflow.find({}).sort("-createdAt").lean()); }
     catch (err) { res.status(500).json({ message: err.message }); }
   });
 
@@ -679,7 +679,7 @@ module.exports = function setupAutomation(app, deps) {
         const taskDocs = await Task.find({ title: { $regex: task, $options: "i" }, contact: { $ne: null } }).select("contact");
         query._id = { $in: taskDocs.map((t) => t.contact) };
       }
-      res.json(await Contact.find(query).populate("assignedTo", "name email").sort("-createdAt"));
+      res.json(await Contact.find(query).populate("assignedTo", "name email").sort("-createdAt").lean());
     } catch (err) { res.status(500).json({ message: err.message }); }
   });
 
@@ -820,7 +820,7 @@ module.exports = function setupAutomation(app, deps) {
       const query = {};
       if (status) query.status = status;
       if (contactId) query.contact = contactId;
-      res.json(await Task.find(query).populate("assignedTo", "name email").populate("contact", "name email").sort("-createdAt"));
+      res.json(await Task.find(query).populate("assignedTo", "name email").populate("contact", "name email").sort("-createdAt").lean());
     } catch (err) { res.status(500).json({ message: err.message }); }
   });
 
@@ -868,7 +868,7 @@ module.exports = function setupAutomation(app, deps) {
   app.get("/api/admin/pipelines", protect, adminOnly, async (req, res) => {
     try {
       await getDefaultPipeline(); // make sure at least one exists
-      res.json(await Pipeline.find({}).sort("name"));
+      res.json(await Pipeline.find({}).sort("name").lean());
     } catch (err) { res.status(500).json({ message: err.message }); }
   });
 
@@ -910,7 +910,7 @@ module.exports = function setupAutomation(app, deps) {
     try {
       const query = {};
       if (req.query.pipelineId) query.pipeline = req.query.pipelineId;
-      res.json(await Opportunity.find(query).populate("contact").populate("pipeline", "name stages").sort("-createdAt"));
+      res.json(await Opportunity.find(query).populate("contact").populate("pipeline", "name stages").sort("-createdAt").lean());
     } catch (err) { res.status(500).json({ message: err.message }); }
   });
 
@@ -969,7 +969,7 @@ module.exports = function setupAutomation(app, deps) {
   // ══════════════════════════════════════════════════════════════════════════
 
   app.get("/api/admin/trigger-links", protect, adminOnly, async (req, res) => {
-    try { res.json(await TrackedLink.find({}).sort("-createdAt")); }
+    try { res.json(await TrackedLink.find({}).sort("-createdAt").lean()); }
     catch (err) { res.status(500).json({ message: err.message }); }
   });
 

@@ -48,6 +48,12 @@
 //    New dependency:  npm install ffmpeg-static   (voice note conversion)
 //    Media received BEFORE this update has no download info — to get it,
 //    use Clear History + Reconnect once (optional).
+//
+// D. NEW — failed sends now record WHY. `WhatsAppMessage.error` stores the
+//    real error text (e.g. "This number isn't connected right now") for any
+//    row with status "failed" — from a workflow's Send WhatsApp Message
+//    action, a manual send, or a bulk send — so the reason is visible
+//    without digging through server logs.
 
 let Baileys = null;
 try {
@@ -250,6 +256,11 @@ const WhatsAppMessageSchema = new mongoose.Schema({
   groupId:    { type: String, default: "" },
   message:    { type: String, default: "" },
   status:     { type: String, enum: ["sent", "failed", "received"], default: "sent" },
+  // NEW — set only when status is "failed": the real reason the send
+  // didn't go through (e.g. "This number isn't connected right now", or
+  // whatever Baileys/WhatsApp itself reported), so it's visible in the
+  // dashboard instead of only in server logs.
+  error:      { type: String, default: "" },
   source:     { type: String, default: "" }, // "workflow" | "manual" | "mobile_app" | "self_hosted" | "history_sync" | "bulk" | "ai_bot" | "external_api"
   waMessageId: { type: String, default: "" },
   // Exact WhatsApp identifier the message came from / went to (phone JID or
@@ -281,7 +292,7 @@ async function logWhatsAppMessage(fields) {
       const now = new Date();
       await WhatsAppMessage.updateOne(
         { instanceId: fields.instanceId, waMessageId: fields.waMessageId },
-        { $setOnInsert: { groupId: "", jid: "", ...fields, createdAt: fields.createdAt || now, updatedAt: now } },
+        { $setOnInsert: { groupId: "", jid: "", error: "", ...fields, createdAt: fields.createdAt || now, updatedAt: now } },
         { upsert: true, timestamps: false }
       );
     } else {
@@ -927,7 +938,7 @@ async function runBulkJob(jobId, sessionId, numbers, message) {
       await logWhatsAppMessage({ instanceId: sessionId, direction: "outgoing", number: normalizeWaNumber(number), jid: toWhatsAppJid(number), message, status: "sent", source: "bulk", waMessageId });
       results.push({ number, success: true, error: "" });
     } catch (err) {
-      await logWhatsAppMessage({ instanceId: sessionId, direction: "outgoing", number: normalizeWaNumber(number), message, status: "failed", source: "bulk" });
+      await logWhatsAppMessage({ instanceId: sessionId, direction: "outgoing", number: normalizeWaNumber(number), message, status: "failed", source: "bulk", error: err.message });
       results.push({ number, success: false, error: err.message });
     }
     await WhatsAppBulkJob.findByIdAndUpdate(jobId, { results });
@@ -1166,7 +1177,7 @@ app.post("/api/admin/whatsapp-server/send", protect, adminOnly, requireBaileys, 
       const waMessageId = await sendSelfHostedMessage(session.sessionId, sendTarget, message.trim());
       await logWhatsAppMessage({ instanceId: session.sessionId, direction: "outgoing", number: displayNumber, jid: sendTarget.includes("@") ? sendTarget : toWhatsAppJid(sendTarget), message: message.trim(), status: "sent", source: "manual", waMessageId });
     } catch (err) {
-      await logWhatsAppMessage({ instanceId: session.sessionId, direction: "outgoing", number: displayNumber, message: message.trim(), status: "failed", source: "manual" });
+      await logWhatsAppMessage({ instanceId: session.sessionId, direction: "outgoing", number: displayNumber, message: message.trim(), status: "failed", source: "manual", error: err.message });
       throw err;
     }
     res.json({ sent: true });
@@ -1201,8 +1212,14 @@ app.post("/api/whatsapp-server/external/send", requireBaileys, async (req, res) 
     if (!settings.whatsappServerApiKey || apiKey !== settings.whatsappServerApiKey)
       return res.status(401).json({ message: "Invalid API key" });
     if (!sessionId || !to?.trim() || !message?.trim()) return res.status(400).json({ message: "sessionId, to, and message are required" });
-    const waMessageId = await sendSelfHostedMessage(sessionId, to.trim(), message.trim());
-    await logWhatsAppMessage({ instanceId: sessionId, direction: "outgoing", number: normalizeWaNumber(to), jid: toWhatsAppJid(to), message: message.trim(), status: "sent", source: "external_api", waMessageId });
+    let waMessageId = "";
+    try {
+      waMessageId = await sendSelfHostedMessage(sessionId, to.trim(), message.trim());
+      await logWhatsAppMessage({ instanceId: sessionId, direction: "outgoing", number: normalizeWaNumber(to), jid: toWhatsAppJid(to), message: message.trim(), status: "sent", source: "external_api", waMessageId });
+    } catch (err) {
+      await logWhatsAppMessage({ instanceId: sessionId, direction: "outgoing", number: normalizeWaNumber(to), message: message.trim(), status: "failed", source: "external_api", error: err.message });
+      throw err;
+    }
     res.json({ sent: true });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
