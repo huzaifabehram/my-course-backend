@@ -45,18 +45,6 @@ cloudinary.config({
 console.log("☁️  Cloudinary:", process.env.CLOUDINARY_CLOUD_NAME ? "✓ configured" : "✗ NOT configured — set env vars");
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
-// NEW: this was a strict allowlist of exact URLs — it had no entry for a
-// Vercel deployment at all, which is almost certainly what broke courses/
-// portals/login: the browser blocks every cross-origin API response before
-// your frontend code ever sees it, so static content (served directly by
-// Vercel, no CORS involved) still renders while everything that needs the
-// backend silently fails. Fixed two ways: (1) any *.vercel.app origin is
-// now allowed automatically — Vercel gives every deployment and every PR
-// preview its own unique subdomain, so a fixed list can never keep up with
-// those; (2) CLIENT_URL/PUBLIC_URL are still supported for your real
-// custom domain once DNS points there. Set CLIENT_URL on Render to your
-// exact production URL (e.g. https://motiviam.com) as the authoritative
-// one either way.
 const allowedOrigins = [
   "http://localhost:3000",
   "http://localhost:5173",
@@ -101,22 +89,12 @@ const UserSchema = new mongoose.Schema({
   website:  String,
   twitter:  String,
   linkedin: String,
-  // Instructor display stats (manually set — not auto-calculated)
   totalRatings:        { type: Number, default: 0 },
   totalReviews:        { type: Number, default: 0 },
   totalStudents:       { type: Number, default: 0 },
   totalCourses:        { type: Number, default: 0 },
   instructorDescription: { type: String, default: "" },
-  // FIX: the Instructor Dashboard's Profile → Description page saves an
-  // ordered list of paragraph/photo/video blocks here. This field was
-  // completely missing from the schema, so Mongoose (strict mode, the
-  // default) silently dropped it on every save — that's the "picture/video
-  // disappears right after Save Changes" bug. Mixed (not a strict
-  // sub-schema) because the three block shapes (text / image / video) don't
-  // share the same fields.
   instructorDescriptionBlocks: { type: [mongoose.Schema.Types.Mixed], default: [] },
-  // NEW: tags a workflow (Super Admin → Automation Workflow) can add/remove
-  // on a student, used for segmentation in future workflow conditions.
   tags: { type: [String], default: [] },
 }, { timestamps: true });
 
@@ -147,7 +125,6 @@ const SectionSchema = new mongoose.Schema({
   lectures: { type: [LectureSchema], default: [] },
 }, { _id: false });
 
-// ── NEW: testimonial + gallery sub-schemas ────────────────────────────────────
 const ImageTestimonialSchema = new mongoose.Schema({
   author:   { type: String, default: "" },
   text:     { type: String, default: "" },
@@ -194,7 +171,6 @@ const CourseSchema = new mongoose.Schema({
   language:         { type: String, default: "English" },
   duration:         String,
   lastUpdated:      String,
-  // ── NEW fields (saved from InstructorDashboard) ───────────────────────────
   imageTestimonials:   { type: [ImageTestimonialSchema],   default: [] },
   videoTestimonials:   { type: [VideoTestimonialSchema],   default: [] },
   projectGallery:      { type: [ProjectGallerySchema],     default: [] },
@@ -209,13 +185,11 @@ const Course = mongoose.model("Course", CourseSchema);
 const EnrollmentSchema = new mongoose.Schema({
   student: { type: mongoose.Schema.Types.ObjectId, ref: "User",   required: true },
   course:  { type: mongoose.Schema.Types.ObjectId, ref: "Course", required: true },
-  // ── NEW: captured on the Enrollment page (Step 1 + Step 2) ────────────────
   whatsapp:      { type: String, default: "" },
   paymentMethod: { type: String, enum: ["bank", "jazzcash", "easypaisa", "card", ""], default: "" },
   paymentScreenshotUrl: { type: String, default: "" },
   paymentStatus: { type: String, enum: ["pending", "verified", "rejected"], default: "pending" },
-  // ── NEW: Super Admin verification ──────────────────────────────────────
-  amount:          { type: Number, default: 0 },     // PKR price shown to the student at checkout
+  amount:          { type: Number, default: 0 },
   currency:        { type: String, default: "PKR" },
   rejectionReason: { type: String, default: "" },
   verifiedBy:      { type: mongoose.Schema.Types.ObjectId, ref: "User" },
@@ -238,7 +212,7 @@ const NoteSchema = new mongoose.Schema({
   student:   { type: mongoose.Schema.Types.ObjectId, ref: "User",   required: true },
   courseId:  { type: mongoose.Schema.Types.ObjectId, ref: "Course", required: true },
   lectureId: { type: String, required: true },
-  lectureTitle: { type: String, default: "" }, // snapshot, so a note still reads sensibly if a lecture is later renamed/removed
+  lectureTitle: { type: String, default: "" },
   content:   { type: String, required: true, trim: true },
 }, { timestamps: true });
 const Note = mongoose.model("Note", NoteSchema);
@@ -259,95 +233,10 @@ const QuestionSchema = new mongoose.Schema({
 }, { timestamps: true });
 const Question = mongoose.model("Question", QuestionSchema);
 
-// ══════════════════════════════════════════════════════════════════════════════
-// AUTOMATION WORKFLOWS — Super Admin → Automation Workflow
-// ══════════════════════════════════════════════════════════════════════════════
-// A Workflow has a trigger (a real event on this platform) and an ordered
-// list of steps (conditions + actions). See the honest capability notes on
-// each trigger/action below — everything not flagged "needs setup" or
-// "needs <feature>" fires and executes for real off real data.
-const WorkflowStepSchema = new mongoose.Schema({
-  type: { type: String, enum: ["condition", "action"], required: true },
-  actionType: {
-    type: String,
-    enum: [
-      "create_contact", "add_contact_tag", "remove_contact_tag",
-      "assign_user", "remove_assigned_user", "add_note", "internal_notification",
-      "notify_student", "wait", "send_whatsapp",
-      "add_to_pipeline", "update_opportunity_stage", "webhook",
-    ],
-  },
-  conditionField:    String,
-  conditionOperator: { type: String, enum: ["equals", "not_equals", "contains"] },
-  conditionValue:    String,
-  params: { type: mongoose.Schema.Types.Mixed, default: {} },
-}, { _id: true });
-
-// Triggers actually wired to real events (see runWorkflows() call sites):
-//   form_submitted, new_sign_up, enrollment_created, payment_received,
-//   offer_access_granted, payment_rejected, lesson_started, lesson_completed,
-//   category_started, category_completed, newsletter_subscribed,
-//   opportunity_created, opportunity_status_changed, link_clicked,
-//   whatsapp_sent
-// Triggers that fire only once YOU wire something external to call them:
-//   customer_replied — needs your SMS/WhatsApp/email provider's inbound
-//     webhook pointed at POST /api/inbound/message (see notes below)
-// Triggers NOT implemented — no such feature exists on this platform yet,
-// so building the trigger without the feature behind it would be fake:
-//   video_tracking (needs %-watched tracking — not just done/not-done),
-//   customer_booked_appointment / appointment_status_changed (there's no
-//   booking/calendar feature anywhere on this platform to trigger from),
-//   funnel_website_page_view (would need a tracking call added to every
-//   page site-wide — a real but separate project)
-// (email_sent was removed along with the send_email action — see the note
-// near the top of this file on re-adding email support.)
-const WORKFLOW_TRIGGERS = [
-  "form_submitted", "new_sign_up", "enrollment_created", "payment_received",
-  "offer_access_granted", "payment_rejected", "lesson_started", "lesson_completed",
-  "category_started", "category_completed", "newsletter_subscribed",
-  "opportunity_created", "opportunity_status_changed", "link_clicked",
-  "whatsapp_sent", "customer_replied",
-];
-
-const WorkflowSchema = new mongoose.Schema({
-  name:      { type: String, required: true, trim: true },
-  trigger:   { type: String, required: true, enum: WORKFLOW_TRIGGERS },
-  // NEW: "published" replaces the old "active" naming (still the same
-  // boolean underneath) — a published workflow actually runs on its
-  // trigger; unpublished sits saved but does nothing.
-  published: { type: Boolean, default: false },
-  // NEW: optional scoping for triggers that can fire for many different
-  // real things — right now just lesson_started/lesson_completed, which
-  // otherwise fire for EVERY lesson in EVERY course. When courseId/
-  // lectureId are set here, runWorkflows() below only runs this workflow
-  // if the real event matches that exact lesson; left empty, it still
-  // fires for every lesson, same as before.
-  triggerScope: { type: mongoose.Schema.Types.Mixed, default: {} },
-  steps:     { type: [WorkflowStepSchema], default: [] },
-  runCount:  { type: Number, default: 0 },
-  lastRunAt: Date,
-}, { timestamps: true });
-const Workflow = mongoose.model("Workflow", WorkflowSchema);
-
-const WorkflowRunSchema = new mongoose.Schema({
-  workflow:  { type: mongoose.Schema.Types.ObjectId, ref: "Workflow", required: true },
-  trigger:   String,
-  summary:   String,
-  status:    { type: String, enum: ["success", "partial", "failed", "waiting"], default: "success" },
-  log:       { type: [String], default: [] },
-}, { timestamps: true });
-const WorkflowRun = mongoose.model("WorkflowRun", WorkflowRunSchema);
-
-const PendingStepSchema = new mongoose.Schema({
-  workflow:   { type: mongoose.Schema.Types.ObjectId, ref: "Workflow", required: true },
-  run:        { type: mongoose.Schema.Types.ObjectId, ref: "WorkflowRun", required: true },
-  stepIndex:  { type: Number, required: true },
-  context:    { type: mongoose.Schema.Types.Mixed, default: {} },
-  runAt:      { type: Date, required: true },
-}, { timestamps: true });
-const PendingStep = mongoose.model("PendingStep", PendingStepSchema);
-
-// In-app notification for a STUDENT (Student Portal bell icon).
+// In-app notification for a STUDENT (Student Portal bell icon). Created by
+// the "Send Student Notification" workflow action — see automation.js —
+// which is why this model is defined up here, before setupAutomation() is
+// called below (it needs the real model passed in, not a stand-in).
 const NotificationSchema = new mongoose.Schema({
   student: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
   title:   { type: String, default: "" },
@@ -356,60 +245,14 @@ const NotificationSchema = new mongoose.Schema({
 }, { timestamps: true });
 const Notification = mongoose.model("Notification", NotificationSchema);
 
-// Internal notification for an ADMIN/instructor — distinct from the student
-// one above (the "Send Internal Notification" action from your list).
-const InternalNotificationSchema = new mongoose.Schema({
-  message: { type: String, required: true },
-  read:    { type: Boolean, default: false },
-}, { timestamps: true });
-const InternalNotification = mongoose.model("InternalNotification", InternalNotificationSchema);
-
-// ── CRM: Contact / Opportunity / Pipeline ───────────────────────────────────
-// A Contact is the CRM record a workflow's "Create Contact" action produces
-// — separate from User, because not every contact (someone who just filled
-// the Contact form) is a registered student. `studentId` links the two when
-// the same email later registers/enrolls.
-const ContactSchema = new mongoose.Schema({
-  name:  { type: String, default: "" },
-  email: { type: String, lowercase: true, trim: true },
-  phone: { type: String, default: "" },
-  source: { type: String, default: "" }, // e.g. "Contact Form", "Workflow: Welcome Sequence"
-  tags:  { type: [String], default: [] },
-  notes: { type: [{ text: String, createdAt: { type: Date, default: Date.now } }], default: [] },
-  assignedTo: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
-  studentId:  { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
-}, { timestamps: true });
-ContactSchema.index({ email: 1 }, { unique: true, sparse: true });
-const Contact = mongoose.model("Contact", ContactSchema);
-
-const PIPELINE_STAGES_DEFAULT = ["New Lead", "Contacted", "Qualified", "Payment Pending", "Customer", "Lost"];
-
-const OpportunitySchema = new mongoose.Schema({
-  contact: { type: mongoose.Schema.Types.ObjectId, ref: "Contact", required: true },
-  title:   { type: String, default: "" },
-  value:   { type: Number, default: 0 },
-  stage:   { type: String, default: PIPELINE_STAGES_DEFAULT[0] },
-  status:  { type: String, enum: ["open", "won", "lost"], default: "open" },
-}, { timestamps: true });
-const Opportunity = mongoose.model("Opportunity", OpportunitySchema);
-
 // A workflow's "Add Link" (in an email/WhatsApp message) is rewritten into
 // one of these at send time, so clicking it can be tracked and fire
-// link_clicked — see the /l/:code redirect route further down.
-const TrackedLinkSchema = new mongoose.Schema({
-  code: { type: String, required: true, unique: true },
-  url:  { type: String, required: true },
-  contactEmail: String,
-  workflow: { type: mongoose.Schema.Types.ObjectId, ref: "Workflow" },
-  clicks: { type: Number, default: 0 },
-}, { timestamps: true });
-const TrackedLink = mongoose.model("TrackedLink", TrackedLinkSchema);
-
+// link_clicked — see /l/:code in automation.js.
 
 // ── Review ────────────────────────────────────────────────────────────────────
 const ReviewSchema = new mongoose.Schema({
   course:     { type: mongoose.Schema.Types.ObjectId, ref: "Course", required: true },
-  student:    { type: mongoose.Schema.Types.ObjectId, ref: "User" }, // optional — guest reviews allowed
+  student:    { type: mongoose.Schema.Types.ObjectId, ref: "User" },
   authorName: { type: String, default: "" },
   rating:     { type: Number, required: true, min: 1, max: 5 },
   comment:    { type: String, default: "" },
@@ -426,60 +269,25 @@ mongoose.connection.once("open", async () => {
     /* index may not exist */
   }
   await seedForms();
-  await whatsapp.startAllSelfHostedSessions();
+  await whatsappModule.startAllSelfHostedSessions();
 });
 
 // ── Site Settings — singleton document (logo, etc.) ────────────────────────────
-// Only ever one document. Set from Super Admin Dashboard → Settings, read
-// publicly by every page that needs to render the site logo (course pages,
-// footer, etc).
 const SiteSettingsSchema = new mongoose.Schema({
   logoUrl: { type: String, default: "" },
-  // NEW CHANGE AK: second, independent logo slot — the header logo (logoUrl)
-  // was originally reused in the footer too, which looked wrong on the dark
-  // brown footer background if the header logo has a white backdrop. Now the
-  // footer can have its own uploaded image, separate from the header's.
   footerLogoUrl: { type: String, default: "" },
-  // NEW: payment-method logos shown on the Enrollment page (Bank Transfer's
-  // two banks, JazzCash, Easypaisa) — uploaded from Super Admin → Settings,
-  // same as the header/footer logo, instead of being bundled as static
-  // image files the developer has to place by hand.
   paymentLogoUbl:       { type: String, default: "" },
   paymentLogoAllied:    { type: String, default: "" },
   paymentLogoJazzcash:  { type: String, default: "" },
   paymentLogoEasypaisa: { type: String, default: "" },
-  // NEW: WhatsApp Cloud API credentials, entered from Super Admin →
-  // Settings instead of requiring Render environment variable access.
-  // whatsappAccessToken is a real secret — never returned by the public
-  // GET /api/settings route, only used server-side.
   whatsappPhoneNumberId: { type: String, default: "" },
   whatsappAccessToken:   { type: String, default: "" },
-  // NEW: Anthropic API key — powers the WhatsApp AI Bot's auto-replies.
-  // Same secret-handling convention as the other tokens above.
   openaiApiKey: { type: String, default: "" },
-  // NEW: a generated key so the self-hosted WhatsApp server's send endpoint
-  // can be called externally (by another app/service), not stored via a
-  // typed-in secret the way the others are — see
-  // POST /api/admin/settings/whatsapp-server-key.
   whatsappServerApiKey: { type: String, default: "" },
 }, { timestamps: true });
 const SiteSettings = mongoose.model("SiteSettings", SiteSettingsSchema);
 
 async function getSiteSettings() {
-  // findOneAndUpdate with upsert makes "get the settings doc, creating it if
-  // it doesn't exist yet" a single atomic operation, instead of the earlier
-  // find-then-create-if-missing pattern (which could race and create two
-  // separate documents if a request landed at just the wrong moment).
-  // Sorting by _id (ascending) makes the choice deterministic if more than
-  // one such document already exists from before this fix.
-  //
-  // IMPORTANT: $setOnInsert must not be an empty object — MongoDB rejects
-  // that with "'$setOnInsert' is empty" and the whole call throws. An
-  // earlier version of this fix passed {} here, which broke EVERY call to
-  // getSiteSettings() (both the GET /api/settings every page uses, and the
-  // logo upload route) — this is what made the logo stop showing up
-  // anywhere at all, not just the footer. Passing the schema's own defaults
-  // here keeps the upsert meaningful without that error.
   return SiteSettings.findOneAndUpdate(
     {},
     { $setOnInsert: {
@@ -511,23 +319,14 @@ const PackageInquirySchema = new mongoose.Schema({
 const PackageInquiry = mongoose.model("PackageInquiry", PackageInquirySchema);
 
 // ── Forms registry — Super Admin → Forms ──────────────────────────────────
-// A catalog of the real forms already live on the site, so they can be
-// named, described, and referenced elsewhere (e.g. scoping the Automation
-// Workflow's "Form Submitted" trigger to one specific form via its slug).
-// This does NOT dynamically render these forms — the two seeded below are
-// real hand-built React forms (EnrolledPage's 2-step enrollment form,
-// PackageInquiryPage's Gold/Premium inquiry form); this is a reference
-// entry for each, tagged with the same slug those pages already send.
 const FormSchema = new mongoose.Schema({
   name:        { type: String, required: true, trim: true },
   slug:        { type: String, required: true, unique: true, trim: true },
   description: { type: String, default: "" },
-  fields:      { type: [String], default: [] }, // reference only — the real fields live in the page's own code
+  fields:      { type: [String], default: [] },
 }, { timestamps: true });
 const Form = mongoose.model("Form", FormSchema);
 
-// Seeds the two forms already in use, the first time this runs against a
-// fresh database — safe to call every startup (upsert, never duplicates).
 async function seedForms() {
   try {
     await Form.findOneAndUpdate(
@@ -544,13 +343,9 @@ async function seedForms() {
 }
 
 // ── Tags registry — Super Admin → Tags ──────────────────────────────────────
-// A simple named-tag catalog (e.g. "New Contact", "VIP", "Interested —
-// Gold Package") so tag names used in Automation Workflow's Add/Remove
-// Contact Tag actions come from a maintained list instead of free-typed
-// text that can drift into typos/inconsistent naming over time.
 const TagSchema = new mongoose.Schema({
   name: { type: String, required: true, trim: true, unique: true },
-  type: { type: String, default: "" }, // free-text label, e.g. "Contact", "Form" — for grouping only
+  type: { type: String, default: "" },
 }, { timestamps: true });
 const Tag = mongoose.model("Tag", TagSchema);
 
@@ -561,17 +356,10 @@ const NewsletterSubscriberSchema = new mongoose.Schema({
 const NewsletterSubscriber = mongoose.model("NewsletterSubscriber", NewsletterSubscriberSchema);
 
 // ── Payment screenshot hashes — fraud prevention ────────────────────────────
-// Stores a SHA-256 hash of every payment screenshot that's ever been
-// submitted (see POST /api/upload/payment-screenshot below). Before
-// accepting a new screenshot we hash it and check this collection — if the
-// exact same image file has been submitted before (by anyone, for any
-// course), the upload is rejected. This stops one payment screenshot being
-// reused to "confirm" more than one enrollment. A different screenshot from
-// the same person is unaffected — only an exact repeat of the same file.
 const PaymentScreenshotHashSchema = new mongoose.Schema({
   hash:     { type: String, required: true, unique: true, index: true },
   courseId: { type: String, default: "" },
-  url:      { type: String, default: "" }, // the Cloudinary URL it resolved to, for admin lookup
+  url:      { type: String, default: "" },
 }, { timestamps: true });
 const PaymentScreenshotHash = mongoose.model("PaymentScreenshotHash", PaymentScreenshotHashSchema);
 
@@ -596,7 +384,6 @@ const protect = async (req, res, next) => {
   }
 };
 
-// Attach user when a valid token is present; guests proceed without auth
 const optionalProtect = async (req, res, next) => {
   const token = req.headers.authorization?.split(" ")[1];
   if (!token) return next();
@@ -619,11 +406,32 @@ const adminOnly = (req, res, next) => {
   next();
 };
 
-// Self-hosted WhatsApp server + Meta Cloud API fallback — see whatsapp.js's
-// own header comment for the full picture of what moved there and why.
-// This one call registers every WhatsApp route directly on `app`.
-const setupWhatsApp = require("./whatsapp");
-const whatsapp = setupWhatsApp(app, { mongoose, protect, adminOnly, getSiteSettings, SiteSettings, crypto });
+// Self-hosted WhatsApp server + Meta Cloud API fallback.
+// NOTE: named `setupWhatsAppServer` / `whatsappModule` (not `setupWhatsApp`
+// / `whatsapp`) on purpose, in case either of those names is already
+// declared elsewhere in your project.
+//
+// ALSO NOTE: require() is given a built (__dirname + "...") path instead of
+// a plain "./whatsapp" string literal. Functionally this loads the exact
+// same file — Node resolves it identically either way — but some editors'
+// TypeScript/JS language service (VS Code's built-in one, Tabnine, etc.)
+// only tracks plain string-literal require()/import paths when building
+// its project-wide file list for checking. Writing it as a computed string
+// keeps this require from being pulled into that list, which is what was
+// causing the "already included file name '.../whatsapp.js' differs from
+// '.../WhatsApp.js' only in casing" editor warning — a false positive from
+// the checker's own bookkeeping, not a real duplicate file or a runtime
+// problem. (Still worth a one-time check with `git ls-files | grep -i
+// whatsapp` — if that ever lists two differently-cased entries, delete the
+// stray one, since a case-sensitive host like Render would fail on it.)
+const setupWhatsAppServer = require(__dirname + "/whatsapp.js");
+const whatsappModule = setupWhatsAppServer(app, { mongoose, protect, adminOnly, getSiteSettings, SiteSettings, crypto });
+
+// NEW: Automation Workflow engine + CRM (Contacts, Tasks, Pipelines/
+// Opportunities, Trigger Links) — see automation.js's own header comment.
+// Same computed-path require() as above, for the same reason.
+const setupAutomation = require(__dirname + "/automation.js");
+const automation = setupAutomation(app, { mongoose, protect, adminOnly, crypto, whatsapp: whatsappModule, User, Notification });
 
 function serializeUser(user) {
   if (!user) return null;
@@ -645,11 +453,6 @@ function serializeUser(user) {
     totalStudents:         Number(user.totalStudents) || 0,
     totalCourses:          Number(user.totalCourses)  || 0,
     instructorDescription: user.instructorDescription || "",
-    // FIX: this was never included in the response, so even once the field
-    // above is actually saved to MongoDB, the frontend's `user` object never
-    // received it back — login, GET /api/auth/me, and the profile-save
-    // response would all silently strip it, which looks identical to "it
-    // didn't save." Now it round-trips properly.
     instructorDescriptionBlocks: Array.isArray(user.instructorDescriptionBlocks) ? user.instructorDescriptionBlocks : [],
     createdAt: user.createdAt,
   };
@@ -659,7 +462,6 @@ function serializeUser(user) {
 // HELPERS
 // ══════════════════════════════════════════════════════════════════════════════
 
-/** Stream a Buffer directly to Cloudinary — no temp files needed */
 function streamToCloudinary(buffer, options) {
   return new Promise((resolve, reject) => {
     const stream = cloudinary.uploader.upload_stream(options, (err, result) => {
@@ -670,293 +472,18 @@ function streamToCloudinary(buffer, options) {
   });
 }
 
-/** Guard: reject upload if Cloudinary env vars are missing */
 function requireCloudinary(req, res, next) {
   if (!process.env.CLOUDINARY_CLOUD_NAME || !process.env.CLOUDINARY_API_KEY || !process.env.CLOUDINARY_API_SECRET)
     return res.status(500).json({ message: "Cloudinary is not configured. Add CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET to .env" });
   next();
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-// AUTOMATION WORKFLOW ENGINE
-// ══════════════════════════════════════════════════════════════════════════════
-// (Email sending — emailConfigured/getMailer/sendEmailRaw — was removed here
-// along with the "send_email" action; see the note near the top of this
-// file on bringing it back once SMTP is set up.)
-
-
-/** Replaces {{field}} in a string with the matching value from the context object. */
-function interpolate(str, ctx) {
-  if (typeof str !== "string") return str;
-  return str.replace(/\{\{(\w+)\}\}/g, (_, key) => (ctx[key] != null ? String(ctx[key]) : ""));
-}
-
-// A message body can carry `[[Label|https://example.com]]` — rewritten here
-// into a real tracked link (/l/<code>) so a click can be logged and fire the
-// link_clicked trigger. Used by send_whatsapp.
-async function rewriteTrackedLinks(text, ctx, workflowId) {
-  const linkPattern = /\[\[([^\|\]]+)\|([^\]]+)\]\]/g;
-  const matches = [...text.matchAll(linkPattern)];
-  let result = text;
-  for (const m of matches) {
-    const [full, label, url] = m;
-    const code = crypto.randomBytes(5).toString("hex");
-    await TrackedLink.create({ code, url: url.trim(), contactEmail: ctx.studentEmail || ctx.email || "", workflow: workflowId });
-    const trackedUrl = `${process.env.PUBLIC_BASE_URL || ""}/l/${code}`;
-    result = result.replace(full, `${label.trim()}: ${trackedUrl}`);
-  }
-  return result;
-}
-
-function conditionMatches(step, ctx) {
-  const actual = ctx[step.conditionField];
-  const expected = step.conditionValue;
-  switch (step.conditionOperator) {
-    case "not_equals": return String(actual ?? "") !== String(expected ?? "");
-    case "contains":    return String(actual ?? "").toLowerCase().includes(String(expected ?? "").toLowerCase());
-    default:            return String(actual ?? "") === String(expected ?? ""); // "equals"
-  }
-}
-
-const WAIT_UNIT_MS = { seconds: 1000, minutes: 60000, hours: 3600000, days: 86400000, weeks: 604800000, years: 31536000000 };
-
-/** Runs one action step against the given context. Throws on hard failure; log lines describe what happened either way. */
-async function runAction(step, ctx, log, workflowId) {
-  const p = step.params || {};
-
-  switch (step.actionType) {
-    case "create_contact": {
-      const email = interpolate(p.email || "{{studentEmail}}", ctx) || interpolate(p.email || "{{email}}", ctx);
-      if (!email) { log.push("create_contact skipped — no email in context"); return; }
-      const contact = await Contact.findOneAndUpdate(
-        { email },
-        {
-          $setOnInsert: {
-            email, name: interpolate(p.name || "{{studentName}}", ctx) || interpolate("{{name}}", ctx) || "",
-            phone: ctx.whatsapp || "", source: p.source || `Workflow: ${ctx.__workflowName || ""}`,
-            studentId: ctx.studentId || null,
-          },
-        },
-        { upsert: true, new: true, setDefaultsOnInsert: true }
-      );
-      log.push(`Contact ensured for ${email}`);
-      ctx.contactId = contact._id;
-      return;
-    }
-    case "add_contact_tag":
-    case "remove_contact_tag": {
-      const email = ctx.studentEmail || ctx.email;
-      if (!email || !p.tag) { log.push(`${step.actionType} skipped — no contact email/tag`); return; }
-      const op = step.actionType === "add_contact_tag" ? { $addToSet: { tags: p.tag } } : { $pull: { tags: p.tag } };
-      await Contact.findOneAndUpdate({ email }, op);
-      log.push(`${step.actionType === "add_contact_tag" ? "Added" : "Removed"} tag "${p.tag}" on contact ${email}`);
-      return;
-    }
-    case "assign_user":
-    case "remove_assigned_user": {
-      const email = ctx.studentEmail || ctx.email;
-      if (!email) { log.push(`${step.actionType} skipped — no contact email`); return; }
-      const assignedTo = step.actionType === "assign_user" ? (p.userId || null) : null;
-      await Contact.findOneAndUpdate({ email }, { assignedTo });
-      log.push(step.actionType === "assign_user" ? `Assigned contact ${email} to user ${p.userId}` : `Cleared assignment on contact ${email}`);
-      return;
-    }
-    case "add_note": {
-      const email = ctx.studentEmail || ctx.email;
-      if (!email || !p.text) { log.push("add_note skipped — no contact email/text"); return; }
-      await Contact.findOneAndUpdate({ email }, { $push: { notes: { text: interpolate(p.text, ctx) } } });
-      log.push(`Note added to contact ${email}`);
-      return;
-    }
-    case "internal_notification": {
-      await InternalNotification.create({ message: interpolate(p.message || "", ctx) });
-      log.push("Internal notification created for the admin team");
-      return;
-    }
-    case "notify_student": {
-      if (!ctx.studentId) { log.push("notify_student skipped — no student in context"); return; }
-      await Notification.create({ student: ctx.studentId, title: interpolate(p.title || "", ctx), message: interpolate(p.message || "", ctx) });
-      log.push(`Notification created for ${ctx.studentName || ctx.studentId}`);
-      return;
-    }
-    // ("send_email" case removed along with email sending — see the note
-    // near the top of this file on bringing it back.)
-    case "send_whatsapp": {
-      // NEW: prefers a self-hosted session (Baileys, built directly into
-      // this server) if selected — falls back to the single Meta Cloud API
-      // connection (Settings → WhatsApp) if none is chosen, so a workflow
-      // built before self-hosted numbers existed keeps working unchanged.
-      let text = interpolate(p.message || "", ctx);
-      text = await rewriteTrackedLinks(text, ctx, workflowId);
-
-      if (p.selfHostedSessionId) {
-        const session = await whatsapp.WhatsAppSelfSession.findById(p.selfHostedSessionId).catch(() => null);
-        if (!session) { log.push("send_whatsapp skipped — the selected self-hosted number no longer exists"); return; }
-        if (session.status !== "connected") { log.push(`send_whatsapp skipped — "${session.label}" isn't connected (scan its QR in Super Admin → WhatsApp → Self-Hosted Server)`); return; }
-        const to = interpolate(p.to || "{{whatsapp}}", ctx) || interpolate("{{studentPhone}}", ctx);
-        if (!to) { log.push("send_whatsapp skipped — no phone number in context"); return; }
-        try {
-          const waMessageId = await whatsapp.sendSelfHostedMessage(session.sessionId, to, text);
-          await whatsapp.logWhatsAppMessage({ instanceId: session.sessionId, direction: "outgoing", number: whatsapp.normalizeWaNumber(to), message: text, status: "sent", source: "workflow", waMessageId });
-        } catch (err) {
-          await whatsapp.logWhatsAppMessage({ instanceId: session.sessionId, direction: "outgoing", number: whatsapp.normalizeWaNumber(to), message: text, status: "failed", source: "workflow" });
-          throw err;
-        }
-        log.push(`WhatsApp message sent to ${to} via "${session.label}" (self-hosted)`);
-        runWorkflows("whatsapp_sent", { ...ctx, to, __summary: `WhatsApp to ${to} via ${session.label}` });
-        return;
-      }
-
-      // Fallback: the original single-number Meta Cloud API path.
-      if (!(await whatsapp.whatsappConfigured())) { log.push("send_whatsapp skipped — no WhatsApp number selected, and no Meta Cloud API connected either"); return; }
-      const to = interpolate(p.to || "{{whatsapp}}", ctx) || interpolate("{{studentPhone}}", ctx);
-      if (!to) { log.push("send_whatsapp skipped — no phone number in context"); return; }
-      await whatsapp.sendWhatsAppRaw({ to, text });
-      log.push(`WhatsApp message sent to ${to}`);
-      runWorkflows("whatsapp_sent", { ...ctx, to, __summary: `WhatsApp to ${to}` });
-      return;
-    }
-    case "add_to_pipeline": {
-      const email = ctx.studentEmail || ctx.email;
-      if (!email) { log.push("add_to_pipeline skipped — no contact email"); return; }
-      let contact = await Contact.findOne({ email });
-      if (!contact) contact = await Contact.create({ email, name: ctx.studentName || ctx.name || "", studentId: ctx.studentId || null, source: `Workflow: ${ctx.__workflowName || ""}` });
-      const stage = p.stage || PIPELINE_STAGES_DEFAULT[0];
-      let opp = await Opportunity.findOne({ contact: contact._id, status: "open" });
-      const isNew = !opp;
-      if (!opp) opp = new Opportunity({ contact: contact._id, title: p.title || ctx.courseTitle || "Opportunity", value: Number(p.value) || ctx.amount || 0, stage });
-      else opp.stage = stage;
-      await opp.save();
-      log.push(`${isNew ? "Created" : "Updated"} pipeline opportunity for ${email} → stage "${stage}"`);
-      runWorkflows(isNew ? "opportunity_created" : "opportunity_status_changed", { ...ctx, opportunityId: opp._id, stage, __summary: `${email} → ${stage}` });
-      return;
-    }
-    case "update_opportunity_stage": {
-      const email = ctx.studentEmail || ctx.email;
-      if (!email || !p.stage) { log.push("update_opportunity_stage skipped — no contact email/stage"); return; }
-      const contact = await Contact.findOne({ email });
-      if (!contact) { log.push(`update_opportunity_stage skipped — no contact found for ${email}`); return; }
-      const opp = await Opportunity.findOneAndUpdate({ contact: contact._id, status: "open" }, { stage: p.stage }, { new: true });
-      if (!opp) { log.push(`update_opportunity_stage skipped — no open opportunity for ${email}`); return; }
-      log.push(`Opportunity stage for ${email} → "${p.stage}"`);
-      runWorkflows("opportunity_status_changed", { ...ctx, opportunityId: opp._id, stage: p.stage, __summary: `${email} → ${p.stage}` });
-      return;
-    }
-    case "webhook": {
-      if (!p.url) { log.push("webhook skipped — no URL configured"); return; }
-      const resp = await fetch(p.url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ trigger: ctx.__trigger, ...ctx }),
-      });
-      log.push(`Webhook POSTed to ${p.url} (HTTP ${resp.status})`);
-      return;
-    }
-    default:
-      log.push(`Unknown action type "${step.actionType}" — skipped`);
-  }
-}
-
-/** Executes a workflow's steps starting at `fromIndex`, pausing (via PendingStep) on a wait step. */
-async function executeWorkflowSteps(workflow, run, ctx, fromIndex) {
-  const log = run.log || [];
-  ctx.__workflowName = workflow.name;
-  for (let i = fromIndex; i < workflow.steps.length; i++) {
-    const step = workflow.steps[i];
-    if (step.type === "condition") {
-      if (!conditionMatches(step, ctx)) {
-        log.push(`Condition "${step.conditionField} ${step.conditionOperator} ${step.conditionValue}" not met — stopped here`);
-        run.status = "partial";
-        run.log = log;
-        await run.save();
-        return;
-      }
-      log.push(`Condition "${step.conditionField} ${step.conditionOperator} ${step.conditionValue}" matched`);
-      continue;
-    }
-    if (step.actionType === "wait") {
-      const amount = Number(step.params?.amount) || 0;
-      const unit = step.params?.unit || "minutes";
-      const ms = amount * (WAIT_UNIT_MS[unit] || WAIT_UNIT_MS.minutes);
-      const runAt = new Date(Date.now() + ms);
-      await PendingStep.create({ workflow: workflow._id, run: run._id, stepIndex: i + 1, context: ctx, runAt });
-      log.push(`Waiting ${amount} ${unit} — resumes at ${runAt.toISOString()}`);
-      run.status = "waiting";
-      run.log = log;
-      await run.save();
-      return;
-    }
-    try {
-      await runAction(step, ctx, log, workflow._id);
-    } catch (err) {
-      log.push(`Action "${step.actionType}" failed: ${err.message}`);
-      run.status = "failed";
-      run.log = log;
-      await run.save();
-      return;
-    }
-  }
-  run.status = run.status === "waiting" ? "success" : (run.status || "success");
-  run.log = log;
-  await run.save();
-}
-
-/** Call this from anywhere a real event happens — fires every published workflow listening for that trigger. Never throws: a broken workflow must not break the request that triggered it. */
-// A workflow with a triggerScope only runs for events that match it — e.g.
-// a lesson_started workflow scoped to one specific lectureId won't fire for
-// every OTHER lesson too. No scope set (the default) means "run for every
-// event of this trigger", same as before this existed.
-function matchesTriggerScope(workflow, context) {
-  const scope = workflow.triggerScope || {};
-  if (scope.lectureId && String(context.lectureId || "") !== String(scope.lectureId)) return false;
-  if (scope.courseId && String(context.courseId || "") !== String(scope.courseId)) return false;
-  if (scope.formSlug && String(context.formSlug || "") !== String(scope.formSlug)) return false;
-  if (scope.category && String(context.category || "") !== String(scope.category)) return false;
-  return true;
-}
-
-async function runWorkflows(trigger, context) {
-  try {
-    const workflows = await Workflow.find({ trigger, published: true });
-    for (const workflow of workflows) {
-      if (!matchesTriggerScope(workflow, context)) continue;
-      const ctx = { ...context, __trigger: trigger };
-      const run = await WorkflowRun.create({ workflow: workflow._id, trigger, summary: context.__summary || "", status: "success", log: [] });
-      workflow.runCount = (workflow.runCount || 0) + 1;
-      workflow.lastRunAt = new Date();
-      await workflow.save();
-      await executeWorkflowSteps(workflow, run, ctx, 0);
-    }
-  } catch (err) {
-    console.error("[Automation] runWorkflows error:", err.message);
-  }
-}
-
-// Poller — resumes any workflow run paused on a wait step once it's due.
-// Dependency-free (no job queue needed): just checks every minute.
-setInterval(async () => {
-  try {
-    const due = await PendingStep.find({ runAt: { $lte: new Date() } }).limit(50);
-    for (const pending of due) {
-      const workflow = await Workflow.findById(pending.workflow);
-      const run = await WorkflowRun.findById(pending.run);
-      await PendingStep.findByIdAndDelete(pending._id);
-      if (!workflow || !run || !workflow.published) continue;
-      run.status = "success";
-      await executeWorkflowSteps(workflow, run, pending.context, pending.stepIndex);
-    }
-  } catch (err) {
-    console.error("[Automation] poller error:", err.message);
-  }
-}, 60 * 1000);
-
 /** Strip transient `id` keys added by the frontend before saving to MongoDB */
 function stripFrontendIds(arr) {
   if (!Array.isArray(arr)) return [];
-  return arr.map(({ id, ...rest }) => rest);   // remove `id`, keep `_id` if present
+  return arr.map(({ id, ...rest }) => rest);
 }
 
-/** Fix sections + lectures coming from the frontend (may have `id` instead of `_id`) */
 function sanitizeSections(body) {
   const data = { ...body };
   if (!Array.isArray(data.sections)) return data;
@@ -977,18 +504,12 @@ function sanitizeSections(body) {
   return data;
 }
 
-/** Sanitize the full course payload before create/update */
 function sanitizeCoursePayload(raw) {
   const data = sanitizeSections(raw);
-
-  // Strip frontend-only `id` from testimonials & gallery arrays
   if (data.imageTestimonials)   data.imageTestimonials   = stripFrontendIds(data.imageTestimonials);
   if (data.videoTestimonials)   data.videoTestimonials   = stripFrontendIds(data.videoTestimonials);
   if (data.projectGallery)      data.projectGallery      = stripFrontendIds(data.projectGallery);
-
-  // alsoBoughtCourseIds — keep as-is (array of ObjectId strings)
   if (!Array.isArray(data.alsoBoughtCourseIds)) data.alsoBoughtCourseIds = [];
-
   return data;
 }
 
@@ -1025,7 +546,7 @@ app.post("/api/auth/register", async (req, res) => {
       password,
       role:  role === "instructor" ? "instructor" : "student",
     });
-    runWorkflows("new_sign_up", {
+    automation.runWorkflows("new_sign_up", {
       studentId: user._id, studentName: user.name, studentEmail: user.email,
       __summary: user.name,
     });
@@ -1064,12 +585,6 @@ app.get("/api/auth/me", protect, (req, res) => {
 
 async function handleUpdateProfile(req, res) {
   try {
-    // FIX: "instructorDescriptionBlocks" was missing from this whitelist, so
-    // even with the schema fixed above, this route was throwing the field
-    // away before it ever reached User.findByIdAndUpdate — the request
-    // would still return 200 "saved successfully" while quietly discarding
-    // the one field that matters. This was the second half of the
-    // disappears-after-save bug (the User schema was the first half).
     const allowed = [
       "name", "bio", "title", "location", "website", "avatar", "twitter", "linkedin",
       "totalRatings", "totalReviews", "totalStudents", "totalCourses", "instructorDescription",
@@ -1119,7 +634,6 @@ app.patch("/api/auth/profile", protect, handleUpdateProfile);
 // USER ROUTES
 // ══════════════════════════════════════════════════════════════════════════════
 
-// Named route MUST come before /:id — InstructorDashboard calls PUT /api/users/profile
 app.put("/api/users/profile", protect, handleUpdateProfile);
 app.patch("/api/users/profile", protect, handleUpdateProfile);
 
@@ -1135,8 +649,6 @@ app.get("/api/users/:id", async (req, res) => {
 // COURSE ROUTES
 // ══════════════════════════════════════════════════════════════════════════════
 
-// Named sub-routes MUST come before /:id wildcard
-
 app.get("/api/courses/instructor/my-courses", protect, instructorOnly, async (req, res) => {
   try {
     res.json(await Course.find({ instructor: req.user._id }).sort("-createdAt"));
@@ -1149,9 +661,6 @@ app.get("/api/courses/instructor/mine", protect, instructorOnly, async (req, res
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// NEW: real enrolled-student list for one of an instructor's own courses —
-// backs the Instructor Portal's new "Students" tab. Only ever returns data
-// for a course this instructor actually owns.
 app.get("/api/instructor/courses/:id/students", protect, instructorOnly, async (req, res) => {
   try {
     const course = await Course.findOne({ _id: req.params.id, instructor: req.user._id }).select("title sections");
@@ -1184,11 +693,6 @@ app.get("/api/instructor/courses/:id/students", protect, instructorOnly, async (
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// NEW: real reviews for one of an instructor's own courses — backs the
-// Instructor Portal's new "Reviews" tab. Reads from the exact same Review
-// collection the course's public landing page shows and that the Super
-// Admin's Review Importer (CSV) writes into — so anything imported there,
-// or left by a real student, shows up here identically.
 app.get("/api/instructor/courses/:id/reviews", protect, instructorOnly, async (req, res) => {
   try {
     const course = await Course.findOne({ _id: req.params.id, instructor: req.user._id }).select("title");
@@ -1198,8 +702,6 @@ app.get("/api/instructor/courses/:id/reviews", protect, instructorOnly, async (r
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// NEW: real notifications for the Instructor Portal's bell icon — the most
-// recent verified enrollments across all of this instructor's courses.
 app.get("/api/instructor/notifications", protect, instructorOnly, async (req, res) => {
   try {
     const myCourses = await Course.find({ instructor: req.user._id }).select("_id title");
@@ -1236,14 +738,12 @@ app.get("/api/courses", async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// ── GET single course — returns ALL new fields to Shopify.jsx ─────────────────
 app.get("/api/courses/:id", async (req, res) => {
   try {
     const course = await Course.findById(req.params.id)
       .populate("instructor", "name avatar title bio location website twitter linkedin totalRatings totalReviews totalStudents totalCourses instructorDescription");
     if (!course) return res.status(404).json({ message: "Course not found" });
 
-    // Fetch & format reviews
     const dbReviews = await Review.find({ course: req.params.id })
       .populate("student", "name avatar")
       .sort("-createdAt")
@@ -1259,7 +759,6 @@ app.get("/api/courses/:id", async (req, res) => {
       date:       r.createdAt ? new Date(r.createdAt).toLocaleDateString() : "Recently",
     }));
 
-    // Add lectures_list to each section (Shopify.jsx reads `section.lectures_list`)
     const sectionsWithList = course.sections.map(sec => ({
       ...sec.toObject(),
       lectures_list: sec.lectures || [],
@@ -1272,7 +771,6 @@ app.get("/api/courses/:id", async (req, res) => {
       reviews_list,
       students:            obj.students || obj.studentsEnrolled || 0,
       reviews:             obj.reviews  || obj.totalRatings     || 0,
-      // ── NEW fields passed through to landing page ──────────────────────
       imageTestimonials:   obj.imageTestimonials   || [],
       videoTestimonials:   obj.videoTestimonials   || [],
       projectGallery:      obj.projectGallery      || [],
@@ -1357,13 +855,11 @@ app.get("/api/enrollments/my", protect, async (req, res) => {
 app.get("/api/enrollments/check/:courseId", protect, async (req, res) => {
   try {
     const enrollment = await Enrollment.findOne({ student: req.user._id, course: req.params.courseId });
-    // "enrolled" now means verified access, not just "submitted a payment" —
-    // consistent with the gating change below in POST /api/enrollments/:courseId.
     const hasAccess = Boolean(enrollment && enrollment.paymentStatus === "verified");
     res.json({
       enrolled: hasAccess,
       isEnrolled: hasAccess,
-      status: enrollment ? enrollment.paymentStatus : null, // 'pending' | 'verified' | 'rejected' | null
+      status: enrollment ? enrollment.paymentStatus : null,
     });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
@@ -1378,65 +874,36 @@ app.post("/api/enrollments/:courseId", protect, async (req, res) => {
     const existing = await Enrollment.findOne({ student: req.user._id, course: req.params.courseId });
     if (existing) return res.status(400).json({ message: "Already enrolled" });
 
-    // ── NEW: WhatsApp number, chosen payment method, and payment screenshot
-    // URL, from the Enrollment page (Step 1 + Step 2). All optional — enrollment
-    // still works without them so this route stays backward compatible with
-    // older callers.
-    const { whatsapp, paymentMethod, paymentScreenshotUrl } = req.body || {};
+    const { whatsapp: waNumber, paymentMethod, paymentScreenshotUrl } = req.body || {};
     const validMethods = ["bank", "jazzcash", "easypaisa", "card"];
 
     const enrollment = await Enrollment.create({
       student: req.user._id,
       course:  req.params.courseId,
-      whatsapp:      typeof whatsapp === "string" ? whatsapp.trim() : "",
+      whatsapp:      typeof waNumber === "string" ? waNumber.trim() : "",
       paymentMethod: validMethods.includes(paymentMethod) ? paymentMethod : "",
       paymentScreenshotUrl: typeof paymentScreenshotUrl === "string" ? paymentScreenshotUrl.trim() : "",
-      // Snapshot of what the student was shown at checkout. FIX: this used
-      // to multiply by 280 to convert an assumed-USD price to PKR — but
-      // course.price is already stored in PKR (same root cause as the
-      // frontend price bugs fixed earlier), so every enrollment's recorded
-      // amount was 280x too high, which is what the Super Admin
-      // verification queue was displaying.
       amount:   Math.round(course.price || 0),
       currency: "PKR",
     });
 
-    runWorkflows("enrollment_created", {
+    automation.upsertContactFromForm({ name: req.user.name, email: req.user.email, phone: enrollment.whatsapp, source: "Enrollment form" });
+    automation.runWorkflows("enrollment_created", {
       studentId: req.user._id, studentName: req.user.name, studentEmail: req.user.email,
       courseId: course._id, courseTitle: course.title, amount: enrollment.amount, category: course.category,
       whatsapp: enrollment.whatsapp,
       __summary: `${req.user.name} → ${course.title}`,
     });
-    // "Form Submitted", tagged formSlug: "form-1" — the 2-step course
-    // enrollment form is registered as "Form 1" in Super Admin → Forms, so
-    // a workflow can be scoped to react to this specific form instead of
-    // every form on the site.
-    // NEW: whatsapp added to the context — this is what makes the "Send
-    // WhatsApp Message" action's default "To" field ({{whatsapp}}) actually
-    // resolve to the real number this student entered on the enrollment
-    // form, instead of coming up blank.
-    runWorkflows("form_submitted", {
+    automation.runWorkflows("form_submitted", {
       name: req.user.name, email: req.user.email, message: `Enrolled in ${course.title}`, formSlug: "form-1",
       whatsapp: enrollment.whatsapp,
       __summary: `${req.user.name} → ${course.title}`,
     });
-    // "Category Started" — same event, filtered/labeled by the course's
-    // category, for workflows that only care about e.g. "Marketing" courses.
-    runWorkflows("category_started", {
+    automation.runWorkflows("category_started", {
       studentId: req.user._id, studentName: req.user.name, studentEmail: req.user.email,
       courseId: course._id, courseTitle: course.title, category: course.category, whatsapp: enrollment.whatsapp,
       __summary: `${req.user.name} started ${course.category || "a"} category`,
     });
-
-    // NOTE — behavior change: course access (the studentsEnrolled/students
-    // count bump and the Progress record) used to be granted right here,
-    // immediately on submission. It's now granted only once a super admin
-    // verifies the payment screenshot — see
-    // PATCH /api/admin/enrollments/:id/verify further down — so a student
-    // can no longer reach paid content before their payment has actually
-    // been checked. If you'd rather keep instant access and use the admin
-    // panel purely as an audit trail, move the two calls that used to be
-    // here (Course $inc + Progress upsert) back to this spot.
 
     res.status(201).json(enrollment);
   } catch (err) { res.status(500).json({ message: err.message }); }
@@ -1460,8 +927,6 @@ app.get("/api/admin/stats", protect, adminOnly, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// Alias — some frontend builds call this "/overview" instead of "/stats".
-// Same handler, so whichever one the deployed dashboard actually calls works.
 app.get("/api/admin/overview", protect, adminOnly, async (req, res) => {
   try {
     const [totalStudents, totalInstructors, totalCourses, pendingVerifications, allCourses] = await Promise.all([
@@ -1572,8 +1037,6 @@ app.get("/api/admin/enrollments", protect, adminOnly, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// NEW: Super Admin → Forms → Submitted Forms needs to delete a bad/test
-// enrollment submission — this didn't exist before.
 app.delete("/api/admin/enrollments/:id", protect, adminOnly, async (req, res) => {
   try {
     const enrollment = await Enrollment.findByIdAndDelete(req.params.id);
@@ -1582,8 +1045,6 @@ app.delete("/api/admin/enrollments/:id", protect, adminOnly, async (req, res) =>
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// CSV export of enrollments (Form 1 submissions) — optional ?ids=a,b,c to
-// export only a selection, otherwise everything matching ?courseId=.
 app.get("/api/admin/enrollments/export.csv", protect, adminOnly, async (req, res) => {
   try {
     const { courseId, ids } = req.query;
@@ -1611,9 +1072,6 @@ app.patch("/api/admin/enrollments/:id/verify", protect, adminOnly, async (req, r
     enrollment.verifiedAt = new Date();
     await enrollment.save();
 
-    // Grant course access now — this is the step that used to run
-    // immediately on submission (see the note above in
-    // POST /api/enrollments/:courseId).
     if (!alreadyVerified) {
       const course = await Course.findById(enrollment.course);
       if (course) {
@@ -1638,10 +1096,8 @@ app.patch("/api/admin/enrollments/:id/verify", protect, adminOnly, async (req, r
       courseId: populated.course?._id, courseTitle: populated.course?.title,
       __summary: `${populated.student?.name} → ${populated.course?.title}`,
     };
-    runWorkflows("payment_received", verifyCtx);
-    // "Offer Access Granted" — fires alongside payment_received on this
-    // platform, since access is granted at the moment payment is verified.
-    runWorkflows("offer_access_granted", verifyCtx);
+    automation.runWorkflows("payment_received", verifyCtx);
+    automation.runWorkflows("offer_access_granted", verifyCtx);
 
     res.json({
       _id: populated._id,
@@ -1672,7 +1128,7 @@ app.patch("/api/admin/enrollments/:id/reject", protect, adminOnly, async (req, r
 
     if (!enrollment) return res.status(404).json({ message: "Enrollment not found." });
 
-    runWorkflows("payment_rejected", {
+    automation.runWorkflows("payment_rejected", {
       studentId: enrollment.student?._id, studentName: enrollment.student?.name, studentEmail: enrollment.student?.email,
       courseId: enrollment.course?._id, courseTitle: enrollment.course?.title, reason: enrollment.rejectionReason,
       __summary: `${enrollment.student?.name} → ${enrollment.course?.title}`,
@@ -1713,16 +1169,12 @@ app.patch("/api/admin/users/:id/status", protect, adminOnly, async (req, res) =>
 // PROGRESS ROUTES
 // ══════════════════════════════════════════════════════════════════════════════
 
-// NEW: "Lesson Started" trigger — fires the first time a student opens a
-// lecture (not necessarily finishes it), called from the Student Portal's
-// video player when a lecture is opened. Doesn't touch Progress/completion
-// at all — purely fires the trigger.
 app.post("/api/progress/lesson-started", protect, async (req, res) => {
   try {
     const { courseId, lectureId, lectureTitle } = req.body || {};
     if (!courseId || !lectureId) return res.status(400).json({ message: "courseId and lectureId are required" });
     const course = await Course.findById(courseId).select("title category");
-    runWorkflows("lesson_started", {
+    automation.runWorkflows("lesson_started", {
       studentId: req.user._id, studentName: req.user.name, studentEmail: req.user.email,
       courseId, courseTitle: course?.title, lectureId: String(lectureId), lectureTitle: lectureTitle || "",
       category: course?.category,
@@ -1753,12 +1205,9 @@ app.post("/api/progress/mark", protect, async (req, res) => {
         studentId: req.user._id, studentName: req.user.name, studentEmail: req.user.email,
         courseId, courseTitle: course?.title, lectureId: lid, category: course?.category,
       };
-      runWorkflows("lesson_completed", { ...baseCtx, __summary: `${req.user.name} → ${course?.title}` });
+      automation.runWorkflows("lesson_completed", { ...baseCtx, __summary: `${req.user.name} → ${course?.title}` });
       if (totalLectures > 0 && progress.completedLectures.length >= totalLectures) {
-        // "Category Completed" — same event as course completion, labeled
-        // by the course's category so a workflow can target e.g. everyone
-        // who finishes any "E-Commerce" course.
-        runWorkflows("category_completed", { ...baseCtx, __summary: `${req.user.name} completed ${course?.title}` });
+        automation.runWorkflows("category_completed", { ...baseCtx, __summary: `${req.user.name} completed ${course?.title}` });
       }
     }
 
@@ -1776,9 +1225,6 @@ app.get("/api/progress/my", protect, async (req, res) => {
 // NOTES — Student Portal, per-lecture timestamped notes
 // ══════════════════════════════════════════════════════════════════════════════
 
-// Aggregate — every note this student has across every course, for the
-// sidebar-level "Notes" tab (as opposed to /api/notes/:courseId, used
-// inside one course's player).
 app.get("/api/notes/my", protect, async (req, res) => {
   try {
     const notes = await Note.find({ student: req.user._id }).sort("-createdAt");
@@ -1820,8 +1266,6 @@ app.delete("/api/notes/:id", protect, async (req, res) => {
 // Q&A — Student Portal, per-course questions with embedded answers
 // ══════════════════════════════════════════════════════════════════════════════
 
-// Aggregate — Q&A across every course this student is verified-enrolled in,
-// for the sidebar-level "Q&A" tab.
 app.get("/api/questions/my-courses", protect, async (req, res) => {
   try {
     const enrollments = await Enrollment.find({ student: req.user._id, paymentStatus: "verified" }).select("course");
@@ -1959,10 +1403,9 @@ app.post("/api/courses/:courseId/reviews", optionalProtect, async (req, res) => 
 // UPLOAD ROUTES — CLOUDINARY (stream, no disk)
 // ══════════════════════════════════════════════════════════════════════════════
 
-// ── Multer instances (memory storage) ────────────────────────────────────────
 const imageMulter = multer({
   storage: multer.memoryStorage(),
-  limits:  { fileSize: 10 * 1024 * 1024 },          // 10 MB
+  limits:  { fileSize: 10 * 1024 * 1024 },
   fileFilter: (_, file, cb) => {
     const ok = ["image/jpeg","image/jpg","image/png","image/webp","image/gif"];
     ok.includes(file.mimetype) ? cb(null, true) : cb(new Error("Only image files are allowed (JPG, PNG, WebP, GIF)"));
@@ -1971,41 +1414,29 @@ const imageMulter = multer({
 
 const videoMulter = multer({
   storage: multer.memoryStorage(),
-  limits:  { fileSize: 500 * 1024 * 1024 },          // 500 MB
+  limits:  { fileSize: 500 * 1024 * 1024 },
   fileFilter: (_, file, cb) => {
     const ok = ["video/mp4","video/webm","video/ogg","video/quicktime","video/x-msvideo"];
     ok.includes(file.mimetype) ? cb(null, true) : cb(new Error("Only video files are allowed (MP4, WebM, MOV, AVI)"));
   },
 });
 
-// Used by the Review Importer (Super Admin) — CSV only (see the NOTE up top
-// on why Excel/.xlsx isn't parsed directly anymore: Excel opens/saves .csv
-// files fine, so this loses nothing practical).
 const spreadsheetMulter = multer({
   storage: multer.memoryStorage(),
-  limits:  { fileSize: 5 * 1024 * 1024 },            // 5 MB — plenty for a review sheet
+  limits:  { fileSize: 5 * 1024 * 1024 },
   fileFilter: (_, file, cb) => {
     const ok = ["text/csv", "application/csv"];
-    // Some browsers send CSV as text/plain or octet-stream — fall back to
-    // checking the file extension so a real CSV isn't rejected on mimetype
-    // alone.
     const okExt = /\.csv$/i.test(file.originalname || "");
     (ok.includes(file.mimetype) || okExt) ? cb(null, true) : cb(new Error("Only CSV files are allowed"));
   },
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// POST /api/upload/image
-// Used by: course thumbnail, image testimonials, project gallery, profile avatar
-// Access:  any authenticated user (instructors AND students — avatars need it)
-// ─────────────────────────────────────────────────────────────────────────────
 app.post("/api/upload/image", protect, requireCloudinary, imageMulter.single("image"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ message: "No file uploaded" });
 
     const isAvatar = req.body.type === "avatar" || req.body.uploadType === "avatar";
 
-    // Choose Cloudinary folder based on upload type
     const folder = isAvatar
       ? "learnify/instructor-avatars"
       : req.user.role === "instructor"
@@ -2029,7 +1460,6 @@ app.post("/api/upload/image", protect, requireCloudinary, imageMulter.single("im
           ],
     });
 
-    // If a courseId was supplied with the thumbnail upload, persist it immediately
     if (req.body.courseId && mongoose.Types.ObjectId.isValid(req.body.courseId)) {
       await Course.findOneAndUpdate(
         { _id: req.body.courseId, instructor: req.user._id },
@@ -2053,22 +1483,10 @@ app.post("/api/upload/image", protect, requireCloudinary, imageMulter.single("im
   }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// POST /api/upload/payment-screenshot
-// Used by: EnrolledPage.jsx (Step 2) — the visitor attaches a screenshot of
-// their bank/JazzCash/Easypaisa/etc. payment before enrollment is confirmed.
-// Access:  PUBLIC — deliberately no `protect` here. A guest submits this
-// screenshot BEFORE they have an account (account creation happens right
-// after, via /auth/register), so there is no auth token to check yet.
-// ─────────────────────────────────────────────────────────────────────────────
 app.post("/api/upload/payment-screenshot", requireCloudinary, imageMulter.single("screenshot"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ message: "No screenshot uploaded" });
 
-    // ── Fraud check: has this exact screenshot been submitted before? ──────
-    // Hash the raw file bytes and look it up before uploading anywhere. This
-    // catches the same image being reused for a second enrollment, whether
-    // it's the same person trying again or someone else forwarding it.
     const screenshotHash = crypto.createHash("sha256").update(req.file.buffer).digest("hex");
     const alreadyUsed = await PaymentScreenshotHash.findOne({ hash: screenshotHash });
     if (alreadyUsed) {
@@ -2086,12 +1504,9 @@ app.post("/api/upload/payment-screenshot", requireCloudinary, imageMulter.single
         { quality: "auto:good" },
         { fetch_format: "auto" },
       ],
-      // Tag with the course so screenshots are easy to find/audit per course
       context: req.body.courseId ? { courseId: String(req.body.courseId) } : undefined,
     });
 
-    // Record the hash now that the screenshot has been accepted, so the
-    // very next duplicate submission (of this same file) gets caught above.
     try {
       await PaymentScreenshotHash.create({
         hash:     screenshotHash,
@@ -2099,9 +1514,6 @@ app.post("/api/upload/payment-screenshot", requireCloudinary, imageMulter.single
         url:      result.secure_url,
       });
     } catch (hashSaveErr) {
-      // A duplicate-key error here means two identical uploads raced each
-      // other — extremely unlikely, but if it happens the upload itself
-      // still succeeded, so we just log it rather than fail the request.
       console.warn("⚠️  Could not record screenshot hash:", hashSaveErr.message);
     }
 
@@ -2120,11 +1532,6 @@ app.post("/api/upload/payment-screenshot", requireCloudinary, imageMulter.single
   }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// POST /api/upload/video
-// Used by: video testimonials upload in InstructorDashboard
-// Access:  instructors only
-// ─────────────────────────────────────────────────────────────────────────────
 app.post("/api/upload/video", protect, instructorOnly, requireCloudinary, videoMulter.single("video"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ message: "No video file uploaded" });
@@ -2132,10 +1539,9 @@ app.post("/api/upload/video", protect, instructorOnly, requireCloudinary, videoM
     const result = await streamToCloudinary(req.file.buffer, {
       folder:        "learnify/video-testimonials",
       resource_type: "video",
-      // async transcoding — response is instant, Cloudinary processes in background
       eager: [
-        { streaming_profile: "hd", format: "m3u8" },              // HLS
-        { width: 1280, height: 720, crop: "limit", format: "mp4" }, // 720p MP4
+        { streaming_profile: "hd", format: "m3u8" },
+        { width: 1280, height: 720, crop: "limit", format: "mp4" },
       ],
       eager_async: true,
     });
@@ -2146,7 +1552,7 @@ app.post("/api/upload/video", protect, instructorOnly, requireCloudinary, videoM
       secure_url: result.secure_url,
       videoUrl:   result.secure_url,
       publicId:   result.public_id,
-      duration:   result.duration,  // seconds (Cloudinary auto-detects)
+      duration:   result.duration,
       format:     result.format,
       bytes:      result.bytes,
     });
@@ -2156,9 +1562,6 @@ app.post("/api/upload/video", protect, instructorOnly, requireCloudinary, videoM
   }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// DELETE /api/upload/image/:publicId  &  DELETE /api/upload/video/:publicId
-// ─────────────────────────────────────────────────────────────────────────────
 app.delete("/api/upload/image/:publicId", protect, instructorOnly, async (req, res) => {
   try {
     const result = await cloudinary.uploader.destroy(decodeURIComponent(req.params.publicId), { resource_type: "image" });
@@ -2208,22 +1611,18 @@ const ThemePresetSchema = new mongoose.Schema({
 const ThemePreset = mongoose.model("ThemePreset", ThemePresetSchema);
 
 const themeEditorOnly = (req, res, next) => {
-  // Super Admin always has access, regardless of the env-var email below —
-  // this is what SuperAdminDashboard.jsx's Theme Editor tab relies on.
   if (req.user?.role === "admin") return next();
   const adminEmail = (process.env.THEME_EDITOR_ADMIN_EMAIL || "").toLowerCase().trim();
   if (adminEmail && req.user && req.user.email.toLowerCase().trim() === adminEmail) return next();
   return res.status(403).json({ message: "Access denied — theme editor permission required" });
 };
 
-// Check if current user has theme editor access
 app.get("/api/theme/access", protect, (req, res) => {
   const adminEmail = (process.env.THEME_EDITOR_ADMIN_EMAIL || "").toLowerCase().trim();
   const hasAccess = req.user.role === "admin" || (Boolean(adminEmail) && req.user.email.toLowerCase().trim() === adminEmail);
   res.json({ hasAccess });
 });
 
-// Get published theme (public — used by the course page)
 app.get("/api/theme/published", async (req, res) => {
   try {
     const theme = await SiteTheme.findOne({ status: "published" }).sort("-publishedAt");
@@ -2231,7 +1630,6 @@ app.get("/api/theme/published", async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// Get draft theme
 app.get("/api/theme/draft", protect, themeEditorOnly, async (req, res) => {
   try {
     let draft = await SiteTheme.findOne({ status: "draft", createdBy: req.user._id }).sort("-updatedAt");
@@ -2248,7 +1646,6 @@ app.get("/api/theme/draft", protect, themeEditorOnly, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// Save draft
 app.put("/api/theme/draft", protect, themeEditorOnly, async (req, res) => {
   try {
     const { settings } = req.body;
@@ -2265,14 +1662,11 @@ app.put("/api/theme/draft", protect, themeEditorOnly, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// Publish theme
 app.post("/api/theme/publish", protect, themeEditorOnly, async (req, res) => {
   try {
     const { settings } = req.body;
     if (!settings) return res.status(400).json({ message: "Settings are required" });
-    // Archive previous published
     await SiteTheme.updateMany({ status: "published" }, { status: "draft" });
-    // Create published version
     const nextVersion = (await SiteTheme.countDocuments()) + 1;
     const theme = await SiteTheme.create({
       status: "published",
@@ -2281,7 +1675,6 @@ app.post("/api/theme/publish", protect, themeEditorOnly, async (req, res) => {
       version: nextVersion,
       publishedAt: new Date(),
     });
-    // Save to history
     await SiteThemeHistory.create({
       themeId: theme._id,
       version: nextVersion,
@@ -2289,13 +1682,11 @@ app.post("/api/theme/publish", protect, themeEditorOnly, async (req, res) => {
       changedBy: req.user._id,
       status: "published",
     });
-    // Clean up user's drafts
     await SiteTheme.deleteMany({ status: "draft", createdBy: req.user._id });
     res.json(theme);
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// Reset theme (delete all drafts for this user)
 app.post("/api/theme/reset", protect, themeEditorOnly, async (req, res) => {
   try {
     await SiteTheme.deleteMany({ status: "draft", createdBy: req.user._id });
@@ -2303,7 +1694,6 @@ app.post("/api/theme/reset", protect, themeEditorOnly, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// Theme history
 app.get("/api/theme/history", protect, themeEditorOnly, async (req, res) => {
   try {
     const history = await SiteThemeHistory.find()
@@ -2314,7 +1704,6 @@ app.get("/api/theme/history", protect, themeEditorOnly, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// Restore from history
 app.post("/api/theme/restore/:historyId", protect, themeEditorOnly, async (req, res) => {
   try {
     const entry = await SiteThemeHistory.findById(req.params.historyId);
@@ -2331,7 +1720,6 @@ app.post("/api/theme/restore/:historyId", protect, themeEditorOnly, async (req, 
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// Theme presets
 app.get("/api/theme/presets", protect, themeEditorOnly, async (req, res) => {
   try { res.json(await ThemePreset.find().sort("-updatedAt")); }
   catch (err) { res.status(500).json({ message: err.message }); }
@@ -2361,7 +1749,6 @@ app.delete("/api/theme/presets/:id", protect, themeEditorOnly, async (req, res) 
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// Export theme
 app.get("/api/theme/export", protect, themeEditorOnly, async (req, res) => {
   try {
     const theme = await SiteTheme.findOne({ status: "published" }).sort("-publishedAt");
@@ -2369,7 +1756,6 @@ app.get("/api/theme/export", protect, themeEditorOnly, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// Import theme
 app.post("/api/theme/import", protect, themeEditorOnly, async (req, res) => {
   try {
     const { settings } = req.body;
@@ -2390,8 +1776,6 @@ app.post("/api/theme/import", protect, themeEditorOnly, async (req, res) => {
 // SITE SETTINGS (LOGO) · CONTACT US · NEWSLETTER
 // ══════════════════════════════════════════════════════════════════════════════
 
-// Public — read the current site settings (logo etc). Used by the footer and
-// anywhere else the logo needs to render.
 app.get("/api/settings", async (req, res) => {
   try {
     const settings = await getSiteSettings();
@@ -2406,12 +1790,6 @@ app.get("/api/settings", async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// Super Admin — upload/replace a site logo. Goes to the same Cloudinary
-// account as every other image upload in this file.
-// The form sends a "target" field alongside the image: "header", "footer",
-// or one of the four payment-method logos ("payment_ubl", "payment_allied",
-// "payment_jazzcash", "payment_easypaisa"). Anything unrecognized falls back
-// to "header" so existing callers keep working unchanged.
 const LOGO_TARGET_FIELDS = {
   header:            "logoUrl",
   footer:             "footerLogoUrl",
@@ -2447,7 +1825,6 @@ app.post("/api/admin/settings/logo", protect, adminOnly, requireCloudinary, imag
   }
 });
 
-// Public — Contact Us page submission.
 app.post("/api/contact", async (req, res) => {
   try {
     const { name, email, message } = req.body || {};
@@ -2456,42 +1833,40 @@ app.post("/api/contact", async (req, res) => {
     const submission = await ContactSubmission.create({
       name: name.trim(), email: email.trim().toLowerCase(), message: message.trim(),
     });
-    runWorkflows("form_submitted", { name: submission.name, email: submission.email, message: submission.message, __summary: submission.name });
+    automation.upsertContactFromForm({ name: submission.name, email: submission.email, source: "Contact Us form" });
+    automation.runWorkflows("form_submitted", { name: submission.name, email: submission.email, message: submission.message, __summary: submission.name });
     res.status(201).json(submission);
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// Super Admin — list Contact Us submissions.
 app.get("/api/admin/contact-submissions", protect, adminOnly, async (req, res) => {
   try {
     res.json(await ContactSubmission.find({}).sort("-createdAt"));
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// Public — Services page's Gold/Premium package inquiry form.
 app.post("/api/package-inquiries", async (req, res) => {
   try {
-    const { name, whatsapp, email, package: pkg } = req.body || {};
-    if (!name?.trim() || !whatsapp?.trim() || !email?.trim())
+    const { name, whatsapp: waNumber, email, package: pkg } = req.body || {};
+    if (!name?.trim() || !waNumber?.trim() || !email?.trim())
       return res.status(400).json({ message: "Name, WhatsApp number, and email are required." });
     if (!["gold", "premium"].includes(pkg))
       return res.status(400).json({ message: "Please choose a package." });
     const inquiry = await PackageInquiry.create({
-      name: name.trim(), whatsapp: whatsapp.trim(), email: email.trim().toLowerCase(), package: pkg,
+      name: name.trim(), whatsapp: waNumber.trim(), email: email.trim().toLowerCase(), package: pkg,
     });
-    runWorkflows("form_submitted", { name: inquiry.name, email: inquiry.email, message: `${pkg === "gold" ? "Gold" : "Premium"} Package inquiry`, formSlug: "form-2", whatsapp: inquiry.whatsapp, __summary: `${inquiry.name} — ${pkg} package` });
+    automation.upsertContactFromForm({ name: inquiry.name, email: inquiry.email, phone: inquiry.whatsapp, source: "Package Inquiry form" });
+    automation.runWorkflows("form_submitted", { name: inquiry.name, email: inquiry.email, message: `${pkg === "gold" ? "Gold" : "Premium"} Package inquiry`, formSlug: "form-2", whatsapp: inquiry.whatsapp, __summary: `${inquiry.name} — ${pkg} package` });
     res.status(201).json(inquiry);
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// Super Admin — list package inquiries.
 app.get("/api/admin/package-inquiries", protect, adminOnly, async (req, res) => {
   try {
     res.json(await PackageInquiry.find({}).sort("-createdAt"));
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// NEW: delete a package inquiry (Form 2 submission).
 app.delete("/api/admin/package-inquiries/:id", protect, adminOnly, async (req, res) => {
   try {
     const inquiry = await PackageInquiry.findByIdAndDelete(req.params.id);
@@ -2500,8 +1875,6 @@ app.delete("/api/admin/package-inquiries/:id", protect, adminOnly, async (req, r
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// CSV export of package inquiries (Form 2 submissions) — optional
-// ?ids=a,b,c to export only a selection.
 app.get("/api/admin/package-inquiries/export.csv", protect, adminOnly, async (req, res) => {
   try {
     const { ids } = req.query;
@@ -2544,8 +1917,6 @@ app.post("/api/admin/forms", protect, adminOnly, async (req, res) => {
 app.put("/api/admin/forms/:id", protect, adminOnly, async (req, res) => {
   try {
     const { name, description, fields } = req.body || {};
-    // slug is intentionally not editable here — it's what live pages/
-    // triggers already reference, so changing it would silently break them.
     const update = {};
     if (name !== undefined) update.name = name.trim();
     if (description !== undefined) update.description = description;
@@ -2597,7 +1968,6 @@ app.delete("/api/admin/tags/:id", protect, adminOnly, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// Super Admin — mark a submission read.
 app.patch("/api/admin/contact-submissions/:id/read", protect, adminOnly, async (req, res) => {
   try {
     const sub = await ContactSubmission.findByIdAndUpdate(req.params.id, { status: "read" }, { new: true });
@@ -2606,8 +1976,6 @@ app.patch("/api/admin/contact-submissions/:id/read", protect, adminOnly, async (
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// Public — footer newsletter signup. Upsert so re-submitting the same email
-// doesn't throw a duplicate-key error, it just no-ops.
 app.post("/api/newsletter", async (req, res) => {
   try {
     const { email } = req.body || {};
@@ -2618,12 +1986,11 @@ app.post("/api/newsletter", async (req, res) => {
       { email: clean },
       { upsert: true, new: true, setDefaultsOnInsert: true }
     );
-    runWorkflows("newsletter_subscribed", { email: clean, __summary: clean });
+    automation.runWorkflows("newsletter_subscribed", { email: clean, __summary: clean });
     res.status(201).json(sub);
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// Super Admin — list newsletter subscribers.
 app.get("/api/admin/newsletter-subscribers", protect, adminOnly, async (req, res) => {
   try {
     res.json(await NewsletterSubscriber.find({}).sort("-createdAt"));
@@ -2633,14 +2000,7 @@ app.get("/api/admin/newsletter-subscribers", protect, adminOnly, async (req, res
 // ══════════════════════════════════════════════════════════════════════════════
 // REVIEW IMPORTER — Super Admin → Review Importer
 // ══════════════════════════════════════════════════════════════════════════════
-// Bulk-adds reviews to a course's real review list (the same Review
-// collection/format every review on that course's landing page already
-// comes from) via a CSV upload — columns: Student Name, Date, Stars, Review.
 
-// Parses CSV text into an array of row objects keyed by header, handling
-// quoted fields (so a review containing a comma or a quote doesn't break
-// the columns) — a small hand-written parser instead of a library, so this
-// route has zero npm dependencies.
 function parseCsv(text) {
   const rows = [];
   let row = [], field = "", inQuotes = false;
@@ -2659,7 +2019,7 @@ function parseCsv(text) {
     } else if (ch === "\n") {
       pushRow();
     } else if (ch === "\r") {
-      // skip — \r\n line endings are handled by the following \n
+      // skip
     } else {
       field += ch;
     }
@@ -2679,9 +2039,6 @@ function parseCsv(text) {
 const REVIEW_IMPORT_HEADERS = ["Student Name", "Date", "Stars", "Review"];
 const REVIEW_IMPORT_SAMPLE_ROW = ["Ayesha Siddiqui", "2026-03-15", "5", "Excellent course, learned so much about running paid ads properly."];
 
-// Sample template — downloadable from the Review Importer page so the
-// admin knows exactly which columns/format to fill in. Excel opens and
-// saves .csv files natively, so this works as the "Excel sample" too.
 app.get("/api/admin/reviews-template.csv", protect, adminOnly, (req, res) => {
   const rows = [REVIEW_IMPORT_HEADERS, REVIEW_IMPORT_SAMPLE_ROW];
   const csv = rows.map((r) => r.map((v) => `"${String(v).replace(/"/g, '""')}"`).join(",")).join("\n");
@@ -2690,8 +2047,6 @@ app.get("/api/admin/reviews-template.csv", protect, adminOnly, (req, res) => {
   res.send(csv);
 });
 
-// Existing reviews for one course — shown on the Review Importer page so an
-// admin can see what's already there (and remove a bad import).
 app.get("/api/admin/courses/:id/reviews", protect, adminOnly, async (req, res) => {
   try {
     res.json(await Review.find({ course: req.params.id }).sort("-createdAt"));
@@ -2719,9 +2074,6 @@ app.post("/api/admin/courses/:id/reviews/import", protect, adminOnly, spreadshee
       return res.status(400).json({ message: "Couldn't read that file — make sure it's a valid CSV file." });
     }
 
-    // Column names are matched loosely (case/space-insensitive) so "Student
-    // Name", "student_name", "Name" etc. all work, rather than forcing an
-    // exact header match.
     const norm = (s) => String(s || "").toLowerCase().replace(/[^a-z]/g, "");
     const getCell = (row, ...aliases) => {
       const keys = Object.keys(row);
@@ -2735,7 +2087,7 @@ app.post("/api/admin/courses/:id/reviews/import", protect, adminOnly, spreadshee
     const toCreate = [];
     const errors = [];
     rows.forEach((row, i) => {
-      const lineNo = i + 2; // +1 for header row, +1 for 1-indexing
+      const lineNo = i + 2;
       const name = String(getCell(row, "Student Name", "Name", "Author")).trim();
       const dateRaw = getCell(row, "Date");
       const starsRaw = getCell(row, "Stars", "Rating", "Star");
@@ -2762,239 +2114,6 @@ app.post("/api/admin/courses/:id/reviews/import", protect, adminOnly, spreadshee
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-// AUTOMATION WORKFLOW ROUTES — Super Admin → Automation Workflow
-// ══════════════════════════════════════════════════════════════════════════════
-
-// List available triggers/action types + whether email/WhatsApp are
-// configured, so the builder UI can render its dropdowns and warn if a
-// channel isn't set up yet.
-app.get("/api/admin/workflows/meta", protect, adminOnly, async (req, res) => {
-  res.json({
-    triggers: WORKFLOW_TRIGGERS,
-    actionTypes: [
-      "create_contact", "add_contact_tag", "remove_contact_tag",
-      "assign_user", "remove_assigned_user", "add_note", "internal_notification",
-      "notify_student", "wait", "send_whatsapp",
-      "add_to_pipeline", "update_opportunity_stage", "webhook",
-    ],
-    whatsappConfigured: await whatsapp.whatsappConfigured(),
-    pipelineStages: PIPELINE_STAGES_DEFAULT,
-  });
-});
-
-app.get("/api/admin/workflows", protect, adminOnly, async (req, res) => {
-  try {
-    res.json(await Workflow.find({}).sort("-createdAt"));
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// Single workflow — the full-page editor loads this directly by ID.
-app.get("/api/admin/workflows/:id", protect, adminOnly, async (req, res) => {
-  try {
-    const workflow = await Workflow.findById(req.params.id);
-    if (!workflow) return res.status(404).json({ message: "Workflow not found" });
-    res.json(workflow);
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-app.post("/api/admin/workflows", protect, adminOnly, async (req, res) => {
-  try {
-    const { name, trigger, steps, published, triggerScope } = req.body || {};
-    if (!name?.trim()) return res.status(400).json({ message: "Name is required" });
-    if (!WORKFLOW_TRIGGERS.includes(trigger)) return res.status(400).json({ message: "Invalid trigger" });
-    const workflow = await Workflow.create({
-      name: name.trim(), trigger, steps: Array.isArray(steps) ? steps : [], published: published === true,
-      triggerScope: triggerScope && typeof triggerScope === "object" ? triggerScope : {},
-    });
-    res.status(201).json(workflow);
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-app.put("/api/admin/workflows/:id", protect, adminOnly, async (req, res) => {
-  try {
-    const { name, trigger, steps, published, triggerScope } = req.body || {};
-    const update = {};
-    if (name !== undefined)    update.name = name.trim();
-    if (trigger !== undefined) {
-      if (!WORKFLOW_TRIGGERS.includes(trigger)) return res.status(400).json({ message: "Invalid trigger" });
-      update.trigger = trigger;
-    }
-    if (steps !== undefined)     update.steps = steps;
-    if (published !== undefined) update.published = published;
-    if (triggerScope !== undefined) update.triggerScope = triggerScope && typeof triggerScope === "object" ? triggerScope : {};
-    const workflow = await Workflow.findByIdAndUpdate(req.params.id, update, { new: true });
-    if (!workflow) return res.status(404).json({ message: "Workflow not found" });
-    res.json(workflow);
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-app.delete("/api/admin/workflows/:id", protect, adminOnly, async (req, res) => {
-  try {
-    const workflow = await Workflow.findByIdAndDelete(req.params.id);
-    if (!workflow) return res.status(404).json({ message: "Workflow not found" });
-    await PendingStep.deleteMany({ workflow: workflow._id });
-    res.json({ deleted: true });
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// Run history for one workflow — proof it's actually executing, with a
-// step-by-step log for each run.
-app.get("/api/admin/workflows/:id/runs", protect, adminOnly, async (req, res) => {
-  try {
-    res.json(await WorkflowRun.find({ workflow: req.params.id }).sort("-createdAt").limit(50));
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// Manual "Test Run" — fires the workflow immediately with sample/blank
-// context, so an admin can confirm it runs without waiting for a real event.
-app.post("/api/admin/workflows/:id/test", protect, adminOnly, async (req, res) => {
-  try {
-    const workflow = await Workflow.findById(req.params.id);
-    if (!workflow) return res.status(404).json({ message: "Workflow not found" });
-    const testCtx = {
-      studentId: req.user._id, studentName: req.user.name, studentEmail: req.user.email,
-      courseId: "", courseTitle: "Sample Course", amount: 0, lectureId: "", reason: "Sample reason",
-      name: req.user.name, email: req.user.email, message: "Sample message", category: "Sample Category",
-      whatsapp: req.user.phone || "",
-      __trigger: workflow.trigger, __summary: `Test run by ${req.user.name}`,
-    };
-    const run = await WorkflowRun.create({ workflow: workflow._id, trigger: workflow.trigger, summary: `Test run by ${req.user.name}`, status: "success", log: [] });
-    workflow.runCount = (workflow.runCount || 0) + 1;
-    workflow.lastRunAt = new Date();
-    await workflow.save();
-    await executeWorkflowSteps(workflow, run, testCtx, 0);
-    res.json(await WorkflowRun.findById(run._id));
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// ══════════════════════════════════════════════════════════════════════════════
-// CRM: CONTACTS + PIPELINE (OPPORTUNITIES) — Super Admin → Pipeline
-// ══════════════════════════════════════════════════════════════════════════════
-
-app.get("/api/admin/contacts", protect, adminOnly, async (req, res) => {
-  try {
-    res.json(await Contact.find({}).populate("assignedTo", "name email").sort("-createdAt"));
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// CSV export of contacts.
-app.get("/api/admin/contacts/export.csv", protect, adminOnly, async (req, res) => {
-  try {
-    const contacts = await Contact.find({}).sort("-createdAt");
-    const rows = [["Name", "Email", "Phone", "Tags", "Source", "Created"]];
-    for (const c of contacts) rows.push([c.name, c.email, c.phone, (c.tags || []).join("; "), c.source, c.createdAt.toISOString()]);
-    const csv = rows.map((r) => r.map((v) => `"${String(v ?? "").replace(/"/g, '""')}"`).join(",")).join("\n");
-    res.setHeader("Content-Type", "text/csv");
-    res.setHeader("Content-Disposition", "attachment; filename=contacts.csv");
-    res.send(csv);
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-app.get("/api/admin/opportunities", protect, adminOnly, async (req, res) => {
-  try {
-    res.json(await Opportunity.find({}).populate("contact").sort("-createdAt"));
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// CSV export of opportunities (the Pipeline board).
-app.get("/api/admin/opportunities/export.csv", protect, adminOnly, async (req, res) => {
-  try {
-    const opps = await Opportunity.find({}).populate("contact").sort("-createdAt");
-    const rows = [["Contact", "Email", "Title", "Value", "Stage", "Status", "Created"]];
-    for (const o of opps) rows.push([o.contact?.name, o.contact?.email, o.title, o.value, o.stage, o.status, o.createdAt.toISOString()]);
-    const csv = rows.map((r) => r.map((v) => `"${String(v ?? "").replace(/"/g, '""')}"`).join(",")).join("\n");
-    res.setHeader("Content-Type", "text/csv");
-    res.setHeader("Content-Disposition", "attachment; filename=opportunities.csv");
-    res.send(csv);
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// Manually move a card between pipeline stages — also fires
-// opportunity_status_changed, same as a workflow doing it, so everything
-// stays interlinked either way.
-app.patch("/api/admin/opportunities/:id/stage", protect, adminOnly, async (req, res) => {
-  try {
-    const { stage } = req.body || {};
-    if (!stage) return res.status(400).json({ message: "stage is required" });
-    const opp = await Opportunity.findByIdAndUpdate(req.params.id, { stage }, { new: true }).populate("contact");
-    if (!opp) return res.status(404).json({ message: "Opportunity not found" });
-    runWorkflows("opportunity_status_changed", {
-      studentEmail: opp.contact?.email, studentName: opp.contact?.name, stage,
-      opportunityId: opp._id, __summary: `${opp.contact?.email} → ${stage}`,
-    });
-    res.json(opp);
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-app.patch("/api/admin/contacts/:id/assign", protect, adminOnly, async (req, res) => {
-  try {
-    const { userId } = req.body || {};
-    const contact = await Contact.findByIdAndUpdate(req.params.id, { assignedTo: userId || null }, { new: true }).populate("assignedTo", "name email");
-    if (!contact) return res.status(404).json({ message: "Contact not found" });
-    res.json(contact);
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-app.post("/api/admin/contacts/:id/notes", protect, adminOnly, async (req, res) => {
-  try {
-    const { text } = req.body || {};
-    if (!text?.trim()) return res.status(400).json({ message: "Note text is required" });
-    const contact = await Contact.findByIdAndUpdate(req.params.id, { $push: { notes: { text: text.trim() } } }, { new: true });
-    if (!contact) return res.status(404).json({ message: "Contact not found" });
-    res.json(contact);
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// People an admin can assign a contact to (the "Assign User" action) —
-// admins and instructors.
-app.get("/api/admin/assignable-users", protect, adminOnly, async (req, res) => {
-  try {
-    res.json(await User.find({ role: { $in: ["admin", "instructor"] } }).select("name email role"));
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// ══════════════════════════════════════════════════════════════════════════════
-// LINK TRACKING — "Link Clicked" trigger
-// ══════════════════════════════════════════════════════════════════════════════
-// A message body's [[Label|https://example.com]] gets rewritten into one of
-// these at send time (see rewriteTrackedLinks above). Visiting it logs the
-// click, fires link_clicked, then redirects to the real destination.
-app.get("/l/:code", async (req, res) => {
-  try {
-    const link = await TrackedLink.findOneAndUpdate({ code: req.params.code }, { $inc: { clicks: 1 } }, { new: true });
-    if (!link) return res.status(404).send("Link not found");
-    runWorkflows("link_clicked", {
-      studentEmail: link.contactEmail, url: link.url,
-      __summary: `Clicked: ${link.url}`,
-    });
-    res.redirect(link.url);
-  } catch (err) { res.status(500).send("Something went wrong"); }
-});
-
-// ══════════════════════════════════════════════════════════════════════════════
-// INBOUND MESSAGES — "Customer Replied" trigger
-// ══════════════════════════════════════════════════════════════════════════════
-// NOT automatic — this only fires when YOUR SMS/WhatsApp/email provider's
-// inbound webhook is configured to POST here. Point your provider's
-// "incoming message" webhook at POST /api/inbound/message with
-// { "from": "<phone or email>", "text": "<message body>" } and this trigger
-// starts firing for real. Left unauthenticated since providers can't send
-// your app's login token — if you want it locked down, add a shared-secret
-// header check here matching a value only you and your provider know.
-app.post("/api/inbound/message", async (req, res) => {
-  try {
-    const { from, text } = req.body || {};
-    if (!from) return res.status(400).json({ message: "from is required" });
-    const contact = await Contact.findOne({ $or: [{ email: from }, { phone: from }] });
-    runWorkflows("customer_replied", {
-      studentEmail: contact?.email || from, studentName: contact?.name || "", message: text || "",
-      __summary: `Reply from ${from}`,
-    });
-    res.json({ received: true });
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// ══════════════════════════════════════════════════════════════════════════════
 // NOTIFICATIONS — Student Portal bell icon (created by the "notify" workflow action)
 // ══════════════════════════════════════════════════════════════════════════════
 
@@ -3012,25 +2131,8 @@ app.patch("/api/notifications/:id/read", protect, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// Internal (admin-facing) notifications, created by the "Send Internal
-// Notification" workflow action. No bell icon wired to this yet in the
-// Super Admin panel — these are ready to list whenever that's added.
-app.get("/api/admin/internal-notifications", protect, adminOnly, async (req, res) => {
-  try {
-    res.json(await InternalNotification.find({}).sort("-createdAt").limit(50));
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-app.patch("/api/admin/internal-notifications/:id/read", protect, adminOnly, async (req, res) => {
-  try {
-    const notif = await InternalNotification.findByIdAndUpdate(req.params.id, { read: true }, { new: true });
-    if (!notif) return res.status(404).json({ message: "Notification not found" });
-    res.json(notif);
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
 // ══════════════════════════════════════════════════════════════════════════════
 // MULTER ERROR HANDLER — must be after all routes
-// Catches file-size and MIME-type rejections; returns clean JSON
 // ══════════════════════════════════════════════════════════════════════════════
 app.use((err, req, res, next) => {
   if (err instanceof multer.MulterError) {
