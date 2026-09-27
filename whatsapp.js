@@ -789,9 +789,26 @@ async function startSelfHostedSession(sessionDoc) {
     }
 
     // 3) messages
+    // NEW: yields back to the real Node.js event loop every 20 messages
+    // (via setImmediate, not just an await on a fast/already-resolved
+    // promise — those only yield to the microtask queue, which is NOT
+    // enough here). describeMessage()/serializeMediaRaw() below do a real
+    // synchronous JSON-tree walk per media message, and a full history
+    // import can hand this loop several thousand messages in one event —
+    // without a real yield, that ran as one long unbroken stretch of CPU
+    // work that froze the ENTIRE Node process, not just the WhatsApp
+    // dashboard: every other request on the whole site (a student loading
+    // a course, an admin loading anything) queued up behind it until the
+    // sync finished. Yielding lets pending requests actually get served in
+    // between, so the rest of the site stays responsive while a big
+    // history import runs in the background — it only makes the import
+    // itself very slightly slower wall-clock, which is the right trade.
     const ops = [];
     const now = new Date();
+    let processed = 0;
     for (const msg of messages || []) {
+      processed++;
+      if (processed % 20 === 0) await new Promise((resolve) => setImmediate(resolve));
       const remote = msg.key?.remoteJid || "";
       if (!msg.message || !remote) continue;
       if (remote.endsWith("@g.us") || remote.endsWith("@broadcast") || remote.endsWith("@newsletter")) continue;
@@ -865,6 +882,13 @@ async function startSelfHostedSession(sessionDoc) {
 // On server start: every account with a saved login reconnects silently
 // (no QR). Accounts that were never scanned are marked "disconnected" so
 // the dashboard offers Reconnect instead of looping QR codes in the background.
+//
+// NEW: sessionIds currently being (re)connected — either from this startup
+// scan or from ensureSelfHostedConnected() below — so the two never trigger
+// a SECOND, overlapping connect attempt for the same session (that would
+// call stopSelfHostedSocket() on the one already in progress and make it
+// abort partway through instead of finishing normally).
+const connectingSessions = new Set();
 async function startAllSelfHostedSessions() {
   if (!Baileys) { console.log("[Self-hosted WhatsApp] Baileys not installed — skipping startup reconnect"); return; }
   try {
@@ -875,8 +899,49 @@ async function startAllSelfHostedSessions() {
       else if (s.status !== "disconnected") await WhatsAppSelfSession.findByIdAndUpdate(s._id, { status: "disconnected", lastQr: "" });
     }
     console.log(`[Self-hosted WhatsApp] startup — reconnecting ${toStart.length} saved session(s): ${toStart.map((s) => s.label).join(", ") || "(none)"}`);
-    for (const s of toStart) startSelfHostedSession(s).catch((err) => console.error("[Self-hosted WhatsApp] startup reconnect failed for", s.label, ":", err.message));
+    for (const s of toStart) {
+      connectingSessions.add(s.sessionId);
+      startSelfHostedSession(s)
+        .catch((err) => console.error("[Self-hosted WhatsApp] startup reconnect failed for", s.label, ":", err.message))
+        .finally(() => connectingSessions.delete(s.sessionId));
+    }
   } catch (err) { console.error("[Self-hosted WhatsApp] startup scan failed:", err.message); }
+}
+
+// NEW — the permanent fix for "WhatsApp is connected but the message still
+// failed": `activeSelfHostedSockets` only lives in THIS process's memory,
+// and resets on every server restart (Render sleep/wake, a redeploy, a
+// crash-restart) even though the WhatsApp LOGIN itself (saved in MongoDB)
+// never actually logged out. A workflow's wait step can easily resume on a
+// process that just restarted and hasn't finished reconnecting its socket
+// yet — that used to be reported as "not connected" and treated as a real
+// failure, even though the account was never disconnected.
+//
+// This actively (re)connects the session and waits up to `timeoutMs` for
+// the socket to come online before giving up — so as long as the account
+// genuinely has a valid saved login (hasSavedLogin), a send only ever
+// treats it as "not connected" after really trying, not just because this
+// particular process hadn't caught up yet. A session with no saved login
+// at all (truly logged out / never connected) returns false immediately —
+// there's nothing to wait for.
+const CONNECT_WAIT_POLL_MS = 500;
+async function ensureSelfHostedConnected(sessionId, timeoutMs = 20000) {
+  if (activeSelfHostedSockets.has(sessionId)) return true;
+  const sessionDoc = await WhatsAppSelfSession.findOne({ sessionId });
+  if (!sessionDoc) return false;
+  if (!(await hasSavedLogin(sessionId))) return false;
+  if (!connectingSessions.has(sessionId)) {
+    connectingSessions.add(sessionId);
+    startSelfHostedSession(sessionDoc)
+      .catch((err) => console.error("[Self-hosted WhatsApp] ensureSelfHostedConnected reconnect failed:", err.message))
+      .finally(() => connectingSessions.delete(sessionId));
+  }
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (activeSelfHostedSockets.has(sessionId)) return true;
+    await new Promise((r) => setTimeout(r, CONNECT_WAIT_POLL_MS));
+  }
+  return activeSelfHostedSockets.has(sessionId);
 }
 
 // Digits only — the one canonical number format stored everywhere.
@@ -1732,5 +1797,6 @@ if (keepAliveBase) {
     whatsappConfigured,
     sendWhatsAppRaw,
     startAllSelfHostedSessions,
+    ensureSelfHostedConnected,
   };
 };

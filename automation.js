@@ -299,6 +299,25 @@ module.exports = function setupAutomation(app, deps) {
 
   const WAIT_UNIT_MS = { seconds: 1000, minutes: 60000, hours: 3600000, days: 86400000, weeks: 604800000, years: 31536000000 };
 
+  // ── WhatsApp send retry — see the "send_whatsapp" case in runAction() ────
+  // When a self-hosted send can't go out (the socket isn't live in THIS
+  // process right now, most often right after a restart), it's retried
+  // automatically instead of failing the run. WA_RETRY_GAP staggers
+  // several queued retries for the SAME number 10 minutes apart, so a
+  // backlog built up during an outage doesn't all fire in one burst the
+  // moment it reconnects; WA_RETRY_MAX is a safety cap (~3.5 days of
+  // retries) so a permanently-dead session doesn't retry forever.
+  const WA_RETRY_GAP_MS = 10 * 60 * 1000;
+  const WA_RETRY_MAX = 500;
+  const nextWaRetrySlot = new Map(); // sessionId → epoch ms of the next free retry slot
+  function scheduleWaRetrySlot(sessionId) {
+    const earliest = Date.now() + WA_RETRY_GAP_MS;
+    const prevSlot = nextWaRetrySlot.get(sessionId) || 0;
+    const slot = Math.max(earliest, prevSlot + WA_RETRY_GAP_MS);
+    nextWaRetrySlot.set(sessionId, slot);
+    return new Date(slot);
+  }
+
   // NEW: the Wait step now takes hours + minutes + seconds together. Old
   // workflows saved before this change (amount + unit) still work exactly
   // as they did.
@@ -391,17 +410,46 @@ module.exports = function setupAutomation(app, deps) {
         if (p.selfHostedSessionId) {
           const session = await whatsapp.WhatsAppSelfSession.findById(p.selfHostedSessionId).catch(() => null);
           if (!session) { log.push("send_whatsapp skipped — the selected self-hosted number no longer exists"); return; }
-          if (session.status !== "connected") { log.push(`send_whatsapp skipped — "${session.label}" isn't connected (scan its QR in Super Admin → WhatsApp → Self-Hosted Server)`); return; }
+          // NOTE: no longer bails out here just because session.status !==
+          // "connected" — that field, and the in-memory socket behind it,
+          // both reset on every server restart (Render sleep/wake, a
+          // redeploy, a crash-restart) even though the WhatsApp LOGIN
+          // itself is untouched (it's saved in MongoDB and survives all of
+          // that). A long wait (e.g. 4 hours) is much more likely to span
+          // one of these restarts than a short one — that's why only the
+          // longer-delayed messages were the ones coming back "not
+          // connected" here, while WhatsApp itself never actually logged
+          // out.
+          //
+          // PERMANENT FIX: before even attempting the send, actively
+          // (re)connect and wait up to ~20s for the socket to come back —
+          // see whatsapp.ensureSelfHostedConnected(). This is what removes
+          // the false "not connected" failures entirely: as long as the
+          // account's login is genuinely still valid, this gives it a real
+          // chance to reconnect instead of judging it dead the instant this
+          // one process's in-memory socket happens to be missing. Only a
+          // truly logged-out session (no valid saved login at all) skips
+          // straight to the retry-later path below with no wait.
+          await whatsapp.ensureSelfHostedConnected(session.sessionId);
           try {
             const waMessageId = await whatsapp.sendSelfHostedMessage(session.sessionId, to, text);
             await whatsapp.logWhatsAppMessage({ instanceId: session.sessionId, direction: "outgoing", number: to, message: text, status: "sent", source: "workflow", waMessageId });
+            log.push(`WhatsApp message sent to +${to} via "${session.label}" (self-hosted)`);
+            runWorkflows("whatsapp_sent", { ...ctx, to, __summary: `WhatsApp to +${to} via ${session.label}` });
+            return;
           } catch (err) {
-            await whatsapp.logWhatsAppMessage({ instanceId: session.sessionId, direction: "outgoing", number: to, message: text, status: "failed", source: "workflow" });
-            throw err;
+            // Don't fail the run — schedule an automatic retry instead.
+            // See the "retry" handling in executeWorkflowSteps() below for
+            // the staggering logic (10 min apart, capped) and for where
+            // the "failed" WhatsAppMessage row actually gets written if
+            // every retry is exhausted.
+            return {
+              retry: true,
+              reason: err.message,
+              sessionId: session.sessionId,
+              waLogOnGiveUp: { instanceId: session.sessionId, direction: "outgoing", number: to, message: text, source: "workflow" },
+            };
           }
-          log.push(`WhatsApp message sent to +${to} via "${session.label}" (self-hosted)`);
-          runWorkflows("whatsapp_sent", { ...ctx, to, __summary: `WhatsApp to +${to} via ${session.label}` });
-          return;
         }
 
         // Fallback: the original single-number Meta Cloud API path.
@@ -483,11 +531,30 @@ module.exports = function setupAutomation(app, deps) {
         await run.save();
         return;
       }
+      let result;
       try {
-        await runAction(step, ctx, log, workflow._id);
+        result = await runAction(step, ctx, log, workflow._id);
       } catch (err) {
         log.push(`Action "${step.actionType}" failed: ${err.message}`);
         run.status = "failed";
+        run.log = log;
+        await run.save();
+        return;
+      }
+      if (result && result.retry) {
+        const retryCount = (ctx.__waRetryCount || 0) + 1;
+        if (retryCount > WA_RETRY_MAX) {
+          log.push(`WhatsApp still isn't reachable after ${WA_RETRY_MAX} retries (~10 min apart) — giving up. Last reason: ${result.reason}`);
+          if (result.waLogOnGiveUp) await whatsapp.logWhatsAppMessage({ ...result.waLogOnGiveUp, status: "failed", error: result.reason });
+          run.status = "failed";
+          run.log = log;
+          await run.save();
+          return;
+        }
+        const runAt = scheduleWaRetrySlot(result.sessionId || "default");
+        await PendingStep.create({ workflow: workflow._id, run: run._id, stepIndex: i, context: { ...ctx, __waRetryCount: retryCount }, runAt });
+        log.push(`WhatsApp isn't reachable right now (${result.reason}) — will retry automatically once it's back (attempt ${retryCount}, next try ~${runAt.toISOString()})`);
+        run.status = "waiting";
         run.log = log;
         await run.save();
         return;

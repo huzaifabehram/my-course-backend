@@ -178,6 +178,28 @@ const CourseSchema = new mongoose.Schema({
     type:    [{ type: mongoose.Schema.Types.ObjectId, ref: "Course" }],
     default: [],
   },
+  // NEW: freeform breadcrumb text set from the Instructor Dashboard's Course
+  // Editor — e.g. "Marketing / My Custom Title". Rendered on the course
+  // landing page split on "/"; falls back to "<category> / <title>" when
+  // left blank so older courses look exactly as before.
+  breadcrumbText: { type: String, default: "" },
+  // NEW: named bundles — their own price, an optional discount-% badge, and
+  // an FAQ-style "what's included" dropdown list. Each gets its own
+  // "Enroll Now in this Bundle" button on the course landing page, which
+  // charges bundle.price instead of the plain course price (see the
+  // enrollment route below).
+  bundles: {
+    type: [{
+      name:               { type: String, default: "" },
+      price:              { type: Number, default: 0 },
+      discountPercentage: { type: Number, default: 0 },
+      items: {
+        type: [{ title: { type: String, default: "" }, content: { type: String, default: "" } }],
+        default: [],
+      },
+    }],
+    default: [],
+  },
 }, { timestamps: true });
 const Course = mongoose.model("Course", CourseSchema);
 
@@ -194,6 +216,12 @@ const EnrollmentSchema = new mongoose.Schema({
   rejectionReason: { type: String, default: "" },
   verifiedBy:      { type: mongoose.Schema.Types.ObjectId, ref: "User" },
   verifiedAt:      { type: Date },
+  // NEW: set when this enrollment was for a specific course Bundle rather
+  // than the plain course — bundleId references one of the course's own
+  // bundles._id (kept as a plain string, not a ref, since bundles are
+  // subdocuments of Course, not their own collection).
+  bundleId:   { type: String, default: "" },
+  bundleName: { type: String, default: "" },
 }, { timestamps: true });
 EnrollmentSchema.index({ student: 1, course: 1 }, { unique: true });
 const Enrollment = mongoose.model("Enrollment", EnrollmentSchema);
@@ -332,6 +360,11 @@ async function seedForms() {
     await Form.findOneAndUpdate(
       { slug: "form-1" },
       { $setOnInsert: { name: "Form 1", slug: "form-1", description: "Course Enrollment — the 2-step form shown when a student enrolls in a course.", fields: ["Name", "Email", "Password", "WhatsApp Number", "Payment Method", "Payment Screenshot"] } },
+      { upsert: true }
+    );
+    await Form.findOneAndUpdate(
+      { slug: "form-1-step-1" },
+      { $setOnInsert: { name: "Form 1 — Step 1 (Free Preview Lead)", slug: "form-1-step-1", description: "Shown before a free preview lecture plays on the course landing page — Name, Email, WhatsApp Number only.", fields: ["Name", "Email", "WhatsApp Number"] } },
       { upsert: true }
     );
     await Form.findOneAndUpdate(
@@ -509,6 +542,7 @@ function sanitizeCoursePayload(raw) {
   if (data.imageTestimonials)   data.imageTestimonials   = stripFrontendIds(data.imageTestimonials);
   if (data.videoTestimonials)   data.videoTestimonials   = stripFrontendIds(data.videoTestimonials);
   if (data.projectGallery)      data.projectGallery      = stripFrontendIds(data.projectGallery);
+  if (data.bundles) data.bundles = stripFrontendIds(data.bundles).map((b) => ({ ...b, items: stripFrontendIds(b.items || []) }));
   if (!Array.isArray(data.alsoBoughtCourseIds)) data.alsoBoughtCourseIds = [];
   return data;
 }
@@ -874,8 +908,18 @@ app.post("/api/enrollments/:courseId", protect, async (req, res) => {
     const existing = await Enrollment.findOne({ student: req.user._id, course: req.params.courseId });
     if (existing) return res.status(400).json({ message: "Already enrolled" });
 
-    const { whatsapp: waNumber, paymentMethod, paymentScreenshotUrl } = req.body || {};
+    const { whatsapp: waNumber, paymentMethod, paymentScreenshotUrl, bundleId } = req.body || {};
     const validMethods = ["bank", "jazzcash", "easypaisa", "card"];
+
+    // NEW: enrolling in a specific Bundle (Instructor Dashboard → Course
+    // Editor → Bundles) charges that bundle's own price instead of the
+    // plain course price.
+    let amount = Math.round(course.price || 0);
+    let bundleName = "";
+    if (bundleId) {
+      const bundle = (course.bundles || []).find((b) => String(b._id) === String(bundleId));
+      if (bundle) { amount = Math.round(bundle.price || 0); bundleName = bundle.name || ""; }
+    }
 
     const enrollment = await Enrollment.create({
       student: req.user._id,
@@ -883,16 +927,17 @@ app.post("/api/enrollments/:courseId", protect, async (req, res) => {
       whatsapp:      typeof waNumber === "string" ? waNumber.trim() : "",
       paymentMethod: validMethods.includes(paymentMethod) ? paymentMethod : "",
       paymentScreenshotUrl: typeof paymentScreenshotUrl === "string" ? paymentScreenshotUrl.trim() : "",
-      amount:   Math.round(course.price || 0),
-      currency: "PKR",
+      amount, currency: "PKR",
+      bundleId:   bundleId ? String(bundleId) : "",
+      bundleName,
     });
 
     automation.upsertContactFromForm({ name: req.user.name, email: req.user.email, phone: enrollment.whatsapp, source: "Enrollment form" });
     automation.runWorkflows("enrollment_created", {
       studentId: req.user._id, studentName: req.user.name, studentEmail: req.user.email,
       courseId: course._id, courseTitle: course.title, amount: enrollment.amount, category: course.category,
-      whatsapp: enrollment.whatsapp,
-      __summary: `${req.user.name} → ${course.title}`,
+      whatsapp: enrollment.whatsapp, bundleName,
+      __summary: `${req.user.name} → ${course.title}${bundleName ? ` (${bundleName})` : ""}`,
     });
     automation.runWorkflows("form_submitted", {
       name: req.user.name, email: req.user.email, message: `Enrolled in ${course.title}`, formSlug: "form-1",
@@ -906,6 +951,31 @@ app.post("/api/enrollments/:courseId", protect, async (req, res) => {
     });
 
     res.status(201).json(enrollment);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── Free Lecture Preview — Step 1 lead capture ("Form 1, Step 1") ──────────
+// Fired when a visitor fills the quick Name/Email/WhatsApp gate before
+// watching a free preview lecture on the course landing page. Deliberately
+// its OWN form/trigger scope (formSlug "form-1-step-1") separate from the
+// full enrollment form ("form-1") — a workflow can react to just preview
+// leads, or just real enrollments, without the two mixing together. Public
+// (no login required) since a visitor previewing a free lecture may not
+// have an account yet.
+app.post("/api/preview-leads", async (req, res) => {
+  try {
+    const { name, email, whatsapp: waNumber, courseId, courseTitle } = req.body || {};
+    if (!name?.trim() || !email?.trim() || !waNumber?.trim())
+      return res.status(400).json({ message: "Name, email and WhatsApp number are required." });
+    const cleanName = name.trim(), cleanEmail = email.trim().toLowerCase(), cleanWa = waNumber.trim();
+    automation.upsertContactFromForm({ name: cleanName, email: cleanEmail, phone: cleanWa, source: "Free Lecture Preview (Form 1, Step 1)" });
+    automation.runWorkflows("form_submitted", {
+      name: cleanName, email: cleanEmail, whatsapp: cleanWa, formSlug: "form-1-step-1",
+      message: `Requested a free lecture preview${courseTitle ? ` for ${courseTitle}` : ""}`,
+      courseId: courseId || "", courseTitle: courseTitle || "",
+      __summary: cleanName,
+    });
+    res.status(201).json({ received: true });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
