@@ -581,6 +581,13 @@ module.exports = function setupAutomation(app, deps) {
       const workflows = await Workflow.find({ trigger, published: true });
       for (const workflow of workflows) {
         if (!matchesTriggerScope(workflow, context)) continue;
+        // A "derived" event is an extra, more specific event fired alongside
+        // one that already existed (e.g. the Course Payment Form fires next to
+        // the Course Basic & Payment Form for the same enrollment). Workflows
+        // with NO form selected ("any form submitted") skip those, so adding
+        // the extra event can't make them run twice for one customer — only a
+        // workflow explicitly scoped to that specific form reacts to it.
+        if (context.__derived && !(workflow.triggerScope && workflow.triggerScope.formSlug)) continue;
         const ctx = { ...context, __trigger: trigger };
         const run = await WorkflowRun.create({ workflow: workflow._id, trigger, summary: context.__summary || "", status: "success", log: [] });
         workflow.runCount = (workflow.runCount || 0) + 1;

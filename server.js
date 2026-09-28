@@ -183,6 +183,19 @@ const CourseSchema = new mongoose.Schema({
   // landing page split on "/"; falls back to "<category> / <title>" when
   // left blank so older courses look exactly as before.
   breadcrumbText: { type: String, default: "" },
+  // NEW: Custom Content Blocks from the Instructor Dashboard's Course
+  // Editor (heading, sub heading, video/image, and now an optional FAQ list
+  // per block). Kept as free-form objects so a block's shape can grow
+  // (like the new `faqs` array) without needing a schema change each time.
+  // NOTE: this field was missing from the schema entirely before, which
+  // means Mongoose (strict mode) was silently dropping every custom block
+  // on save — they never actually persisted.
+  customBlocks: { type: [mongoose.Schema.Types.Mixed], default: [] },
+  // NEW: the order the instructor arranged the Course Editor's sections in
+  // (drag ☰ / ▲▼). The course landing page follows this order for the
+  // sections that live below the hero — testimonials, video reviews,
+  // project gallery, custom blocks, bundles.
+  editorSectionOrder: { type: [String], default: [] },
   // NEW: named bundles — their own price, an optional discount-% badge, and
   // an FAQ-style "what's included" dropdown list. Each gets its own
   // "Enroll Now in this Bundle" button on the course landing page, which
@@ -355,23 +368,51 @@ const FormSchema = new mongoose.Schema({
 }, { timestamps: true });
 const Form = mongoose.model("Form", FormSchema);
 
+// The four built-in forms. `oldNames` = the names they used to have — a
+// built-in form is only renamed if it still has its OLD default name, so a
+// name you've since edited yourself in Super Admin → Forms is never
+// overwritten on a restart.
+const SYSTEM_FORMS = [
+  {
+    slug: "form-1", oldNames: ["Form 1"],
+    name: "Course Basic & Payment Form",
+    description: "A complete course enrollment — both steps filled: basic details (name, email, WhatsApp, password) and payment (method + screenshot).",
+    fields: ["Name", "Email", "Password", "WhatsApp Number", "Payment Method", "Payment Screenshot"],
+  },
+  {
+    slug: "form-1-step-1", oldNames: ["Form 1 — Step 1 (Free Preview Lead)"],
+    name: "Course Basic Form",
+    description: "Step 1 of a course enrollment — basic details only. Also collected before a free lecture plays on the course page.",
+    fields: ["Name", "Email", "WhatsApp Number"],
+  },
+  {
+    slug: "form-1-step-2", oldNames: [],
+    name: "Course Payment Form",
+    description: "Step 2 of a course enrollment — payment method and screenshot. Always comes after the Course Basic Form.",
+    fields: ["Payment Method", "Payment Screenshot"],
+  },
+  {
+    slug: "form-2", oldNames: ["Form 2"],
+    name: "Service Basic Form",
+    description: "Package inquiry — shown on the Services page's Gold/Premium package cards.",
+    fields: ["Name", "WhatsApp Number", "Email", "Package"],
+  },
+];
+const SYSTEM_FORM_SLUGS = SYSTEM_FORMS.map((f) => f.slug);
+
 async function seedForms() {
   try {
-    await Form.findOneAndUpdate(
-      { slug: "form-1" },
-      { $setOnInsert: { name: "Form 1", slug: "form-1", description: "Course Enrollment — the 2-step form shown when a student enrolls in a course.", fields: ["Name", "Email", "Password", "WhatsApp Number", "Payment Method", "Payment Screenshot"] } },
-      { upsert: true }
-    );
-    await Form.findOneAndUpdate(
-      { slug: "form-1-step-1" },
-      { $setOnInsert: { name: "Form 1 — Step 1 (Free Preview Lead)", slug: "form-1-step-1", description: "Shown before a free preview lecture plays on the course landing page — Name, Email, WhatsApp Number only.", fields: ["Name", "Email", "WhatsApp Number"] } },
-      { upsert: true }
-    );
-    await Form.findOneAndUpdate(
-      { slug: "form-2" },
-      { $setOnInsert: { name: "Form 2", slug: "form-2", description: "Package Inquiry — shown on the Services page's Gold/Premium package cards.", fields: ["Name", "WhatsApp Number", "Email", "Package"] } },
-      { upsert: true }
-    );
+    for (const def of SYSTEM_FORMS) {
+      const existing = await Form.findOne({ slug: def.slug });
+      if (!existing) {
+        await Form.create({ name: def.name, slug: def.slug, description: def.description, fields: def.fields });
+      } else if (def.oldNames.includes(existing.name)) {
+        existing.name = def.name;
+        existing.description = def.description;
+        existing.fields = def.fields;
+        await existing.save();
+      }
+    }
   } catch (err) { console.error("[Forms] seed error:", err.message); }
 }
 
@@ -381,6 +422,24 @@ const TagSchema = new mongoose.Schema({
   type: { type: String, default: "" },
 }, { timestamps: true });
 const Tag = mongoose.model("Tag", TagSchema);
+
+// ── Course Basic Form submissions — Super Admin → Forms ─────────────────────
+// One row per (email, course): the visitor's basic details (name, email,
+// WhatsApp) captured EITHER by the quick gate before a free preview lecture
+// on the course page, OR by Step 1 of the enrollment page — whichever
+// happens first. A course's Payment Form is only ever reachable after this
+// exists (the enrollment route below creates one if somehow missing), so
+// "payment without basic details" can't happen.
+const CourseBasicLeadSchema = new mongoose.Schema({
+  name:        { type: String, required: true, trim: true },
+  email:       { type: String, required: true, lowercase: true, trim: true },
+  whatsapp:    { type: String, required: true, trim: true },
+  course:      { type: mongoose.Schema.Types.ObjectId, ref: "Course", default: null },
+  courseTitle: { type: String, default: "" },
+  source:      { type: String, enum: ["free_preview", "enrollment"], default: "free_preview" },
+}, { timestamps: true });
+CourseBasicLeadSchema.index({ email: 1, course: 1 }, { unique: true, partialFilterExpression: { course: { $type: "objectId" } } });
+const CourseBasicLead = mongoose.model("CourseBasicLead", CourseBasicLeadSchema);
 
 // ── Newsletter subscribers — from the footer newsletter box ────────────────────
 const NewsletterSubscriberSchema = new mongoose.Schema({
@@ -939,10 +998,30 @@ app.post("/api/enrollments/:courseId", protect, async (req, res) => {
       whatsapp: enrollment.whatsapp, bundleName,
       __summary: `${req.user.name} → ${course.title}${bundleName ? ` (${bundleName})` : ""}`,
     });
+    // A Payment Form can never exist without a Course Basic Form — if this
+    // visitor somehow skipped it (older client, logged-in shortcut), record it
+    // now. Silent: only fires its own trigger if it's genuinely new.
+    recordCourseBasicLead({
+      name: req.user.name, email: req.user.email, whatsapp: enrollment.whatsapp,
+      courseId: course._id, source: "enrollment",
+    }).catch((err) => console.error("[Forms] could not record basic lead:", err.message));
+
+    // "Course Basic & Payment Form" — both steps filled. Same event/slug
+    // ("form-1") this route has always fired, so existing workflows scoped
+    // to it keep working; courseId is new, so it can now be scoped per course.
     automation.runWorkflows("form_submitted", {
-      name: req.user.name, email: req.user.email, message: `Enrolled in ${course.title}`, formSlug: "form-1",
-      whatsapp: enrollment.whatsapp,
+      name: req.user.name, email: req.user.email, message: `Enrolled in ${course.title}${bundleName ? ` — ${bundleName}` : ""}`, formSlug: "form-1",
+      whatsapp: enrollment.whatsapp, courseId: String(course._id), courseTitle: course.title,
       __summary: `${req.user.name} → ${course.title}`,
+    });
+    // "Course Payment Form" — the payment half of the same submission, for
+    // workflows that should only react to that. __derived so a workflow with
+    // NO form selected ("any form") doesn't fire a second time for the same
+    // enrollment (see runWorkflows in automation.js).
+    automation.runWorkflows("form_submitted", {
+      name: req.user.name, email: req.user.email, message: `Submitted payment for ${course.title}`, formSlug: "form-1-step-2",
+      whatsapp: enrollment.whatsapp, courseId: String(course._id), courseTitle: course.title,
+      __derived: true, __summary: `${req.user.name} → ${course.title}`,
     });
     automation.runWorkflows("category_started", {
       studentId: req.user._id, studentName: req.user.name, studentEmail: req.user.email,
@@ -954,30 +1033,77 @@ app.post("/api/enrollments/:courseId", protect, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// ── Free Lecture Preview — Step 1 lead capture ("Form 1, Step 1") ──────────
-// Fired when a visitor fills the quick Name/Email/WhatsApp gate before
-// watching a free preview lecture on the course landing page. Deliberately
-// its OWN form/trigger scope (formSlug "form-1-step-1") separate from the
-// full enrollment form ("form-1") — a workflow can react to just preview
-// leads, or just real enrollments, without the two mixing together. Public
-// (no login required) since a visitor previewing a free lecture may not
-// have an account yet.
-app.post("/api/preview-leads", async (req, res) => {
+// ── Course Basic Form — capture + admin views ───────────────────────────────
+// recordCourseBasicLead() is the single place a Course Basic Form
+// submission is saved, whichever way it arrives:
+//   • the quick Name/Email/WhatsApp gate before a free preview lecture on the
+//     course landing page (source "free_preview"), or
+//   • Step 1 of the enrollment page / the enrollment itself ("enrollment").
+// One row per (email, course) — filling it again just refreshes the details.
+// Only the FIRST time an email fills it for a course does it create the
+// Contact and fire the "form_submitted" trigger (formSlug "form-1-step-1"),
+// so a visitor who fills it at preview AND again at enrollment never
+// double-fires a workflow.
+//
+// The trigger is fired with __derived:true — see runWorkflows() in
+// automation.js: workflows with NO form selected ("any form") skip derived
+// events, so adding this new event can't suddenly make an existing "any form
+// submitted" workflow send a second message per customer. Only a workflow
+// explicitly scoped to "Course Basic Form" reacts to it.
+async function recordCourseBasicLead({ name, email, whatsapp: waNumber, courseId, source }) {
+  const cleanName = String(name || "").trim();
+  const cleanEmail = String(email || "").trim().toLowerCase();
+  const cleanWa = String(waNumber || "").trim();
+  if (!cleanName || !cleanEmail || !cleanWa) return { lead: null, created: false };
+
+  let course = null;
+  if (courseId && mongoose.isValidObjectId(courseId)) course = await Course.findById(courseId).select("title");
+
+  const filter = { email: cleanEmail, course: course ? course._id : null };
+  const existing = await CourseBasicLead.findOne(filter);
+  if (existing) {
+    existing.name = cleanName;
+    existing.whatsapp = cleanWa;
+    await existing.save();
+    return { lead: existing, created: false };
+  }
+
+  let lead;
   try {
-    const { name, email, whatsapp: waNumber, courseId, courseTitle } = req.body || {};
+    lead = await CourseBasicLead.create({
+      ...filter, name: cleanName, whatsapp: cleanWa,
+      courseTitle: course?.title || "", source: source === "enrollment" ? "enrollment" : "free_preview",
+    });
+  } catch (err) {
+    if (err.code === 11000) return { lead: await CourseBasicLead.findOne(filter), created: false }; // two requests raced — the other one won
+    throw err;
+  }
+
+  automation.upsertContactFromForm({ name: cleanName, email: cleanEmail, phone: cleanWa, source: `Course Basic Form${course ? ` — ${course.title}` : ""}` });
+  automation.runWorkflows("form_submitted", {
+    name: cleanName, email: cleanEmail, whatsapp: cleanWa, formSlug: "form-1-step-1",
+    message: `Filled the Course Basic Form${course ? ` for ${course.title}` : ""}`,
+    courseId: course ? String(course._id) : "", courseTitle: course?.title || "",
+    __derived: true, __summary: cleanName,
+  });
+  return { lead, created: true };
+}
+
+// Public (no login) — a visitor previewing a free lecture, or filling Step 1
+// of the enrollment page, may not have an account yet. "/api/preview-leads"
+// is kept as an alias of the same handler so anything still calling the old
+// path keeps working.
+async function courseBasicLeadHandler(req, res) {
+  try {
+    const { name, email, whatsapp: waNumber, courseId, source } = req.body || {};
     if (!name?.trim() || !email?.trim() || !waNumber?.trim())
       return res.status(400).json({ message: "Name, email and WhatsApp number are required." });
-    const cleanName = name.trim(), cleanEmail = email.trim().toLowerCase(), cleanWa = waNumber.trim();
-    automation.upsertContactFromForm({ name: cleanName, email: cleanEmail, phone: cleanWa, source: "Free Lecture Preview (Form 1, Step 1)" });
-    automation.runWorkflows("form_submitted", {
-      name: cleanName, email: cleanEmail, whatsapp: cleanWa, formSlug: "form-1-step-1",
-      message: `Requested a free lecture preview${courseTitle ? ` for ${courseTitle}` : ""}`,
-      courseId: courseId || "", courseTitle: courseTitle || "",
-      __summary: cleanName,
-    });
-    res.status(201).json({ received: true });
+    const { created } = await recordCourseBasicLead({ name, email, whatsapp: waNumber, courseId, source });
+    res.status(201).json({ received: true, created });
   } catch (err) { res.status(500).json({ message: err.message }); }
-});
+}
+app.post("/api/course-basic-leads", courseBasicLeadHandler);
+app.post("/api/preview-leads", courseBasicLeadHandler);
 
 // ══════════════════════════════════════════════════════════════════════════════
 // SUPER ADMIN ROUTES
@@ -1960,6 +2086,51 @@ app.get("/api/admin/package-inquiries/export.csv", protect, adminOnly, async (re
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
+// COURSE BASIC FORM SUBMISSIONS — Super Admin → Forms → Submitted Forms
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Optional ?courseId= filters to one course's Basic Form. Each row also says
+// whether that person went on to submit the Payment Form for the same course
+// (matched by email), so the admin panel can show "basic only" vs "also paid".
+app.get("/api/admin/course-basic-leads", protect, adminOnly, async (req, res) => {
+  try {
+    const query = {};
+    if (req.query.courseId && mongoose.isValidObjectId(req.query.courseId)) query.course = req.query.courseId;
+    const leads = await CourseBasicLead.find(query).sort("-createdAt").populate("course", "title").lean();
+
+    const courseIds = [...new Set(leads.map((l) => String(l.course?._id || "")).filter(Boolean))];
+    const enrollments = courseIds.length
+      ? await Enrollment.find({ course: { $in: courseIds } }).populate("student", "email").select("course student").lean()
+      : [];
+    const paid = new Set(enrollments.filter((e) => e.student?.email).map((e) => `${e.course}|${e.student.email.toLowerCase()}`));
+
+    res.json(leads.map((l) => ({ ...l, paid: paid.has(`${l.course?._id}|${l.email}`) })));
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+app.delete("/api/admin/course-basic-leads/:id", protect, adminOnly, async (req, res) => {
+  try {
+    const lead = await CourseBasicLead.findByIdAndDelete(req.params.id);
+    if (!lead) return res.status(404).json({ message: "Submission not found" });
+    res.json({ deleted: true });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+app.get("/api/admin/course-basic-leads/export.csv", protect, adminOnly, async (req, res) => {
+  try {
+    const { ids } = req.query;
+    const query = ids ? { _id: { $in: String(ids).split(",") } } : {};
+    const leads = await CourseBasicLead.find(query).sort("-createdAt").populate("course", "title");
+    const rows = [["Name", "Email", "WhatsApp", "Course", "Source", "Submitted"]];
+    for (const l of leads) rows.push([l.name, l.email, l.whatsapp, l.course?.title || l.courseTitle, l.source === "enrollment" ? "Enrollment page" : "Free preview", l.createdAt.toISOString()]);
+    const csv = rows.map((r) => r.map((v) => `"${String(v ?? "").replace(/"/g, '""')}"`).join(",")).join("\n");
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", "attachment; filename=course-basic-form.csv");
+    res.send(csv);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
 // FORMS — Super Admin → Forms
 // ══════════════════════════════════════════════════════════════════════════════
 
@@ -2001,7 +2172,7 @@ app.delete("/api/admin/forms/:id", protect, adminOnly, async (req, res) => {
   try {
     const form = await Form.findById(req.params.id);
     if (!form) return res.status(404).json({ message: "Form not found" });
-    if (form.slug === "form-1" || form.slug === "form-2")
+    if (SYSTEM_FORM_SLUGS.includes(form.slug))
       return res.status(400).json({ message: "This form is wired into a live page and can't be deleted from here." });
     await Form.findByIdAndDelete(req.params.id);
     res.json({ deleted: true });
