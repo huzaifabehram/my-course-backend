@@ -61,6 +61,18 @@ app.use(cors({
   },
   credentials: true,
 }));
+// SPEED: gzip/brotli-style compression for API responses. Course objects and
+// admin lists are big JSON and compress to a fraction of their size, which is
+// the difference between "instant" and "loading…" on a phone connection.
+// Optional on purpose: if the `compression` package isn't installed yet the
+// server still starts normally (it just logs a reminder) — run
+// `npm install compression` once and redeploy to switch it on.
+try {
+  // eslint-disable-next-line global-require
+  app.use(require("compression")());
+} catch (err) {
+  console.log("[perf] 'compression' is not installed — API responses are being sent uncompressed. Run: npm install compression");
+}
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
@@ -1979,6 +1991,10 @@ app.post("/api/theme/import", protect, themeEditorOnly, async (req, res) => {
 app.get("/api/settings", async (req, res) => {
   try {
     const settings = await getSiteSettings();
+    // Logos change rarely — let the browser/CDN reuse this for a short while
+    // (and serve a slightly stale copy while it refreshes) instead of hitting
+    // the server on every single page.
+    res.set("Cache-Control", "public, max-age=20, stale-while-revalidate=120");
     res.json({
       logoUrl:       settings.logoUrl       || "",
       footerLogoUrl: settings.footerLogoUrl || "",
@@ -2408,4 +2424,4 @@ app.listen(PORT, () => {
   console.log(`🚀  Server  →  http://localhost:${PORT}`);
   console.log(`🌍  CORS    →  ${allowedOrigins.join(", ")}`);
   console.log(`☁️   Cloud  →  ${process.env.CLOUDINARY_CLOUD_NAME ?? "⚠️  NOT SET"}`);
-});
+}); 
