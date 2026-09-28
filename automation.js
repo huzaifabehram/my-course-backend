@@ -421,16 +421,14 @@ module.exports = function setupAutomation(app, deps) {
           // connected" here, while WhatsApp itself never actually logged
           // out.
           //
-          // PERMANENT FIX: before even attempting the send, actively
-          // (re)connect and wait up to ~20s for the socket to come back —
-          // see whatsapp.ensureSelfHostedConnected(). This is what removes
-          // the false "not connected" failures entirely: as long as the
-          // account's login is genuinely still valid, this gives it a real
-          // chance to reconnect instead of judging it dead the instant this
-          // one process's in-memory socket happens to be missing. Only a
-          // truly logged-out session (no valid saved login at all) skips
-          // straight to the retry-later path below with no wait.
-          await whatsapp.ensureSelfHostedConnected(session.sessionId);
+          // PERMANENT FIX: whatsapp.sendSelfHostedMessage() below now
+          // actively (re)connects and waits up to ~20s for the socket to
+          // come back before actually giving up (see
+          // ensureSelfHostedConnected() in whatsapp.js) — the same fix
+          // covers this workflow path, a manual send from the dashboard,
+          // bulk sends, and the external API, all from one place. Only a
+          // truly logged-out session (no valid saved login at all) fails
+          // fast with no wait.
           try {
             const waMessageId = await whatsapp.sendSelfHostedMessage(session.sessionId, to, text);
             await whatsapp.logWhatsAppMessage({ instanceId: session.sessionId, direction: "outgoing", number: to, message: text, status: "sent", source: "workflow", waMessageId });

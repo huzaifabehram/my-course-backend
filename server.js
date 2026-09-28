@@ -221,9 +221,12 @@ const CourseSchema = new mongoose.Schema({
       price:              { type: Number, default: 0 },
       discountPercentage: { type: Number, default: 0 },
       items: {
-        // price = that module's own "actual" price; the course page adds them
-        // up into the struck-through Actual Price and works out the % saved.
-        type: [{ title: { type: String, default: "" }, price: { type: Number, default: 0 }, content: { type: String, default: "" } }],
+        // price = that module's own "original" price; the course page adds
+        // them up into the struck-through Original Price and works out the %
+        // saved. imageUrl = the small icon/logo shown next to the module
+        // name (e.g. the Facebook or Shopify logo), uploaded via the
+        // Instructor Dashboard's Course Editor and stored on Cloudinary.
+        type: [{ title: { type: String, default: "" }, price: { type: Number, default: 0 }, content: { type: String, default: "" }, imageUrl: { type: String, default: "" } }],
         default: [],
       },
     }],
@@ -2424,4 +2427,4 @@ app.listen(PORT, () => {
   console.log(`🚀  Server  →  http://localhost:${PORT}`);
   console.log(`🌍  CORS    →  ${allowedOrigins.join(", ")}`);
   console.log(`☁️   Cloud  →  ${process.env.CLOUDINARY_CLOUD_NAME ?? "⚠️  NOT SET"}`);
-}); 
+});

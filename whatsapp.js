@@ -985,7 +985,23 @@ async function resolveMessageIdentity(key, sock, instanceId) {
   return { jid, displayNumber: lidLabel(jid) };
 }
 
+// THE SINGLE PLACE every send goes through — the manual "type and hit Send"
+// box in Super Admin → WhatsApp, Bulk Send, the external API endpoint, and
+// every Automation Workflow "Send WhatsApp" step all call this one function.
+// That used to matter: an earlier fix taught the AUTOMATION path to actively
+// reconnect before giving up, but a manual send from the dashboard still hit
+// this function directly and failed immediately — which is exactly the
+// "dashboard says Connected, but sending says not connected" report. Fixing
+// it HERE means every caller is covered by the same fix at once.
 async function sendSelfHostedMessage(sessionId, target, text) {
+  // Actively (re)connects and waits briefly if this process's own in-memory
+  // socket isn't live yet — see ensureSelfHostedConnected below. This is the
+  // common case right after a server restart (Render sleep/wake, a redeploy):
+  // the WhatsApp LOGIN itself is untouched (saved in MongoDB), but this one
+  // process hasn't finished reconnecting its socket yet. Only a session with
+  // no valid saved login at all (truly logged out) skips straight through
+  // with no wait.
+  await ensureSelfHostedConnected(sessionId);
   const sock = activeSelfHostedSockets.get(sessionId);
   if (!sock) throw new Error("This number isn't connected right now");
   const jid = String(target).includes("@") ? target : toWhatsAppJid(target);
