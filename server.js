@@ -204,10 +204,14 @@ const CourseSchema = new mongoose.Schema({
   bundles: {
     type: [{
       name:               { type: String, default: "" },
+      // A few lines explaining what the bundle is (shown under its heading).
+      description:        { type: String, default: "" },
       price:              { type: Number, default: 0 },
       discountPercentage: { type: Number, default: 0 },
       items: {
-        type: [{ title: { type: String, default: "" }, content: { type: String, default: "" } }],
+        // price = that module's own "actual" price; the course page adds them
+        // up into the struck-through Actual Price and works out the % saved.
+        type: [{ title: { type: String, default: "" }, price: { type: Number, default: 0 }, content: { type: String, default: "" } }],
         default: [],
       },
     }],
