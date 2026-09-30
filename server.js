@@ -1401,6 +1401,105 @@ app.delete("/api/admin/tracking/inventory/:id", protect, adminOnly, async (req, 
 // rather than trying to reverse-engineer the original spreadsheet's
 // inconsistent hand-entered totals.
 const DISPATCHED_STATUSES = ["dispatched", "in_transit", "out_for_delivery", "delivered", "returned", "failed_delivery", "non_service_area", "address_incomplete"];
+
+// ── One-time import of the admin's original Excel workbook ─────────────────
+// ("Complete E-com Business Management Sheet") — the exact order rows from
+// its "jul" and "August" tabs, the 5 products from "INVENTRY", and the
+// non-zero expense lines from "DASHBOARD". Duplicate-safe: skips any order
+// whose orderNo, inventory item whose productCode, or expense whose
+// date+category+amount already exists — so pressing the button again (or the
+// Dashboard tab showing it again after everything's been deleted) never
+// creates doubles.
+//
+// NOTE: the workbook also has a "CASH FLOW" ledger and a daily "SEP-25-ADS"
+// (Facebook/TikTok/Google ad spend) sheet — neither fits Orders/Inventory/
+// Expenses, so they were left out of this import; ask if you'd like a
+// section built for either of those too.
+const EXCEL_IMPORT_ORDERS = [
+  { date: "2025-08-01", orderNo: "#ES71427", productTitle: "SM+QB", productCode: "SM+QB", courier: "PostEX", price: 1599.0, customerName: "Ahtasham Shoukat", customerPhone: "+92 333 5121650", customerAddress: "", trackingId: "28030330008771", status: "delivered", paymentStatus: "paid", remarks: "" },
+  { date: "2025-08-01", orderNo: "#ES71428", productTitle: "SM+QB", productCode: "SM+QB", courier: "PostEX", price: 1999.0, customerName: "Azam Hussain", customerPhone: "+92 337 6535799", customerAddress: "", trackingId: "25030330008772", status: "delivered", paymentStatus: "paid", remarks: "" },
+  { date: "2025-08-01", orderNo: "#ES71429", productTitle: "SM+QB", productCode: "SM+QB", courier: "PostEX", price: 1599.0, customerName: "Tayyab Naeem Tayyab Naeem", customerPhone: "+92 313 9671096", customerAddress: "", trackingId: "22030330008773", status: "delivered", paymentStatus: "paid", remarks: "" },
+  { date: "2025-08-01", orderNo: "#ES71430", productTitle: "SL+SM", productCode: "SL+SM", courier: "PostEX", price: 1500.0, customerName: "Muhammad Muqaddas Sheikh", customerPhone: "+92 325 4132281", customerAddress: "", trackingId: "21030330008774", status: "returned", paymentStatus: "returned", remarks: "Retuurn" },
+  { date: "2025-08-01", orderNo: "#ES71431", productTitle: "SM+QB", productCode: "SM+QB", courier: "PostEX", price: 1599.0, customerName: "Ch Shahzad Gul", customerPhone: "+92 326 1961234", customerAddress: "", trackingId: "20030330008775", status: "delivered", paymentStatus: "paid", remarks: "" },
+  { date: "2025-08-01", orderNo: "#ES71432", productTitle: "SM+SL+QB", productCode: "SM+SL+QB", courier: "PostEX", price: 1999.0, customerName: "Hasham Paracha", customerPhone: "+92 335 5282563", customerAddress: "", trackingId: "21030330008776", status: "delivered", paymentStatus: "pending", remarks: "self collection" },
+  { date: "2025-08-01", orderNo: "#ES71433", productTitle: "SL+SM", productCode: "SL+SM", courier: "leopard", price: 1599.0, customerName: "Shaheel Shahzad", customerPhone: "+92 317 5296155", customerAddress: "", trackingId: "22030330008777", status: "delivered", paymentStatus: "paid", remarks: "Re-attempt" },
+  { date: "2025-08-01", orderNo: "#ES71434", productTitle: "SM+QB", productCode: "SM+QB", courier: "leopard", price: 1599.0, customerName: "Arslan Khalid Ansari", customerPhone: "+92 325 5391761", customerAddress: "", trackingId: "23030330008778", status: "out_for_delivery", paymentStatus: "pending", remarks: "" },
+  { date: "2025-08-01", orderNo: "#ES71435", productTitle: "SL+SM", productCode: "SL+SM", courier: "PostEX", price: 1599.0, customerName: "ShahbaZ Ali", customerPhone: "+92 333 2841080", customerAddress: "", trackingId: "27030330008779", status: "delivered", paymentStatus: "pending", remarks: "cancel" },
+  { date: "2025-08-01", orderNo: "#ES71436", productTitle: "SL+SM", productCode: "SL+SM", courier: "PostEX", price: 1599.0, customerName: "Abdul Rehman", customerPhone: "+92 306 6281072", customerAddress: "", trackingId: "26030330008780", status: "returned", paymentStatus: "returned", remarks: "Retuurn" },
+  { date: "2025-08-02", orderNo: "#ES71437", productTitle: "SL+SM", productCode: "SL+SM", courier: "leopard", price: 1599.0, customerName: "Muhammad Yousaf", customerPhone: "+92 311 9375214", customerAddress: "", trackingId: "22030330008781", status: "delivered", paymentStatus: "paid", remarks: "" },
+  { date: "2025-08-02", orderNo: "#ES71438", productTitle: "SM+QB", productCode: "SM+QB", courier: "TCS", price: 1599.0, customerName: "Nauman Khan", customerPhone: "+92 314 8375945", customerAddress: "", trackingId: "27030330008782", status: "returned", paymentStatus: "returned", remarks: "Retuurn" },
+  { date: "2025-08-02", orderNo: "#ES71439", productTitle: "SM+SL+QB", productCode: "SM+SL+QB", courier: "TCS", price: 1999.0, customerName: "Hamza Saleemi", customerPhone: "+92 313 5784447", customerAddress: "", trackingId: "23030330008783", status: "in_transit", paymentStatus: "pending", remarks: "Re-attempt" },
+  { date: "2025-08-02", orderNo: "#ES71440", productTitle: "SM+QB", productCode: "SM+QB", courier: "TCS", price: 1599.0, customerName: "Osama Abrar", customerPhone: "+92 302 2326223", customerAddress: "", trackingId: "26030330008784", status: "delivered", paymentStatus: "paid", remarks: "" },
+  { date: "2025-08-02", orderNo: "#ES71441", productTitle: "SL+SM", productCode: "SL+SM", courier: "Trax", price: 1599.0, customerName: "Sardar Imran Khan", customerPhone: "+92 347 4748419", customerAddress: "", trackingId: "22030330008785", status: "out_for_delivery", paymentStatus: "paid", remarks: "self collection" },
+  { date: "2025-08-02", orderNo: "#ES71442", productTitle: "SM+SL+QB", productCode: "SM+SL+QB", courier: "Trax", price: 1999.0, customerName: "Muhammad Bilal", customerPhone: "+92 342 7052802", customerAddress: "", trackingId: "23030330008786", status: "returned", paymentStatus: "returned", remarks: "Retuurn" },
+  { date: "2025-08-02", orderNo: "#ES71443", productTitle: "SL+SM", productCode: "SL+SM", courier: "Trax", price: 1599.0, customerName: "Mohsin Yar", customerPhone: "+92 333 9597018", customerAddress: "", trackingId: "22030330008788", status: "in_transit", paymentStatus: "pending", remarks: "" },
+  { date: "2025-08-02", orderNo: "#ES71444", productTitle: "SL+SM", productCode: "SL+SM", courier: "PostEX", price: 1599.0, customerName: "Bilal Muneer", customerPhone: "+92 301 1860496", customerAddress: "", trackingId: "29030330008787", status: "delivered", paymentStatus: "pending", remarks: "Re-attempt" },
+  { date: "2025-08-02", orderNo: "#ES71445", productTitle: "SM+SL+QB", productCode: "SM+SL+QB", courier: "PostEX", price: 1999.0, customerName: "Mehran Khan", customerPhone: "+92 311 5058609", customerAddress: "", trackingId: "22030330008789", status: "delivered", paymentStatus: "paid", remarks: "" },
+  { date: "2025-08-02", orderNo: "#ES71446", productTitle: "SL+SM", productCode: "SL+SM", courier: "PostEX", price: 999.0, customerName: "Raja Nauman", customerPhone: "+92 307 3592696", customerAddress: "", trackingId: "26030330008790", status: "in_transit", paymentStatus: "pending", remarks: "" },
+  { date: "2025-08-22", orderNo: "#ZSK171181", productTitle: "Smart Water Bottle", productCode: "SWB", courier: "Leopards", price: 3800.0, customerName: "Muhammad Ahmed Khan", customerPhone: "3204346485", customerAddress: "mian autos D Block mandir Market model town", trackingId: "20400000000000", status: "delivered", paymentStatus: "paid", remarks: "" },
+  { date: "2025-08-22", orderNo: "#ZSK171179", productTitle: "Leather Keychain", productCode: "LK", courier: "Leopards", price: 2450.0, customerName: "Ali Raza", customerPhone: "3418973676", customerAddress: "Hashmi markeet shop ni 63 abdulha haroon road karachi", trackingId: "28400000000000", status: "delivered", paymentStatus: "pending", remarks: "" },
+  { date: "2025-08-22", orderNo: "#ZSK171176", productTitle: "LED Desk Lamp", productCode: "LDL", courier: "POSTEX", price: 1700.0, customerName: "Hassan Shah", customerPhone: "3054594786", customerAddress: "Deewanwala chock main alfhabank k Sath arslan pan shop", trackingId: "22400000000000", status: "delivered", paymentStatus: "paid", remarks: "" },
+  { date: "2025-08-22", orderNo: "#ZSK171173", productTitle: "Wireless Earbuds", productCode: "WE", courier: "TRAX", price: 1999.0, customerName: "Abdullah Siddiq", customerPhone: "", customerAddress: "Jalalpur sharif Ahmad book dipo main lari adqa", trackingId: "", status: "delivered", paymentStatus: "paid", remarks: "" },
+  { date: "2025-08-22", orderNo: "#ZSK171186", productTitle: "Travel Backpack", productCode: "TB", courier: "TCS", price: 1999.0, customerName: "Hamza Iqbal", customerPhone: "", customerAddress: "Shahdadpur hous number 722 janipur MUHALLA", trackingId: "", status: "returned", paymentStatus: "returned", remarks: "" },
+  { date: "2025-08-22", orderNo: "#ZSK171184", productTitle: "Smart Water Bottle", productCode: "SWB", courier: "POSTEX", price: 1700.0, customerName: "Bilal Nawaz", customerPhone: "", customerAddress: "umair iron store bustan rd kunri", trackingId: "", status: "delivered", paymentStatus: "paid", remarks: "" },
+  { date: "2025-08-22", orderNo: "#ZSK171171", productTitle: "Travel Backpack", productCode: "TB", courier: "TRAX", price: 1999.0, customerName: "Imran Farooq", customerPhone: "", customerAddress: "Soneri bank expo centre branch Johar Town lahore", trackingId: "", status: "delivered", paymentStatus: "paid", remarks: "" },
+  { date: "2025-08-23", orderNo: "#ZSK171178", productTitle: "LED Desk Lamp", productCode: "LDL", courier: "POSTEX", price: 1350.0, customerName: "Usman Javed", customerPhone: "", customerAddress: "fort abbass basti phlura", trackingId: "", status: "address_incomplete", paymentStatus: "paid", remarks: "" },
+  { date: "2025-08-23", orderNo: "#ZSK171192", productTitle: "Travel Backpack", productCode: "TB", courier: "POSTEX", price: 1599.0, customerName: "Salman Mirza", customerPhone: "", customerAddress: "Sheesh Mahal Marriage Hall, Model Town, near Election Commission Office, Gujranwala", trackingId: "", status: "delivered", paymentStatus: "pending", remarks: "" },
+  { date: "2025-08-23", orderNo: "#ZSK171193", productTitle: "Travel Backpack", productCode: "TB", courier: "TCS", price: 1599.0, customerName: "Ahsan Tariq", customerPhone: "", customerAddress: "Islam nagar pso pump nazidk police satation", trackingId: "", status: "failed_delivery", paymentStatus: "pending", remarks: "" },
+  { date: "2025-08-23", orderNo: "#ZSK171195", productTitle: "LED Desk Lamp", productCode: "LDL", courier: "Leopards", price: 1999.0, customerName: "Fahad Qureshi", customerPhone: "", customerAddress: "427/428 G4 Block jhower town Lahore", trackingId: "", status: "delivered", paymentStatus: "pending", remarks: "" },
+  { date: "2025-08-25", orderNo: "#ZSK171196", productTitle: "Smart Water Bottle", productCode: "SWB", courier: "Leopards", price: 1700.0, customerName: "Zain Abbas", customerPhone: "", customerAddress: "Jalalpur sharif Ahmad book dipo main lari adqa", trackingId: "", status: "delivered", paymentStatus: "paid", remarks: "" },
+  { date: "2025-08-25", orderNo: "#ZSK171197", productTitle: "Smart Water Bottle", productCode: "SWB", courier: "Leopards", price: 1700.0, customerName: "Owais Malik", customerPhone: "", customerAddress: "Shahdadpur hous number 722 janipur MUHALLA", trackingId: "", status: "delivered", paymentStatus: "pending", remarks: "" },
+  { date: "2025-08-25", orderNo: "#ZSK171198", productTitle: "Travel Backpack", productCode: "TB", courier: "TCS", price: 1599.0, customerName: "Saad Khurram", customerPhone: "", customerAddress: "umair iron store bustan rd kunri", trackingId: "", status: "failed_delivery", paymentStatus: "pending", remarks: "" },
+  { date: "2025-08-25", orderNo: "#ZSK171199", productTitle: "Smart Water Bottle", productCode: "SWB", courier: "TCS", price: 1599.0, customerName: "Rizwan Saeed", customerPhone: "", customerAddress: "Soneri bank expo centre branch Johar Town lahore", trackingId: "", status: "delivered", paymentStatus: "pending", remarks: "" },
+  { date: "2025-08-25", orderNo: "#ZSK171200", productTitle: "Wireless Earbuds", productCode: "WE", courier: "Leopards", price: 1999.0, customerName: "Naveed Akhtar", customerPhone: "", customerAddress: "fort abbass basti phlura", trackingId: "", status: "delivered", paymentStatus: "paid", remarks: "" },
+  { date: "2025-08-25", orderNo: "#ZSK171201", productTitle: "Smart Water Bottle", productCode: "SWB", courier: "Leopards", price: 2450.0, customerName: "Farhan Ali", customerPhone: "", customerAddress: "Sheesh Mahal Marriage Hall, Model Town, near Election Commission Office, Gujranwala", trackingId: "", status: "out_for_delivery", paymentStatus: "pending", remarks: "" },
+  { date: "2025-08-25", orderNo: "#ZSK171202", productTitle: "Travel Backpack", productCode: "TB", courier: "Leopards", price: 1999.0, customerName: "Kamran Zafar", customerPhone: "", customerAddress: "Islam nagar pso pump nazidk police satation", trackingId: "", status: "delivered", paymentStatus: "pending", remarks: "" },
+  { date: "2025-08-25", orderNo: "#ZSK171203", productTitle: "Smart Water Bottle", productCode: "SWB", courier: "Leopards", price: 2450.0, customerName: "Shahzad Khan", customerPhone: "", customerAddress: "427/428 G4 Block jhower town Lahore", trackingId: "", status: "delivered", paymentStatus: "pending", remarks: "" },
+  { date: "2025-08-29", orderNo: "#ZSK171204", productTitle: "Leather Keychain", productCode: "LK", courier: "Cancel", price: 1999.0, customerName: "Tariq Mehmood", customerPhone: "", customerAddress: "umair iron store bustan rd kunri", trackingId: "", status: "non_service_area", paymentStatus: "pending", remarks: "" },
+  { date: "2025-08-29", orderNo: "#ZSK171205", productTitle: "Smart Water Bottle", productCode: "SWB", courier: "TRAX", price: 1999.0, customerName: "Asad Rauf", customerPhone: "", customerAddress: "Soneri bank expo centre branch Johar Town lahore", trackingId: "", status: "in_transit", paymentStatus: "pending", remarks: "" },
+  { date: "2025-08-29", orderNo: "#ZSK171206", productTitle: "Smart Water Bottle", productCode: "SWB", courier: "POSTEX", price: 1700.0, customerName: "Waseem Pervez", customerPhone: "", customerAddress: "fort abbass basti phlura", trackingId: "", status: "delivered", paymentStatus: "paid", remarks: "" },
+  { date: "2025-08-29", orderNo: "#ZSK171207", productTitle: "LED Desk Lamp", productCode: "LDL", courier: "POSTEX", price: 1999.0, customerName: "Murtaza Hamid", customerPhone: "", customerAddress: "Sheesh Mahal Marriage Hall, Model Town, near Election Commission Office, Gujranwala", trackingId: "", status: "delivered", paymentStatus: "pending", remarks: "" },
+  { date: "2025-08-29", orderNo: "#ZSK171208", productTitle: "LED Desk Lamp", productCode: "LDL", courier: "Cancel", price: 1999.0, customerName: "Noor ul Haq", customerPhone: "", customerAddress: "Islam nagar pso pump nazidk police satation", trackingId: "", status: "out_for_delivery", paymentStatus: "pending", remarks: "" },
+  { date: "2025-08-29", orderNo: "#ZSK171209", productTitle: "Smart Water Bottle", productCode: "SWB", courier: "Leopards", price: 2450.0, customerName: "Ehsanullah Khan", customerPhone: "", customerAddress: "427/428 G4 Block jhower town Lahore", trackingId: "", status: "in_transit", paymentStatus: "pending", remarks: "" }
+];
+const EXCEL_IMPORT_INVENTORY = [
+  { productTitle: "Smart Water Bottle", productCode: "SWB", costPrice: 1850.0, sellingPrice: 3800.0, purchasedQty: 70, dispatchedQty: 8, deliveredQty: 7, returnedQty: 0, status: "in_stock", purchaseDate: "2025-07-19" },
+  { productTitle: "Leather Keychain", productCode: "LK", costPrice: 350.0, sellingPrice: 1350.0, purchasedQty: 50, dispatchedQty: 1, deliveredQty: 1, returnedQty: 1, status: "in_stock", purchaseDate: "2025-07-19" },
+  { productTitle: "Wireless Earbuds", productCode: "WE", costPrice: 850.0, sellingPrice: 1999.0, purchasedQty: 80, dispatchedQty: 2, deliveredQty: 2, returnedQty: 0, status: "in_stock", purchaseDate: "2025-07-19" },
+  { productTitle: "Travel Backpack", productCode: "TB", costPrice: 1150.0, sellingPrice: 2450.0, purchasedQty: 45, dispatchedQty: 5, deliveredQty: 3, returnedQty: 2, status: "in_stock", purchaseDate: "2025-07-19" },
+  { productTitle: "LED Desk Lamp", productCode: "LDL", costPrice: 670.0, sellingPrice: 1700.0, purchasedQty: 65, dispatchedQty: 4, deliveredQty: 3, returnedQty: 0, status: "in_stock", purchaseDate: "2025-07-19" }
+];
+const EXCEL_IMPORT_EXPENSES = [
+  { date: "2025-07-31", category: "Delivery Charges", amount: 210, note: "Imported from Excel sheet (jul)" },
+  { date: "2025-07-31", category: "Ad Cost", amount: 300, note: "Imported from Excel sheet (jul)" },
+  { date: "2025-08-31", category: "Shopify", amount: 7400, note: "Imported from Excel sheet (August)" },
+  { date: "2025-08-31", category: "Salaries", amount: 15000, note: "Imported from Excel sheet (August)" },
+  { date: "2025-08-31", category: "Delivery Charges", amount: 4800, note: "Imported from Excel sheet (August)" },
+  { date: "2025-08-31", category: "Ad Cost", amount: 6750, note: "Imported from Excel sheet (August)" }
+];
+app.post("/api/admin/tracking/import-excel-data", protect, adminOnly, async (req, res) => {
+  try {
+    const existingOrderNos = new Set((await TrackingOrder.find({ orderNo: { $in: EXCEL_IMPORT_ORDERS.map((o) => o.orderNo) } }).select("orderNo")).map((o) => o.orderNo));
+    const newOrders = EXCEL_IMPORT_ORDERS.filter((o) => !existingOrderNos.has(o.orderNo));
+    if (newOrders.length) await TrackingOrder.insertMany(newOrders.map((o) => ({ ...o, createdBy: req.user._id })));
+
+    const existingCodes = new Set((await InventoryItem.find({ productCode: { $in: EXCEL_IMPORT_INVENTORY.map((i) => i.productCode) } }).select("productCode")).map((i) => i.productCode));
+    const newInventory = EXCEL_IMPORT_INVENTORY.filter((i) => !existingCodes.has(i.productCode));
+    if (newInventory.length) await InventoryItem.insertMany(newInventory);
+
+    const existingExpenses = await TrackingExpense.find({ category: { $in: EXCEL_IMPORT_EXPENSES.map((e) => e.category) } }).select("date category amount");
+    const expenseKey = (e) => `${new Date(e.date).toISOString().slice(0, 10)}|${e.category}|${e.amount}`;
+    const existingExpenseKeys = new Set(existingExpenses.map(expenseKey));
+    const newExpenses = EXCEL_IMPORT_EXPENSES.filter((e) => !existingExpenseKeys.has(expenseKey(e)));
+    if (newExpenses.length) await TrackingExpense.insertMany(newExpenses);
+
+    res.json({
+      imported: { orders: newOrders.length, inventory: newInventory.length, expenses: newExpenses.length },
+      skipped: { orders: EXCEL_IMPORT_ORDERS.length - newOrders.length, inventory: EXCEL_IMPORT_INVENTORY.length - newInventory.length, expenses: EXCEL_IMPORT_EXPENSES.length - newExpenses.length },
+    });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
 app.get("/api/admin/tracking/dashboard", protect, adminOnly, async (req, res) => {
   try {
     const [orders, expenses, inventory] = await Promise.all([
@@ -1456,12 +1555,23 @@ app.get("/api/admin/tracking/dashboard", protect, adminOnly, async (req, res) =>
       };
     });
 
+    // Daily trend — order count + sales value per day, for the Dashboard's
+    // line/bar charts. Built from the same `orders` already loaded above.
+    const dailyMap = {};
+    for (const o of orders) {
+      const day = new Date(o.date).toISOString().slice(0, 10);
+      if (!dailyMap[day]) dailyMap[day] = { date: day, orders: 0, sales: 0 };
+      dailyMap[day].orders += 1;
+      if (DISPATCHED_STATUSES.includes(o.status)) dailyMap[day].sales += (o.price || 0);
+    }
+    const dailyTrend = Object.values(dailyMap).sort((a, b) => a.date.localeCompare(b.date));
+
     res.json({
       totalOrders, totalDispatch, totalDelivered, deliveredParcelAmount, pendingCOD,
       totalSales, totalAdSpend, totalDeliveryCharges, totalCOGS, totalExpenses,
       grossProfit, netProfit,
       returnedCount: returnedOrders.length,
-      statusPercentages, expenseByCategory, productBreakdown,
+      statusPercentages, expenseByCategory, productBreakdown, dailyTrend,
     });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
