@@ -466,6 +466,85 @@ const NewsletterSubscriberSchema = new mongoose.Schema({
 }, { timestamps: true });
 const NewsletterSubscriber = mongoose.model("NewsletterSubscriber", NewsletterSubscriberSchema);
 
+// ══════════════════════════════════════════════════════════════════════════════
+// PRODUCT TRACKING — Super Admin's own internal COD e-commerce tracker
+// (orders/courier status, an expense ledger, and inventory), replacing the
+// hand-kept Excel workbook the admin shared: order intake through delivery,
+// a running expense list, and per-product stock + profit. All three feed the
+// Dashboard summary (see the /api/admin/tracking/dashboard route below).
+// ══════════════════════════════════════════════════════════════════════════════
+const TrackingOrderSchema = new mongoose.Schema({
+  date:            { type: Date, default: Date.now },
+  orderNo:         { type: String, default: "" },
+  productTitle:    { type: String, default: "" },
+  productCode:     { type: String, default: "" }, // matches an InventoryItem.productCode, loosely (free text, not a hard reference)
+  courier:         { type: String, default: "" },  // PostEX / Leopard / TCS / Trax / …
+  price:           { type: Number, default: 0 },
+  customerName:    { type: String, default: "" },
+  customerPhone:   { type: String, default: "" },
+  customerAddress: { type: String, default: "" },
+  trackingId:      { type: String, default: "" },
+  // Covers the courier lifecycle the sheet used across its "jul"/"August"
+  // tabs, under one consistent set of values instead of each month's sheet
+  // spelling statuses differently ("Confirm"/"Dispatch"/"Out For Delivery"/…).
+  status: {
+    type: String,
+    enum: ["pending", "confirmed", "dispatched", "in_transit", "out_for_delivery", "delivered", "returned", "cancelled", "failed_delivery", "non_service_area", "address_incomplete"],
+    default: "pending",
+  },
+  paymentStatus: { type: String, enum: ["pending", "paid", "returned"], default: "pending" },
+  remarks:       { type: String, default: "" },
+  createdBy:     { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+}, { timestamps: true });
+TrackingOrderSchema.index({ date: -1 });
+TrackingOrderSchema.index({ status: 1 });
+const TrackingOrder = mongoose.model("TrackingOrder", TrackingOrderSchema);
+
+const TrackingExpenseSchema = new mongoose.Schema({
+  date:     { type: Date, default: Date.now },
+  // Freeform, but the sheet's own recurring categories are offered as
+  // suggestions in the UI: Shopify, Rent, Salaries, Marketing Fees, Ad Cost,
+  // Delivery Charges, Agency Fees, Transportation, Other.
+  category: { type: String, default: "Other" },
+  amount:   { type: Number, default: 0 },
+  note:     { type: String, default: "" },
+}, { timestamps: true });
+const TrackingExpense = mongoose.model("TrackingExpense", TrackingExpenseSchema);
+
+const InventoryItemSchema = new mongoose.Schema({
+  productTitle: { type: String, required: true, trim: true },
+  productCode:  { type: String, default: "" }, // short code, e.g. "SWB" for Smart Water Bottle
+  costPrice:    { type: Number, default: 0 },
+  sellingPrice: { type: Number, default: 0 },
+  purchasedQty: { type: Number, default: 0 },
+  dispatchedQty:{ type: Number, default: 0 },
+  deliveredQty: { type: Number, default: 0 },
+  returnedQty:  { type: Number, default: 0 },
+  status:       { type: String, enum: ["in_stock", "low_stock", "out_of_stock"], default: "in_stock" },
+  purchaseDate: { type: Date, default: Date.now },
+}, { timestamps: true });
+const InventoryItem = mongoose.model("InventoryItem", InventoryItemSchema);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INSTRUCTOR PRODUCTS — winning/trending products an instructor showcases to
+// students (photo, name, units sold, reviews, a New/Hot Sale/Trending tag).
+// Instructors manage their own from the Instructor Portal; Super Admin's
+// Products tab shows every instructor's cards together. A separate, much
+// smaller student-facing version is planned later — this pass only wires up
+// creation (Instructor Portal) and the Super Admin view.
+// ══════════════════════════════════════════════════════════════════════════════
+const InstructorProductSchema = new mongoose.Schema({
+  instructor:  { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+  name:        { type: String, required: true, trim: true },
+  description: { type: String, default: "" },
+  imageUrl:    { type: String, default: "" },
+  unitsSold:   { type: Number, default: 0 },
+  reviews:     { type: Number, default: 0 },
+  rating:      { type: Number, default: 0 },
+  tag:         { type: String, enum: ["none", "new", "hot_sale", "trending"], default: "none" },
+}, { timestamps: true });
+const InstructorProduct = mongoose.model("InstructorProduct", InstructorProductSchema);
+
 // ── Payment screenshot hashes — fraud prevention ────────────────────────────
 const PaymentScreenshotHashSchema = new mongoose.Schema({
   hash:     { type: String, required: true, unique: true, index: true },
@@ -1224,6 +1303,223 @@ app.patch("/api/admin/courses/:id/status", protect, adminOnly, async (req, res) 
     const course = await Course.findByIdAndUpdate(req.params.id, { status }, { new: true });
     if (!course) return res.status(404).json({ message: "Course not found." });
     res.json(course);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PRODUCT TRACKING — orders, expenses, inventory, and the dashboard summary
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── Orders ───────────────────────────────────────────────────────────────────
+app.get("/api/admin/tracking/orders", protect, adminOnly, async (req, res) => {
+  try {
+    const { status, search } = req.query;
+    const query = {};
+    if (status && status !== "all") query.status = status;
+    if (search) {
+      const rx = { $regex: search, $options: "i" };
+      query.$or = [{ orderNo: rx }, { customerName: rx }, { customerPhone: rx }, { trackingId: rx }, { productTitle: rx }];
+    }
+    const orders = await TrackingOrder.find(query).sort("-date");
+    res.json(orders);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+app.post("/api/admin/tracking/orders", protect, adminOnly, async (req, res) => {
+  try {
+    const order = await TrackingOrder.create({ ...req.body, createdBy: req.user._id });
+    res.status(201).json(order);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+app.put("/api/admin/tracking/orders/:id", protect, adminOnly, async (req, res) => {
+  try {
+    const order = await TrackingOrder.findByIdAndUpdate(req.params.id, req.body, { new: true, runValidators: true });
+    if (!order) return res.status(404).json({ message: "Order not found" });
+    res.json(order);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+app.delete("/api/admin/tracking/orders/:id", protect, adminOnly, async (req, res) => {
+  try {
+    const order = await TrackingOrder.findByIdAndDelete(req.params.id);
+    if (!order) return res.status(404).json({ message: "Order not found" });
+    res.json({ deleted: true });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── Expenses ─────────────────────────────────────────────────────────────────
+app.get("/api/admin/tracking/expenses", protect, adminOnly, async (req, res) => {
+  try { res.json(await TrackingExpense.find({}).sort("-date")); }
+  catch (err) { res.status(500).json({ message: err.message }); }
+});
+app.post("/api/admin/tracking/expenses", protect, adminOnly, async (req, res) => {
+  try { res.status(201).json(await TrackingExpense.create(req.body)); }
+  catch (err) { res.status(500).json({ message: err.message }); }
+});
+app.put("/api/admin/tracking/expenses/:id", protect, adminOnly, async (req, res) => {
+  try {
+    const expense = await TrackingExpense.findByIdAndUpdate(req.params.id, req.body, { new: true, runValidators: true });
+    if (!expense) return res.status(404).json({ message: "Expense not found" });
+    res.json(expense);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+app.delete("/api/admin/tracking/expenses/:id", protect, adminOnly, async (req, res) => {
+  try {
+    const expense = await TrackingExpense.findByIdAndDelete(req.params.id);
+    if (!expense) return res.status(404).json({ message: "Expense not found" });
+    res.json({ deleted: true });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── Inventory ────────────────────────────────────────────────────────────────
+app.get("/api/admin/tracking/inventory", protect, adminOnly, async (req, res) => {
+  try { res.json(await InventoryItem.find({}).sort("-purchaseDate")); }
+  catch (err) { res.status(500).json({ message: err.message }); }
+});
+app.post("/api/admin/tracking/inventory", protect, adminOnly, async (req, res) => {
+  try { res.status(201).json(await InventoryItem.create(req.body)); }
+  catch (err) { res.status(500).json({ message: err.message }); }
+});
+app.put("/api/admin/tracking/inventory/:id", protect, adminOnly, async (req, res) => {
+  try {
+    const item = await InventoryItem.findByIdAndUpdate(req.params.id, req.body, { new: true, runValidators: true });
+    if (!item) return res.status(404).json({ message: "Inventory item not found" });
+    res.json(item);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+app.delete("/api/admin/tracking/inventory/:id", protect, adminOnly, async (req, res) => {
+  try {
+    const item = await InventoryItem.findByIdAndDelete(req.params.id);
+    if (!item) return res.status(404).json({ message: "Inventory item not found" });
+    res.json({ deleted: true });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── Dashboard summary ────────────────────────────────────────────────────────
+// Plain queries + JS math rather than a Mongo aggregation pipeline — this
+// tool's collections stay small (one admin's own order book), so the simpler
+// approach is easier to verify correct and to adjust later. Every number
+// here is intentionally derived from a clearly-named formula (see comments)
+// rather than trying to reverse-engineer the original spreadsheet's
+// inconsistent hand-entered totals.
+const DISPATCHED_STATUSES = ["dispatched", "in_transit", "out_for_delivery", "delivered", "returned", "failed_delivery", "non_service_area", "address_incomplete"];
+app.get("/api/admin/tracking/dashboard", protect, adminOnly, async (req, res) => {
+  try {
+    const [orders, expenses, inventory] = await Promise.all([
+      TrackingOrder.find({}).lean(),
+      TrackingExpense.find({}).lean(),
+      InventoryItem.find({}).lean(),
+    ]);
+
+    const totalOrders = orders.length;
+    const dispatchedOrders = orders.filter((o) => DISPATCHED_STATUSES.includes(o.status));
+    const deliveredOrders = orders.filter((o) => o.status === "delivered");
+    const returnedOrders = orders.filter((o) => o.status === "returned");
+
+    const totalDispatch = dispatchedOrders.length;
+    const totalDelivered = deliveredOrders.length;
+    const deliveredParcelAmount = deliveredOrders.reduce((s, o) => s + (o.price || 0), 0);
+    const pendingCOD = deliveredOrders.filter((o) => o.paymentStatus !== "paid").reduce((s, o) => s + (o.price || 0), 0);
+    // "Total Sales" = everything actually shipped (dispatched or further along) — matches the sheet's intent, excluding orders still pending/confirmed/cancelled.
+    const totalSales = dispatchedOrders.reduce((s, o) => s + (o.price || 0), 0);
+
+    const expenseByCategory = {};
+    for (const e of expenses) expenseByCategory[e.category] = (expenseByCategory[e.category] || 0) + (e.amount || 0);
+    const totalAdSpend = (expenseByCategory["Ad Cost"] || 0) + (expenseByCategory["Marketing Fees"] || 0);
+    const totalDeliveryCharges = expenseByCategory["Delivery Charges"] || 0;
+    const totalExpenses = expenses.reduce((s, e) => s + (e.amount || 0), 0);
+
+    const totalCOGS = inventory.reduce((s, i) => s + (i.costPrice || 0) * (i.deliveredQty || 0), 0);
+    const grossProfit = deliveredParcelAmount - totalCOGS - totalDeliveryCharges;
+    const netProfit = grossProfit - (totalExpenses - totalDeliveryCharges); // every other expense, delivery charges already subtracted above
+
+    const statusBreakdown = {};
+    for (const o of orders) statusBreakdown[o.status] = (statusBreakdown[o.status] || 0) + 1;
+    const statusPercentages = Object.entries(statusBreakdown).map(([status, count]) => ({
+      status, count, percentage: totalOrders ? Math.round((count / totalOrders) * 1000) / 10 : 0,
+    }));
+
+    // Per-product breakdown — matches orders to an inventory item by
+    // productCode (falling back to matching on productTitle) so "units sold /
+    // revenue" can be shown per product without a hard database reference.
+    const productBreakdown = inventory.map((item) => {
+      const matching = orders.filter((o) =>
+        (item.productCode && o.productCode === item.productCode) ||
+        (!item.productCode && o.productTitle === item.productTitle)
+      );
+      const delivered = matching.filter((o) => o.status === "delivered");
+      return {
+        productTitle: item.productTitle,
+        productCode: item.productCode,
+        unitsDelivered: delivered.length,
+        revenue: delivered.reduce((s, o) => s + (o.price || 0), 0),
+        availableQty: (item.purchasedQty || 0) - (item.dispatchedQty || 0),
+        grossProfit: ((item.sellingPrice || 0) - (item.costPrice || 0)) * (item.deliveredQty || 0),
+      };
+    });
+
+    res.json({
+      totalOrders, totalDispatch, totalDelivered, deliveredParcelAmount, pendingCOD,
+      totalSales, totalAdSpend, totalDeliveryCharges, totalCOGS, totalExpenses,
+      grossProfit, netProfit,
+      returnedCount: returnedOrders.length,
+      statusPercentages, expenseByCategory, productBreakdown,
+    });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INSTRUCTOR PRODUCTS — created in the Instructor Portal, shown as cards in
+// Super Admin → Products (every instructor's products together)
+// ══════════════════════════════════════════════════════════════════════════════
+app.get("/api/instructor/products", protect, instructorOnly, async (req, res) => {
+  try { res.json(await InstructorProduct.find({ instructor: req.user._id }).sort("-createdAt")); }
+  catch (err) { res.status(500).json({ message: err.message }); }
+});
+app.post("/api/instructor/products", protect, instructorOnly, async (req, res) => {
+  try {
+    const { name, description, imageUrl, unitsSold, reviews, rating, tag } = req.body || {};
+    if (!name?.trim()) return res.status(400).json({ message: "Product name is required." });
+    const product = await InstructorProduct.create({
+      instructor: req.user._id, name: name.trim(), description: description || "", imageUrl: imageUrl || "",
+      unitsSold: Number(unitsSold) || 0, reviews: Number(reviews) || 0, rating: Number(rating) || 0,
+      tag: ["none", "new", "hot_sale", "trending"].includes(tag) ? tag : "none",
+    });
+    res.status(201).json(product);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+app.put("/api/instructor/products/:id", protect, instructorOnly, async (req, res) => {
+  try {
+    const product = await InstructorProduct.findOne({ _id: req.params.id, instructor: req.user._id });
+    if (!product) return res.status(404).json({ message: "Product not found" });
+    const { name, description, imageUrl, unitsSold, reviews, rating, tag } = req.body || {};
+    if (name !== undefined) product.name = name;
+    if (description !== undefined) product.description = description;
+    if (imageUrl !== undefined) product.imageUrl = imageUrl;
+    if (unitsSold !== undefined) product.unitsSold = Number(unitsSold) || 0;
+    if (reviews !== undefined) product.reviews = Number(reviews) || 0;
+    if (rating !== undefined) product.rating = Number(rating) || 0;
+    if (tag !== undefined && ["none", "new", "hot_sale", "trending"].includes(tag)) product.tag = tag;
+    await product.save();
+    res.json(product);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+app.delete("/api/instructor/products/:id", protect, instructorOnly, async (req, res) => {
+  try {
+    const product = await InstructorProduct.findOneAndDelete({ _id: req.params.id, instructor: req.user._id });
+    if (!product) return res.status(404).json({ message: "Product not found" });
+    res.json({ deleted: true });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Super Admin — every instructor's products, for the Products tab
+app.get("/api/admin/products", protect, adminOnly, async (req, res) => {
+  try { res.json(await InstructorProduct.find({}).populate("instructor", "name avatar").sort("-createdAt")); }
+  catch (err) { res.status(500).json({ message: err.message }); }
+});
+app.delete("/api/admin/products/:id", protect, adminOnly, async (req, res) => {
+  try {
+    const product = await InstructorProduct.findByIdAndDelete(req.params.id);
+    if (!product) return res.status(404).json({ message: "Product not found" });
+    res.json({ deleted: true });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
